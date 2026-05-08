@@ -1,5 +1,100 @@
 # Changelog
 
+## v0.18.2 — incremental dropped-edge root-cause fix (both directions)
+
+Closes the bug documented in memory `feedback_incremental_edge_timing.md`:
+incremental indexing silently dropped REL_CALLS edges in two symmetric
+scenarios that only `rebuild-index` recovered. v0.18.1 query-time
+freshness was a band-aid for the file_path-aware tools; this is the
+underlying fix, in both directions.
+
+**The bug, both directions**
+
+*Direction A — callee added later*: file B has `caller_b() { foo(); }`.
+At B's Phase 2, `foo` has no same-file or same-language target → REL_CALLS
+dropped (memory `feedback_edge_resolution_same_language.md` correctly
+forbids cross-language fallback for calls). Later, file A is added with
+`function foo() {}`. Incremental index reindexes A only; B isn't in
+`changed_paths`, so B's bare-name `foo()` is never re-resolved. Edge
+`caller_b → foo` permanently missing until full rebuild.
+
+*Direction B — callee removed*: same setup but A is *deleted*. Cascade
+delete on `target_id` FK strips B's edge to A.foo automatically; B isn't
+in `delete_paths`, so Phase 2 doesn't re-extract it. If A is then re-added
+later, B has neither a stale edge nor a way to know it should re-resolve.
+
+**The fix (schema v8)**
+
+New `pending_unresolved_calls` table buffers REL_CALLS that Phase 2 can't
+resolve at extraction time, plus inbound REL_CALLS edges Phase 0 is about
+to cascade-strip. The post-Phase-2 sweep promotes pending rows to real
+edges as soon as a same-language target appears.
+
+- `(source_id REFERENCES nodes ON DELETE CASCADE, target_name,
+  source_language, metadata)` with unique index on the triple — keeps
+  inserts idempotent across repeated Phase 2 invocations.
+- `ON DELETE CASCADE` makes the table self-cleaning: when caller B is
+  reindexed (Phase 1 deletes its old nodes), pending rows for B's old
+  source_ids drain automatically.
+- Sweep scope is **same-language only** — cross-language is never
+  promoted (the canonical false-positive class from
+  `feedback_edge_resolution_same_language.md`). When multiple
+  same-language candidates exist, the existing `refine_ambiguous_targets`
+  applies (path-proximity + non-test preference), so dense-fanout cases
+  don't regress dead-code precision.
+
+**Direction A wiring (commit `d172cae`)**: at Phase 2's REL_CALLS drop
+point in `pipeline.rs`, instead of silent `continue` we
+`insert_pending_unresolved_call`. End of `index_files` runs
+`resolve_pending_calls` which builds name → [(node_id, language)] and
+node_id → path maps from current DB state (one indexed SELECT, not
+per-row), iterates pending rows, applies `refine_ambiguous_targets`
+where ambiguous, inserts edges, drops rows.
+
+**Direction B wiring (commit `9c27739`)**: Phase 0 in `pipeline.rs` now
+resolves file_ids before `delete_files_by_paths` drops them, calls new
+`queries::get_inbound_calls_for_pending` to fetch inbound REL_CALLS
+edges from non-deleted files, and writes pending rows for each before
+letting cascade fire. Same post-Phase-2 sweep then handles the resolution.
+
+**Migration**: SCHEMA_VERSION 7 → 8. INDEX_VERSION unchanged — existing
+edges remain valid; the pending table starts empty and fills naturally
+on next index pass. Migration is transactional (matches the pattern of
+every prior migration). Existing v0.18.1 DBs auto-upgrade on first open.
+
+**Test coverage** (5 new pending-resolution tests + 1 migration test):
+- `test_pending_unresolved_call_resolves_when_callee_added_later`
+  (direction A round-trip)
+- `test_pending_buffers_on_callee_file_deletion` (direction B
+  round-trip — edge → delete → buffered → re-add → edge restored)
+- `test_pending_unresolved_call_does_not_cross_language` (TS pending
+  vs Rust definition stays buffered; cross-language refused)
+- `test_pending_resolves_multiple_calls_in_same_caller` (3 undefined
+  calls in one caller → 3 pending rows → all drain on single sweep)
+- `test_pending_cascade_deletes_when_caller_file_reindexed`
+  (load-bearing schema FK behavior — explicit guard so a future
+  migration weakening the FK fails loudly here)
+- `test_v7_to_v8_migration_adds_pending_table` (asserts table + both
+  indexes after v7-shape DB opened via Database::open)
+
+**Bonus**: 2 new plugin-script test files
+- `scripts/sync-versions.test.js` — 4 tests, fixture-copy strategy, locks
+  release-tooling contract (`feedback_version_sync.md`). Includes
+  `(9 files updated)` count assertion to catch silent target drops.
+- `claude-plugin/scripts/mcp-launcher.test.js` — 3 tests, end-to-end MCP
+  initialize via launcher + 2 static-grep checks for plugin-env
+  isolation (`feedback_plugin_env_isolation.md`) and macOS quarantine
+  hint surface.
+
+**Test count**: 272 default-features (was 265 in v0.18.1), 265
+no-default-features (was 261), 182 JS tests (was 175). All clippy 1.95
+clean on both feature profiles.
+
+**Compatibility**: All 16 MCP tool schemas unchanged. CLI flags
+unchanged. Output JSON unchanged (no shape additions). Schema migration
+is transparent to consumers — query results match v0.18.1 plus
+previously-missing edges that should have been there all along.
+
 ## v0.18.1 — query-time freshness + call-graph truncation provenance
 
 Three additive improvements to MCP tool surfaces, no breaking changes.
