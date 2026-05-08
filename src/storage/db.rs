@@ -153,6 +153,11 @@ impl Database {
                 schema::migrate_v6_to_v7(&conn)?;
                 tx.commit()?;
             }
+            if existing_version < 8 {
+                let tx = conn.unchecked_transaction()?;
+                schema::migrate_v7_to_v8(&conn)?;
+                tx.commit()?;
+            }
         }
 
         conn.execute_batch(&schema::create_tables_sql())?;

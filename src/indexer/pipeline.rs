@@ -922,9 +922,25 @@ fn index_files(
                         &node_id_to_path,
                     )
                 } else if rel.relation == REL_CALLS {
-                    // No same-file, no same-language candidate → drop to avoid cross-language
-                    // false positives. Non-call edges keep global fallback below so external
-                    // sentinel nodes (imports/implements) still resolve.
+                    // No same-file, no same-language candidate → buffer in
+                    // pending_unresolved_calls instead of silently dropping.
+                    // The post-Phase-2 sweep below promotes the row to a real
+                    // edge as soon as a same-language target appears (e.g.
+                    // sibling file added in a later incremental pass). Memory
+                    // `feedback_incremental_edge_timing.md` documented the bug
+                    // this closes: B's bare-name call to `foo()` got dropped
+                    // when foo didn't exist yet, and never re-resolved when A
+                    // later added `foo`. Schema cascade on source_id self-cleans
+                    // when callers are removed/reindexed.
+                    for &src_id in &source_ids {
+                        crate::storage::queries::insert_pending_unresolved_call(
+                            db.conn(),
+                            src_id,
+                            &rel.target_name,
+                            &pf.language,
+                            rel.metadata.as_deref(),
+                        )?;
+                    }
                     continue;
                 } else {
                     all_target_ids
@@ -1208,6 +1224,18 @@ fn index_files(
         }
     }
 
+    // Phase 2c: sweep pending_unresolved_calls — promote any rows whose
+    // target_name now resolves against a same-language node. Cheap when the
+    // table is empty (typical after a full index of a self-contained codebase).
+    let pending_resolved = resolve_pending_calls(db)?;
+    total_edges_created += pending_resolved;
+    if pending_resolved > 0 {
+        tracing::info!(
+            "[index] Phase 2c: resolved {} pending unresolved calls",
+            pending_resolved
+        );
+    }
+
     // Optimize query planner statistics after bulk writes
     if !all_indexed.is_empty() {
         let _ = db.run_optimize();
@@ -1227,6 +1255,119 @@ fn index_files(
         edges_created: total_edges_created,
         stats,
     })
+}
+
+/// Sweep `pending_unresolved_calls` against the current node state. Rows whose
+/// `(target_name, source_language)` now match a real node become a `calls`
+/// edge and the pending row is dropped; rows that still don't resolve stay
+/// buffered for the next index pass.
+///
+/// Resolution priority mirrors Phase 2: same-language candidates only (no
+/// cross-language promotion — memory `feedback_edge_resolution_same_language.md`
+/// flags that as the canonical false-positive class), with
+/// `refine_ambiguous_targets` applied when multiple candidates share the name.
+///
+/// Returns the number of edges inserted by this sweep.
+fn resolve_pending_calls(db: &Database) -> Result<usize> {
+    let pending = crate::storage::queries::list_pending_unresolved_calls(db.conn())?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    // Build name → [(node_id, language)] map ONCE (cheap SELECT, indexed lookup),
+    // then iterate pending rows in memory.
+    use crate::storage::queries::{insert_edge_cached, delete_pending_unresolved_call};
+    let mut name_to_lang_targets: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
+    {
+        let mut stmt = db.conn().prepare(
+            "SELECT n.id, n.name, COALESCE(f.language, ''), f.path
+             FROM nodes n JOIN files f ON f.id = n.file_id
+             WHERE f.language IS NOT NULL"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, name, lang, path) = row?;
+            if lang.is_empty() {
+                continue;
+            }
+            name_to_lang_targets.entry(name).or_default().push((id, lang));
+            node_id_to_path.insert(id, path);
+        }
+    }
+
+    // Map source_id → source file path so refine_ambiguous_targets gets the
+    // proximity hint it needs.
+    let source_ids: Vec<i64> = pending.iter().map(|p| p.source_id).collect();
+    let mut source_id_to_path: HashMap<i64, String> = HashMap::new();
+    if !source_ids.is_empty() {
+        let placeholders = std::iter::repeat_n("?", source_ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.id IN ({})",
+            placeholders
+        );
+        let mut stmt = db.conn().prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = source_ids.iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, path) = row?;
+            source_id_to_path.insert(id, path);
+        }
+    }
+
+    let mut edges_added = 0usize;
+    let mut to_delete: Vec<i64> = Vec::new();
+
+    for row in &pending {
+        let candidates: Vec<i64> = name_to_lang_targets.get(&row.target_name)
+            .map(|entries| entries.iter()
+                .filter(|(_, lang)| *lang == row.source_language)
+                .map(|(id, _)| *id)
+                .filter(|id| *id != row.source_id) // self-call guard
+                .collect())
+            .unwrap_or_default();
+
+        if candidates.is_empty() {
+            continue; // still unresolvable — leave buffered
+        }
+
+        let refined = if candidates.len() > 1 {
+            let source_path = source_id_to_path.get(&row.source_id).cloned().unwrap_or_default();
+            refine_ambiguous_targets(&candidates, &source_path, &node_id_to_path)
+        } else {
+            candidates
+        };
+
+        for tgt_id in &refined {
+            if insert_edge_cached(
+                db.conn(),
+                row.source_id,
+                *tgt_id,
+                REL_CALLS,
+                row.metadata.as_deref(),
+            )? {
+                edges_added += 1;
+            }
+        }
+        to_delete.push(row.id);
+    }
+
+    for id in to_delete {
+        delete_pending_unresolved_call(db.conn(), id)?;
+    }
+
+    Ok(edges_added)
 }
 
 /// Disambiguate N same-language cross-file candidates for a single call/import
@@ -1964,5 +2105,93 @@ impl fmt::Display for MyWriter {
         assert!(did4, "missing file must trigger row cleanup");
         assert!(get_nodes_by_name(db.conn(), "beta").unwrap().is_empty(),
             "beta must be cascade-deleted with its file");
+    }
+
+    /// Root-cause test for `feedback_incremental_edge_timing.md`: file B
+    /// (existing, unchanged) bare-name calls `foo()`. file A is added later
+    /// with `function foo() {}`. Phase 2 of B's first index pass dropped the
+    /// edge because `foo` was unresolvable; before this fix, A's later index
+    /// never re-resolved B's call → permanently missing edge in incremental
+    /// mode (only `rebuild-index` recovered it).
+    ///
+    /// New behavior: B's drop becomes a `pending_unresolved_calls` row; A's
+    /// index pass sweeps pending and promotes the row into a real edge.
+    #[test]
+    fn test_pending_unresolved_call_resolves_when_callee_added_later() {
+        use crate::storage::queries::{count_pending_unresolved_calls, get_node_ids_by_name};
+        use crate::domain::REL_CALLS;
+
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        // Step 1: B exists alone with bare-name call to foo (foo undefined).
+        fs::write(project_dir.path().join("b.ts"),
+            "function caller_b() { foo(); }\n").unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+        // Phase 2 dropped the edge (no same-file/same-language target) and
+        // buffered the row instead.
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1,
+            "B's call to undefined foo must land in pending_unresolved_calls");
+
+        let caller_b_id = get_node_ids_by_name(db.conn(), "caller_b").unwrap()
+            .into_iter().next().expect("caller_b must exist").0;
+
+        // Verify NO edge yet (foo doesn't exist in DB).
+        let pre_edges = crate::storage::queries::get_edges_from(db.conn(), caller_b_id).unwrap();
+        assert!(pre_edges.iter().all(|e| e.relation != REL_CALLS),
+            "no calls edge should exist yet — foo is undefined");
+
+        // Step 2: A is added with foo(). Incremental index picks it up; the
+        // pending sweep at end of index_files promotes B's buffered call into
+        // a real edge.
+        fs::write(project_dir.path().join("a.ts"),
+            "export function foo() {}\n").unwrap();
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+        let foo_id = get_node_ids_by_name(db.conn(), "foo").unwrap()
+            .into_iter().next().expect("foo must exist after A indexed").0;
+
+        let post_edges = crate::storage::queries::get_edges_from(db.conn(), caller_b_id).unwrap();
+        let calls_to_foo: Vec<_> = post_edges.iter()
+            .filter(|e| e.relation == REL_CALLS && e.target_id == foo_id)
+            .collect();
+        assert_eq!(calls_to_foo.len(), 1,
+            "incremental index must promote pending call → calls edge caller_b → foo; \
+             got edges: {:?}", post_edges.iter().map(|e| (&e.relation, e.target_id)).collect::<Vec<_>>());
+
+        // Pending row must be drained after successful resolution.
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
+            "resolved pending row must be deleted after edge insertion");
+    }
+
+    /// Cross-language pending must NOT resolve cross-language. If B (TS)
+    /// calls `update()` and a later-indexed Rust file defines `fn update()`,
+    /// the pending row must stay buffered, not silently bind cross-language
+    /// (memory `feedback_edge_resolution_same_language.md`'s canonical
+    /// false-positive class).
+    #[test]
+    fn test_pending_unresolved_call_does_not_cross_language() {
+        use crate::storage::queries::count_pending_unresolved_calls;
+
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        // TS file with bare-name call to `update`
+        fs::write(project_dir.path().join("client.ts"),
+            "function caller_ts() { update(); }\n").unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
+
+        // Rust file with `update` — different language, must NOT match.
+        fs::write(project_dir.path().join("hasher.rs"),
+            "fn update() {}\n").unwrap();
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+        // Pending row stays — sweep refused cross-language resolution.
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1,
+            "cross-language target must NOT resolve a TS pending call to a Rust fn");
     }
 }

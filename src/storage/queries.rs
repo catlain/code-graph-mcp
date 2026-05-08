@@ -331,6 +331,69 @@ pub fn insert_edge_cached(conn: &Connection, source_id: i64, target_id: i64, rel
     Ok(rows > 0)
 }
 
+/// Buffer a REL_CALLS edge that Phase 2 couldn't resolve against same-file
+/// or same-language candidates so a later resolution sweep can claim it once
+/// the callee is added. Idempotent via the unique index on
+/// (source_id, target_name, source_language).
+pub fn insert_pending_unresolved_call(
+    conn: &Connection,
+    source_id: i64,
+    target_name: &str,
+    source_language: &str,
+    metadata: Option<&str>,
+) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO pending_unresolved_calls (source_id, target_name, source_language, metadata)
+         VALUES (?1, ?2, ?3, ?4)"
+    )?;
+    stmt.execute((source_id, target_name, source_language, metadata))?;
+    Ok(())
+}
+
+/// Pending row resolved into one or more concrete edges.
+pub struct PendingCallRow {
+    pub id: i64,
+    pub source_id: i64,
+    pub target_name: String,
+    pub source_language: String,
+    pub metadata: Option<String>,
+}
+
+/// Stream all pending rows. Caller does the per-row resolution + edge insert.
+pub fn list_pending_unresolved_calls(conn: &Connection) -> Result<Vec<PendingCallRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source_id, target_name, source_language, metadata FROM pending_unresolved_calls"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PendingCallRow {
+            id: row.get(0)?,
+            source_id: row.get(1)?,
+            target_name: row.get(2)?,
+            source_language: row.get(3)?,
+            metadata: row.get(4)?,
+        })
+    })?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Drop a pending row by id (called after the row was successfully resolved).
+pub fn delete_pending_unresolved_call(conn: &Connection, id: i64) -> Result<()> {
+    let mut stmt = conn.prepare_cached("DELETE FROM pending_unresolved_calls WHERE id = ?1")?;
+    stmt.execute([id])?;
+    Ok(())
+}
+
+/// Diagnostic: number of buffered unresolved calls. Useful in tests + a future
+/// `code-graph-mcp health-check` warning when the table grows unbounded.
+pub fn count_pending_unresolved_calls(conn: &Connection) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pending_unresolved_calls",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 pub fn get_edges_from(conn: &Connection, node_id: i64) -> Result<Vec<EdgeRecord>> {
     let mut stmt = conn.prepare(
         "SELECT source_id, target_id, relation, metadata FROM edges WHERE source_id = ?1"

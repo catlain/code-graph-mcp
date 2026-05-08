@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 // Meta keys stored in the `meta` table (added in v7).
 pub const META_KEY_EMBEDDING_DIM: &str = "embedding_dim";
@@ -91,6 +91,24 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
+
+-- Pending unresolved REL_CALLS edges (v8+). When Phase 2 can't resolve a call
+-- against same-file or same-language candidates it would silently drop the
+-- edge — but in incremental indexing this strands "B calls foo" rows whose
+-- callee `foo` later gets added to a sibling file. This table buffers those
+-- drops so a post-Phase-2 resolution sweep can claim them as edges once a
+-- matching same-language target exists. ON DELETE CASCADE on source_id keeps
+-- the table self-cleaning when callers are removed/reindexed.
+CREATE TABLE IF NOT EXISTS pending_unresolved_calls (
+    id              INTEGER PRIMARY KEY,
+    source_id       INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    target_name     TEXT NOT NULL,
+    source_language TEXT NOT NULL,
+    metadata        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_target_lang ON pending_unresolved_calls(target_name, source_language);
+CREATE INDEX IF NOT EXISTS idx_pending_source ON pending_unresolved_calls(source_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique ON pending_unresolved_calls(source_id, target_name, source_language);
 "#)
 }
 
@@ -248,6 +266,24 @@ pub fn migrate_v6_to_v7(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         );"
     )?;
     tracing::info!("[schema] Migration v6->v7 complete.");
+    Ok(())
+}
+
+pub fn migrate_v7_to_v8(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    tracing::info!("[schema] Migrating v7 -> v8: adding pending_unresolved_calls for incremental edge re-resolution");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_unresolved_calls (
+            id              INTEGER PRIMARY KEY,
+            source_id       INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            target_name     TEXT NOT NULL,
+            source_language TEXT NOT NULL,
+            metadata        TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_target_lang ON pending_unresolved_calls(target_name, source_language);
+        CREATE INDEX IF NOT EXISTS idx_pending_source ON pending_unresolved_calls(source_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique ON pending_unresolved_calls(source_id, target_name, source_language);"
+    )?;
+    tracing::info!("[schema] Migration v7->v8 complete.");
     Ok(())
 }
 
