@@ -1316,18 +1316,18 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
         }
     }
 
-    let mut nodes = crate::graph::query::get_call_graph(conn, symbol, direction, depth, file_filter)?;
+    let mut result = crate::graph::query::get_call_graph(conn, symbol, direction, depth, file_filter)?;
     // Fuzzy auto-resolve: if exact-name lookup returned nothing (or only the seed
     // node with no edges) and no --file was specified, promote a unique fuzzy
     // match. Matches MCP get_call_graph behavior.
-    let has_edges = nodes.iter().any(|n| n.depth > 0);
-    let has_seed = nodes.iter().any(|n| n.depth == 0);
+    let has_edges = result.nodes.iter().any(|n| n.depth > 0);
+    let has_seed = result.nodes.iter().any(|n| n.depth == 0);
     let mut resolved_symbol: String = symbol.to_string();
     if !(has_edges || (has_seed && file_filter.is_some())) {
         match resolve_fuzzy_name_cli(conn, symbol)? {
             CliFuzzyResolution::Unique(resolved) => {
                 resolved_symbol = resolved.clone();
-                nodes = crate::graph::query::get_call_graph(conn, &resolved, direction, depth, file_filter)?;
+                result = crate::graph::query::get_call_graph(conn, &resolved, direction, depth, file_filter)?;
                 eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
             }
             CliFuzzyResolution::Ambiguous(cands) => {
@@ -1357,7 +1357,7 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
     // `symbol.to_string()` above). Either way, `symbol` below is the correct
     // identifier to print in the "No call graph results" eprintln.
     let symbol = resolved_symbol.as_str();
-    if nodes.is_empty() {
+    if result.nodes.is_empty() {
         if json_mode {
             println!("{{\"results\":[]}}");
         }
@@ -1370,11 +1370,11 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
     // below uses it as the tree root. The JSON path filters it separately
     // for parity with MCP `get_call_graph` (which excludes the seed).
     let (display_nodes, test_count) = if include_tests {
-        (nodes.iter().collect::<Vec<_>>(), 0usize)
+        (result.nodes.iter().collect::<Vec<_>>(), 0usize)
     } else {
         let mut display = Vec::new();
         let mut tests = 0usize;
-        for n in &nodes {
+        for n in &result.nodes {
             if n.depth > 0
                 && matches!(n.direction, crate::graph::query::Direction::Callers)
                 && crate::domain::is_test_symbol(&n.name, &n.file_path)
@@ -1412,6 +1412,14 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
         let mut output = serde_json::json!({ "results": results });
         if test_count > 0 {
             output["test_callers_hidden"] = serde_json::json!(test_count);
+        }
+        if result.limit_hit {
+            output["limit_hit"] = serde_json::json!(true);
+        }
+        if result.depth_capped {
+            output["depth_capped"] = serde_json::json!(true);
+            output["effective_max_depth"] = serde_json::json!(result.effective_max_depth);
+            output["requested_max_depth"] = serde_json::json!(result.requested_max_depth);
         }
         writeln!(stdout, "{}", serde_json::to_string(&output)?)?;
         return Ok(());
@@ -1487,6 +1495,20 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
 
     if test_count > 0 {
         writeln!(stdout, "  ({} test callers hidden, use --include-tests to show)", test_count)?;
+    }
+    if result.limit_hit {
+        writeln!(
+            stdout,
+            "  ⚠ result truncated: hit row limit ({} rows) — more callers/callees may exist; pick a leaf and re-query",
+            crate::graph::query::CALL_GRAPH_ROW_LIMIT,
+        )?;
+    }
+    if result.depth_capped {
+        writeln!(
+            stdout,
+            "  ⚠ depth capped to {} (requested {}) — deeper chains may exist",
+            result.effective_max_depth, result.requested_max_depth,
+        )?;
     }
 
     Ok(())
@@ -2172,7 +2194,7 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
             let chain = crate::graph::query::get_call_graph(
                 conn, &rm.handler_name, "callees", depth, Some(&rm.file_path),
             )?;
-            let chain_nodes: Vec<serde_json::Value> = chain.iter()
+            let chain_nodes: Vec<serde_json::Value> = chain.nodes.iter()
                 .filter(|n| n.depth > 0)
                 .map(|n| serde_json::json!({
                     "name": n.name, "file_path": n.file_path, "depth": n.depth,
@@ -2186,6 +2208,9 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
                 "metadata": rm.metadata,
                 "call_chain": chain_nodes,
             });
+            if chain.limit_hit || chain.depth_capped {
+                entry["call_chain_truncated"] = serde_json::json!(true);
+            }
             if include_middleware {
                 let downstream = downstream_map.get(&rm.node_id)
                     .cloned()
@@ -2219,10 +2244,13 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
         let chain = crate::graph::query::get_call_graph(
             conn, &rm.handler_name, "callees", depth, Some(&rm.file_path),
         )?;
-        for n in &chain {
+        for n in &chain.nodes {
             if n.depth == 0 { continue; }
             let indent = "  ".repeat(n.depth as usize);
             writeln!(stdout, "{}→ {} ({})", indent, n.name, n.file_path)?;
+        }
+        if chain.limit_hit || chain.depth_capped {
+            writeln!(stdout, "  ⚠ chain truncated for {}", rm.handler_name)?;
         }
     }
 

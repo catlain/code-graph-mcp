@@ -1,6 +1,46 @@
 use super::*;
 use crate::domain::default_dead_code_ignores;
 
+/// Surface call_graph truncation provenance into a JSON response so agents
+/// can tell when results are partial. Adds `limit_hit`, `depth_capped`, and
+/// `effective_max_depth` only when the result was actually truncated, plus a
+/// human-readable `truncation_warning` when either flag fires.
+fn attach_truncation_flags(
+    target: &mut serde_json::Value,
+    result: &crate::graph::query::CallGraphResult,
+) {
+    if !(result.limit_hit || result.depth_capped) {
+        return;
+    }
+    if result.limit_hit {
+        target["limit_hit"] = json!(true);
+    }
+    if result.depth_capped {
+        target["depth_capped"] = json!(true);
+        target["effective_max_depth"] = json!(result.effective_max_depth);
+        target["requested_max_depth"] = json!(result.requested_max_depth);
+    }
+    let warning = match (result.limit_hit, result.depth_capped) {
+        (true, true) => format!(
+            "Result truncated: hit row limit ({} rows) AND depth was capped to {} (requested {}). Run with a more specific symbol or smaller depth, or call get_ast_node(node_id) on a leaf to expand further.",
+            crate::graph::query::CALL_GRAPH_ROW_LIMIT,
+            result.effective_max_depth,
+            result.requested_max_depth,
+        ),
+        (true, false) => format!(
+            "Result truncated: hit row limit ({} rows) — more callers/callees may exist. Use a more specific symbol_name+file_path or get_ast_node on a leaf node_id to drill down.",
+            crate::graph::query::CALL_GRAPH_ROW_LIMIT,
+        ),
+        (false, true) => format!(
+            "Depth was capped to {} (requested {}). Deeper chains may exist; pick a leaf node_id and re-query from there.",
+            result.effective_max_depth,
+            result.requested_max_depth,
+        ),
+        (false, false) => unreachable!(),
+    };
+    target["truncation_warning"] = json!(warning);
+}
+
 impl McpServer {
     pub(super) fn tool_semantic_search(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         // Per-result code_content cap used both in estimation (below) and the
@@ -415,8 +455,8 @@ impl McpServer {
         )?;
 
         // If exact match returns empty (only seed node, no edges), try fuzzy name resolution
-        let has_edges = results.iter().any(|n| n.depth > 0);
-        let has_seed = results.iter().any(|n| n.depth == 0);
+        let has_edges = results.nodes.iter().any(|n| n.depth > 0);
+        let has_seed = results.nodes.iter().any(|n| n.depth == 0);
         if !(has_edges || (has_seed && file_path.is_some())) {
             match self.resolve_fuzzy_name(function_name)? {
                 FuzzyResolution::Unique(resolved) => {
@@ -451,7 +491,7 @@ impl McpServer {
         &self,
         function_name: &str,
         direction: &str,
-        results: &[crate::graph::query::CallGraphNode],
+        results: &crate::graph::query::CallGraphResult,
         compact: bool,
         include_tests: bool,
     ) -> Result<serde_json::Value> {
@@ -459,7 +499,7 @@ impl McpServer {
             is_test_symbol(&n.name, &n.file_path)
         };
         let mut seen_nodes = std::collections::HashSet::new();
-        let all_nodes: Vec<serde_json::Value> = results.iter()
+        let all_nodes: Vec<serde_json::Value> = results.nodes.iter()
             .filter(|n| n.depth > 0 && (include_tests || !is_test(n)))
             // Deduplicate cfg-gated functions (same name+file+depth+direction, different node_id)
             .filter(|n| seen_nodes.insert((&n.name, &n.file_path, n.depth, n.direction.as_str())))
@@ -488,7 +528,7 @@ impl McpServer {
         let test_callers_count = if include_tests {
             0
         } else {
-            results.iter()
+            results.nodes.iter()
                 .filter(|n| n.depth > 0 && is_test(n))
                 .count()
         };
@@ -562,7 +602,7 @@ impl McpServer {
             let caller_rollups: Vec<serde_json::Value> = caller_entries.into_iter().map(|(_, v)| v).collect();
             let callee_rollups: Vec<serde_json::Value> = callee_entries.into_iter().map(|(_, v)| v).collect();
 
-            return Ok(json!({
+            let mut rollup = json!({
                 "mode": "rollup_call_graph",
                 "message": "Call graph is dense; returned as file-level rollup. Pick any node_id and call get_ast_node(node_id) to expand a specific symbol.",
                 "function": function_name,
@@ -576,7 +616,9 @@ impl McpServer {
                     "rollups": callee_rollups,
                     "total_count": callee_total,
                 },
-            }));
+            });
+            attach_truncation_flags(&mut rollup, results);
+            return Ok(rollup);
         }
 
         let callee_nodes: Vec<&serde_json::Value> = all_nodes.iter()
@@ -595,6 +637,7 @@ impl McpServer {
         if test_callers_count > 0 {
             result["test_callers_filtered"] = json!(test_callers_count);
         }
+        attach_truncation_flags(&mut result, results);
         Ok(result)
     }
 
@@ -649,7 +692,7 @@ impl McpServer {
             let chain = crate::graph::query::get_call_graph(
                 self.db.conn(), &rm.handler_name, "callees", depth, Some(&rm.file_path),
             )?;
-            let chain_nodes: Vec<serde_json::Value> = chain.iter()
+            let chain_nodes: Vec<serde_json::Value> = chain.nodes.iter()
                 .filter(|n| n.depth > 0) // exclude root (the handler itself)
                 .filter(|n| !is_test_symbol(&n.name, &n.file_path))
                 .map(|n| json!({
@@ -661,6 +704,9 @@ impl McpServer {
                 }))
                 .collect();
             handler["call_chain"] = json!(chain_nodes);
+            if chain.limit_hit || chain.depth_capped {
+                handler["call_chain_truncated"] = json!(true);
+            }
 
             handlers.push(handler);
         }

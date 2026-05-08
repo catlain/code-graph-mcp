@@ -949,13 +949,13 @@ pub fn get_callers_with_route_info(
 
     let callers = get_call_graph(conn, symbol_name, "callers", max_depth, file_path)?;
 
-    if callers.is_empty() {
+    if callers.nodes.is_empty() {
         return Ok(vec![]);
     }
 
     // Batch fetch route metadata for all callers (avoids N+1 queries)
     let mut route_map: HashMap<i64, String> = HashMap::new();
-    let caller_ids: Vec<i64> = callers.iter().map(|c| c.node_id).collect();
+    let caller_ids: Vec<i64> = callers.nodes.iter().map(|c| c.node_id).collect();
     for chunk in caller_ids.chunks(MAX_IN_PARAMS) {
         let placeholders = make_placeholders(1, chunk.len());
         let sql = format!(
@@ -979,6 +979,7 @@ pub fn get_callers_with_route_info(
     }
 
     let results = callers
+        .nodes
         .iter()
         .map(|caller| CallerWithRouteInfo {
             node_id: caller.node_id,

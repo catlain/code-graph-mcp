@@ -4,6 +4,17 @@ use std::collections::HashMap;
 
 use crate::domain::REL_CALLS;
 
+/// Hard cap on recursive CTE depth — protects against CTE blowup on highly
+/// connected graphs. Caller-requested depth is clamped to this value silently;
+/// `CallGraphResult::depth_capped` flags when that clamp fires so downstream
+/// surfaces (MCP / CLI) can warn the agent that deeper chains may exist.
+pub const CALL_GRAPH_MAX_DEPTH: i32 = 10;
+
+/// Hard cap on rows returned per direction — keeps wide fan-outs from
+/// returning megabytes of JSON. `CallGraphResult::limit_hit` flags when the
+/// SQL query returned exactly this many rows (there may be more).
+pub const CALL_GRAPH_ROW_LIMIT: usize = 200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     Callees,
@@ -34,10 +45,29 @@ pub struct CallGraphNode {
     pub parent_id: Option<i64>,
 }
 
+/// Wraps `Vec<CallGraphNode>` with truncation provenance. Returned by
+/// `get_call_graph` so MCP / CLI surfaces can tell agents when results are
+/// incomplete instead of silently presenting a partial view as the full picture.
+pub struct CallGraphResult {
+    pub nodes: Vec<CallGraphNode>,
+    /// True when at least one direction's recursive CTE hit `CALL_GRAPH_ROW_LIMIT`
+    /// — more nodes may exist beyond the returned set. For "both", true if either
+    /// callees or callers saturated.
+    pub limit_hit: bool,
+    /// True when the caller requested depth > `CALL_GRAPH_MAX_DEPTH`; the result
+    /// only reflects the first `CALL_GRAPH_MAX_DEPTH` levels, deeper chains may exist.
+    pub depth_capped: bool,
+    /// Depth actually used by the SQL query (after clamping).
+    pub effective_max_depth: i32,
+    /// Depth originally requested by the caller (pre-clamp).
+    pub requested_max_depth: i32,
+}
+
 /// Traverse the call graph starting from a function by name.
 ///
 /// `direction` must be one of: "callers", "callees", "both".
-/// `depth` controls the maximum recursion depth.
+/// `depth` controls the maximum recursion depth (clamped to `CALL_GRAPH_MAX_DEPTH`;
+/// `CallGraphResult::depth_capped` flags when the clamp fires).
 /// `file_path` optionally disambiguates when multiple functions share the same name.
 pub fn get_call_graph(
     conn: &Connection,
@@ -45,27 +75,41 @@ pub fn get_call_graph(
     direction: &str,
     max_depth: i32,
     file_path: Option<&str>,
-) -> Result<Vec<CallGraphNode>> {
-    match direction {
-        "callees" => query_direction(conn, function_name, max_depth, file_path, Direction::Callees),
-        "callers" => query_direction(conn, function_name, max_depth, file_path, Direction::Callers),
+) -> Result<CallGraphResult> {
+    let requested_max_depth = max_depth;
+    let effective_max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH);
+    let depth_capped = max_depth > CALL_GRAPH_MAX_DEPTH;
+
+    let (nodes, limit_hit) = match direction {
+        "callees" => query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callees)?,
+        "callers" => query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callers)?,
         "both" => {
-            let callees = query_direction(conn, function_name, max_depth, file_path, Direction::Callees)?;
-            let callers = query_direction(conn, function_name, max_depth, file_path, Direction::Callers)?;
-            Ok(merge_results(callees, callers))
+            let (callees, c1) = query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callees)?;
+            let (callers, c2) = query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callers)?;
+            (merge_results(callees, callers), c1 || c2)
         }
-        other => Err(anyhow!("invalid direction '{}': must be callers, callees, or both", other)),
-    }
+        other => return Err(anyhow!("invalid direction '{}': must be callers, callees, or both", other)),
+    };
+    Ok(CallGraphResult {
+        nodes,
+        limit_hit,
+        depth_capped,
+        effective_max_depth,
+        requested_max_depth,
+    })
 }
 
+/// Returns `(nodes, limit_hit)`. `limit_hit` is true when the SQL query
+/// returned exactly `CALL_GRAPH_ROW_LIMIT` rows — more nodes may exist
+/// beyond the returned set.
 fn query_direction(
     conn: &Connection,
     function_name: &str,
     max_depth: i32,
     file_path: Option<&str>,
     direction: Direction,
-) -> Result<Vec<CallGraphNode>> {
-    let max_depth = max_depth.min(10); // Hard cap to prevent CTE blowup on highly connected graphs
+) -> Result<(Vec<CallGraphNode>, bool)> {
+    let max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH); // Hard cap to prevent CTE blowup on highly connected graphs
     // Use NULL sentinel: when file_path is None, pass NULL and the filter is always true
     let file_filter = "AND (?2 IS NULL OR f.path = ?2)";
     let file_path_param: Option<&str> = file_path;
@@ -116,7 +160,8 @@ fn query_direction(
             JOIN files f ON f.id = n.file_id
         ) WHERE rn = 1
         ORDER BY depth
-        LIMIT 200"
+        LIMIT {row_limit}",
+        row_limit = CALL_GRAPH_ROW_LIMIT,
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -137,7 +182,8 @@ fn query_direction(
         .query_map(rusqlite::params![function_name, file_path_param, max_depth, REL_CALLS], map_row)?
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(results)
+    let limit_hit = results.len() == CALL_GRAPH_ROW_LIMIT;
+    Ok((results, limit_hit))
 }
 
 /// Merge callee and caller results, deduplicating by (node_id, direction) and keeping the entry
@@ -223,18 +269,18 @@ mod tests {
         let result = get_call_graph(conn, "A", "callees", 2, None).unwrap();
 
         // Should include A (depth 0), B (depth 1), C (depth 2)
-        let names: Vec<&str> = result.iter().map(|n| n.name.as_str()).collect();
+        let names: Vec<&str> = result.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"A"), "should contain root node A");
         assert!(names.contains(&"B"), "should contain callee B");
         assert!(names.contains(&"C"), "should contain callee C");
         assert!(!names.contains(&"D"), "should NOT contain D (not a callee of A)");
 
         // Verify depths
-        let a_node = result.iter().find(|n| n.name == "A").unwrap();
+        let a_node = result.nodes.iter().find(|n| n.name == "A").unwrap();
         assert_eq!(a_node.depth, 0);
-        let b_node = result.iter().find(|n| n.name == "B").unwrap();
+        let b_node = result.nodes.iter().find(|n| n.name == "B").unwrap();
         assert_eq!(b_node.depth, 1);
-        let c_node = result.iter().find(|n| n.name == "C").unwrap();
+        let c_node = result.nodes.iter().find(|n| n.name == "C").unwrap();
         assert_eq!(c_node.depth, 2);
     }
 
@@ -262,18 +308,18 @@ mod tests {
 
         let result = get_call_graph(conn, "B", "callers", 2, None).unwrap();
 
-        let names: Vec<&str> = result.iter().map(|n| n.name.as_str()).collect();
+        let names: Vec<&str> = result.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"B"), "should contain root node B");
         assert!(names.contains(&"A"), "should contain caller A");
         assert!(names.contains(&"D"), "should contain caller D");
         assert!(!names.contains(&"C"), "should NOT contain C (C is a callee, not caller)");
 
         // Verify depths
-        let b_node = result.iter().find(|n| n.name == "B").unwrap();
+        let b_node = result.nodes.iter().find(|n| n.name == "B").unwrap();
         assert_eq!(b_node.depth, 0);
-        let a_node = result.iter().find(|n| n.name == "A").unwrap();
+        let a_node = result.nodes.iter().find(|n| n.name == "A").unwrap();
         assert_eq!(a_node.depth, 1);
-        let d_node = result.iter().find(|n| n.name == "D").unwrap();
+        let d_node = result.nodes.iter().find(|n| n.name == "D").unwrap();
         assert_eq!(d_node.depth, 1);
     }
 
@@ -299,9 +345,9 @@ mod tests {
         let result = get_call_graph(conn, "A", "callees", 10, None).unwrap();
 
         // Should terminate and contain at most A and B
-        assert!(result.len() <= 2, "cycle detection should limit results to <=2, got {}", result.len());
+        assert!(result.nodes.len() <= 2, "cycle detection should limit results to <=2, got {}", result.nodes.len());
 
-        let names: Vec<&str> = result.iter().map(|n| n.name.as_str()).collect();
+        let names: Vec<&str> = result.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"A"));
         assert!(names.contains(&"B"));
     }
@@ -330,14 +376,14 @@ mod tests {
 
         let result = get_call_graph(conn, "B", "both", 2, None).unwrap();
 
-        let names: Vec<&str> = result.iter().map(|n| n.name.as_str()).collect();
+        let names: Vec<&str> = result.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"B"), "should contain root node B");
         assert!(names.contains(&"A"), "should contain caller A");
         assert!(names.contains(&"D"), "should contain caller D");
         assert!(names.contains(&"C"), "should contain callee C");
 
         // B should be at depth 0
-        let b_node = result.iter().find(|n| n.name == "B").unwrap();
+        let b_node = result.nodes.iter().find(|n| n.name == "B").unwrap();
         assert_eq!(b_node.depth, 0);
     }
 
@@ -367,15 +413,43 @@ mod tests {
 
         let result = get_call_graph(conn, "C", "callers", 2, None).unwrap();
 
-        let c_node = result.iter().find(|n| n.name == "C").unwrap();
+        let c_node = result.nodes.iter().find(|n| n.name == "C").unwrap();
         assert_eq!(c_node.parent_id, None, "root must have no parent");
 
-        let b_node = result.iter().find(|n| n.name == "B").unwrap();
+        let b_node = result.nodes.iter().find(|n| n.name == "B").unwrap();
         assert_eq!(b_node.parent_id, Some(c), "depth-1 caller B's parent is the root C");
 
-        let a_node = result.iter().find(|n| n.name == "A").unwrap();
+        let a_node = result.nodes.iter().find(|n| n.name == "A").unwrap();
         assert_eq!(a_node.parent_id, Some(b), "depth-2 caller A's parent is depth-1 B (NOT C)");
-        let d_node = result.iter().find(|n| n.name == "D").unwrap();
+        let d_node = result.nodes.iter().find(|n| n.name == "D").unwrap();
         assert_eq!(d_node.parent_id, Some(b), "depth-2 caller D's parent is depth-1 B (NOT C)");
+    }
+
+    /// requested depth > CALL_GRAPH_MAX_DEPTH must set depth_capped and clamp
+    /// effective_max_depth without silently truncating.
+    #[test]
+    fn test_depth_capped_signal() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "test.ts".into(),
+            blake3_hash: "h1".into(),
+            last_modified: 1,
+            language: Some("typescript".into()),
+        }).unwrap();
+        let a = insert_node(conn, &node("A", fid)).unwrap();
+        let b = insert_node(conn, &node("B", fid)).unwrap();
+        insert_edge(conn, a, b, REL_CALLS, None).unwrap();
+
+        let result = get_call_graph(conn, "A", "callees", 99, None).unwrap();
+        assert!(result.depth_capped, "depth=99 must trip the cap");
+        assert_eq!(result.requested_max_depth, 99);
+        assert_eq!(result.effective_max_depth, CALL_GRAPH_MAX_DEPTH);
+        assert!(!result.limit_hit, "this fixture has only 2 nodes, must not trigger row limit");
+
+        let small = get_call_graph(conn, "A", "callees", 5, None).unwrap();
+        assert!(!small.depth_capped, "depth=5 must not trip the cap");
+        assert_eq!(small.requested_max_depth, 5);
+        assert_eq!(small.effective_max_depth, 5);
     }
 }
