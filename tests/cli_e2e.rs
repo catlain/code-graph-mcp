@@ -667,6 +667,18 @@ fn test_cli_json_empty_show() {
 }
 
 #[test]
+fn test_cli_json_empty_show_node_id_missing() {
+    // Regression: `show --node-id 999999` for a nonexistent ID exited 1 with
+    // empty stdout in --json mode, asymmetric with the symbol-not-found path
+    // above which already emits []. Both empty-result paths must agree.
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["show", "--node-id", "9999999", "--json"]);
+    assert_eq!(code, 1);
+    assert_eq!(stdout.trim(), "[]",
+        "JSON show with nonexistent --node-id should output [] (matches symbol-not-found path)");
+}
+
+#[test]
 fn test_cli_json_empty_trace() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["trace", "/api/nonexistent", "--json"]);

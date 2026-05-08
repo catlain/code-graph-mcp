@@ -1933,6 +1933,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
         match queries::get_node_with_file_by_id(conn, nid)? {
             Some(nwf) => vec![(nwf.node, nwf.file_path)],
             None => {
+                if json_mode { println!("[]"); }
                 eprintln!("[code-graph] Node ID {} not found.", nid);
                 std::process::exit(1);
             }
@@ -2455,6 +2456,7 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
     let conn = db.conn();
 
     if !db.vec_enabled() {
+        if json_mode { println!("[]"); }
         eprintln!("[code-graph] Vector search not available (sqlite-vec extension not loaded).");
         eprintln!("  To enable: build with `cargo build --release --features embed-model`.");
         eprintln!("  Alternative: use `code-graph-mcp search <query>` for text-based similarity.");
