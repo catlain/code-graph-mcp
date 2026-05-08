@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.18.3 — release-pipeline supply-chain hardening + pending-sweep narrow
+
+Maintenance release. No public-API or schema changes; CLI flags, MCP tool
+shapes, and SQLite schema all unchanged from v0.18.2. Output of comprehensive
+gstack audit run (/cso, /review, /retro) on v0.18.2 — every finding actioned
+or explicitly accepted with rationale.
+
+**Release pipeline** — third-party action SHA pins, model revision pin
+
+- `release.yml`: `dtolnay/rust-toolchain@stable` → `@e081816` (1.95.0 branch
+  SHA-pinned). Closes the asymmetry where `release.yml` built shipped
+  binaries with whatever the latest stable Rust was at build time, while
+  `ci.yml` tested with `1.95.0`. Also closes the supply-chain window where
+  a moved `@stable` tag would have silently affected every release.
+- `release.yml`: `Swatinem/rust-cache@v2` → `@e18b497`,
+  `softprops/action-gh-release@v3` → `@b430933`. Both third-party,
+  in the release path; cache-action poisoning could exfiltrate `NPM_TOKEN`,
+  release-action substitution could swap GH Release artifacts. Floating
+  major-version tags are mutable; commit SHAs aren't.
+- `release.yml` model-bundle step: HuggingFace `resolve/main/$f` →
+  `resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/$f` for
+  `sentence-transformers/all-MiniLM-L6-v2`. Plus `curl --fail` so a 404
+  HTML page can no longer masquerade as `model.safetensors` (the bundle's
+  downstream sha256 only validated the bundle against itself, not against
+  a known-good upstream).
+
+**Supply-chain CVE coverage** — new CI job + 6 RUSTSEC fixes
+
+- New `audit` job in `ci.yml` runs `cargo audit` against `Cargo.lock` on
+  every push/PR. cargo-audit pinned to `^0.22` because `0.21.x` panics on
+  RustSec advisories using CVSS 4.0 (e.g. `RUSTSEC-2026-0066`) — fetch
+  fails before any finding can be reported. Default behavior fails on
+  vulnerabilities; informational `unmaintained`/`unsound` advisories print
+  but don't block (most are transitive and not under our control until
+  upstream replacements ship).
+- `cargo update -p rustls-webpki -p tar` resolved the 6 advisories the
+  new audit job surfaced on a v0.18.2 baseline:
+  - `rustls-webpki 0.103.9 → 0.103.13` (RUSTSEC-2026-0099 wildcard cert
+    name acceptance, RUSTSEC-2026-0098 URI name constraint, RUSTSEC-2026-0104
+    CRL parsing panic, RUSTSEC-2026-0049 CRL distribution-point matching).
+    Used transitively via `reqwest`/`quinn`.
+  - `tar 0.4.44 → 0.4.45` (RUSTSEC-2026-0067 `unpack_in` symlink chmod,
+    RUSTSEC-2026-0068 PAX size header). Direct dep behind `embed-model`
+    feature, used to unpack the bundled HF model tarball.
+
+**Indexer perf** — pending sweep no longer full-scans nodes
+
+`resolve_pending_calls` in `src/indexer/pipeline.rs` previously did
+`SELECT n.id, n.name, ... FROM nodes n JOIN files f ...` over the full
+nodes table to build the in-memory `name → [(node_id, language)]` map for
+resolution. Even a 1-row pending table triggered a full scan on every
+incremental pass. Narrowed by adding
+`AND n.name IN (SELECT DISTINCT target_name FROM pending_unresolved_calls)`
+to the SELECT — scope drops to ≤ |pending| names per sweep. All 5
+v0.18.2 regression tests still pass; resolution semantics unchanged.
+
 ## v0.18.2 — incremental dropped-edge root-cause fix (both directions)
 
 Closes the bug documented in memory `feedback_incremental_edge_timing.md`:

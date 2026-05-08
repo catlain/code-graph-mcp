@@ -66,3 +66,30 @@ jobs:
           node-version: 20
       - name: Plugin lifecycle tests
         run: node --test claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js scripts/release-smoke.test.js
+
+  # Supply-chain CVE scan over Cargo.lock (376 transitive deps including the
+  # Candle ML stack). cargo-audit reads RustSec advisories and exits non-zero
+  # on any vulnerability — keeps CVE coverage continuous instead of a one-time
+  # review. Independent of the check-and-test matrix because it scans
+  # Cargo.lock content, not build output.
+  #
+  # Pinned to cargo-audit ^0.22 because 0.21.x panics on RustSec advisories
+  # using CVSS 4.0 (e.g. RUSTSEC-2026-0066) — the fetch fails before any
+  # finding can be reported.
+  #
+  # No `--deny warnings`: vulnerabilities fail the run by default; informational
+  # advisories (`unmaintained`, `unsound`) print but don't block — most are
+  # transitive and not under our control until upstream replacements ship.
+  audit:
+    name: Cargo Audit (supply-chain CVE scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-audit
+      - name: Install cargo-audit
+        run: cargo install --locked --version ^0.22 cargo-audit
+      - name: Run cargo audit
+        run: cargo audit
