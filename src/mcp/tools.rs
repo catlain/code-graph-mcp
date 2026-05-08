@@ -82,7 +82,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "project_map".into(),
-                description: "Project architecture map. Use when: starting work on unfamiliar code, finding which module owns functionality, or needing cross-module dependency overview.".into(),
+                description: "Project architecture map. SessionStart hook already injects this at boot. Call only if structure changed mid-session: major refactor, rebuild-index, or many new modules.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

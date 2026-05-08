@@ -1,5 +1,91 @@
 # Changelog
 
+## v0.18.0 — routing_bench frontend domain + project_map dedup hint
+
+Two changes driven by the v0.17.3 30-day usage audit. The audit found
+that **all 728 code-graph MCP/CLI calls in 30 days came from the
+plugin's own repo** — frontend / non-Rust workflows had zero coverage
+in the routing benchmark, so we couldn't tell whether tool descriptions
+activated for them. It also found that `project_map` was being invoked
+~11 times/30d via MCP **after** SessionStart had already injected the
+same map at boot — pure redundancy.
+
+**1. routing_bench frontend domain** (`tests/routing_bench.rs`).
+
+Adds a second 20-query oracle (`FRONTEND_ORACLE`) covering the same 7
+core tools with JS/TS/Vue/React phrasing (component / hook / Promise /
+useEffect / Redux dispatch). Selectable via new env:
+
+- `ROUTING_BENCH_DOMAIN=backend` (default — preserves v0.17.2/v0.17.3
+  baselines comparable; runs only the original 22-query Rust pool).
+- `ROUTING_BENCH_DOMAIN=frontend` — runs only `FRONTEND_ORACLE`.
+- `ROUTING_BENCH_DOMAIN=all` — both pools (42 q), with separate
+  `Backend recall` / `Frontend recall` buckets in the report so
+  frontend regressions don't hide behind backend wins.
+
+The bench helpers (`compute_recall`, `compute_overall`, `build_oracle`)
+were refactored to accept an oracle slice instead of hardcoding `ORACLE`,
+so the same scoring path covers both domains. `oracle_well_formed`
+guards backend coverage; new `frontend_oracle_well_formed` and
+`frontend_oracle_distinct_from_backend` guard the frontend pool.
+
+15 new tests added (42 total, was 27); no API key required for any of
+them. Test count: `cargo test --test routing_bench` 42 passed,
+1 ignored (the API-gated `routing_recall_benchmark` itself).
+
+**First frontend baseline** (sonnet-4.5, 3-run majority vote,
+domain=all mode=context-rich, ~$0.80/run):
+
+- Backend recall: **22/22 = 100%** (was 21/22 in v0.17.2 — the historic
+  `EmbeddingModel struct definition` miss did not recur this run; v0.17.3's
+  description tightening of `get_ast_node` and `semantic_code_search`
+  appears to have stuck on sonnet-4.5).
+- Frontend recall: **19/20 = 95.0%**.
+- FP-rate: 0/10 = 0%.
+- Overall: 51/52 = 98.1%.
+
+The single frontend miss is `"List all React components in src/components/"` →
+routes to `module_overview` (3-run unanimous), expected `ast_search`. This
+is borderline-by-design: the query contains a module-path prefix
+(`src/components/`) which triggers the v0.17.0 description rule "if module
+path is known, prefer module_overview" — the same rule guarded by backend
+ORACLE's `"How does the embedding pipeline work in src/embedding/?"`
+regression case. Two valid routings; model picked the path-anchored one.
+Future regression gate: frontend recall ≥ 19/20.
+
+**Conclusion**: frontend pool achieves near-backend recall with vanilla
+sonnet — tool descriptions already activate on JS/TS/Vue/React
+vocabulary. The "frontend project shows zero MCP calls" observation
+from the usage audit is workflow/install shortfall (the audited project
+hadn't enabled the plugin in `.mcp.json`), not a routing-description
+failure.
+
+**2. project_map description: explicit dedup hint** (`src/mcp/tools.rs`).
+
+Description rewritten from
+`"Project architecture map. Use when: starting work on unfamiliar
+code, finding which module owns functionality, or needing cross-module
+dependency overview."`
+to
+`"Project architecture map. SessionStart hook already injects this at
+boot. Call only if structure changed mid-session: major refactor,
+rebuild-index, or many new modules."`
+
+170 bytes, fits the 200-byte per-description cap asserted by
+`mcp::tools::tests::test_descriptions_are_concise`.
+
+**Re-bench (same methodology) post-description-change**: zero
+regression. Backend 22/22, Frontend 19/20, FP 0/10, Overall 51/52
+unchanged. Same single frontend miss. Conclusion: explicit
+"do-not-call-redundantly" framing in tool descriptions is regression-
+safe and reusable for any other MCP tool that already has SessionStart-
+hook coverage.
+
+**Expected impact**: ~11 redundant `project_map` MCP calls/month
+eliminated (~33K tokens/month saved) without any routing precision
+trade-off. Will be visible in the next 30-day window's
+`code-graph-mcp stats tools.project_map.n` count.
+
 ## v0.17.3 — get_ast_node disambiguation (description tightening)
 
 Bench-driven fix on **published tool descriptions** for the

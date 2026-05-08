@@ -37,13 +37,30 @@
 //! Misses print with `expected` vs `got` so you can see whether routing went to
 //! a semantically-adjacent tool or a wrong tool entirely.
 //!
+//! ## Domains
+//!
+//! `ROUTING_BENCH_DOMAIN` selects which oracle pool runs:
+//! - `backend` (default) — Rust/cross-module phrasing only (`ORACLE`, 22 q).
+//!   Preserves baseline comparability with v0.17.2 and earlier.
+//! - `frontend` — JS/TS/Vue/React phrasing only (`FRONTEND_ORACLE`, 20 q).
+//!   Same 7 core tools, swapped vocabulary (component / hook / Promise<User> /
+//!   useEffect / Redux / dispatch). Tests whether tool descriptions activate
+//!   on the daagu-style frontend workflows that scored 0 MCP calls in the 7d
+//!   usage audit.
+//! - `all` — both pools (42 q), with separate per-domain recall buckets in
+//!   the report so frontend regressions don't hide behind backend wins.
+//!
 //! ## Cost
 //!
-//! Tool-only mode (default): ~$0.10/run with `claude-sonnet-4-6` (20 queries ×
-//! 1 run × ~1.2K in + ~150 out tokens).
+//! Tool-only mode, 3-run majority vote (post-Task 8):
+//! - `domain=backend`   ~$0.30/run (22 q × 3 runs).
+//! - `domain=frontend`  ~$0.27/run (20 q × 3 runs).
+//! - `domain=all`       ~$0.55/run (42 q × 3 runs).
 //!
-//! Context-rich mode (`ROUTING_BENCH_MODE=context-rich`): ~$0.45/run (30
-//! queries × 3 runs majority vote, system prompt grows by INDEX_LINE_MIRROR).
+//! Context-rich mode (adds 10 FP queries + INDEX_LINE_MIRROR system prompt):
+//! - `domain=backend`   ~$0.45/run (32 q × 3 runs).
+//! - `domain=frontend`  ~$0.40/run (30 q × 3 runs).
+//! - `domain=all`       ~$0.80/run (52 q × 3 runs).
 //!
 //! OpenRouter adds a small markup (~5–10%).
 
@@ -105,6 +122,44 @@ const ORACLE: &[(&str, &str)] = &[
     // query asserts the rename-audit phrasing still hits find_references
     // — the intent we want to preserve through the tightening.
     ("I need to rename parse_tree to parse_ast — find every place I'd update.", "find_references"),
+];
+
+/// Frontend (JS/TS/Vue/React) phrasing of the same 7 tool intents. Activated
+/// by `ROUTING_BENCH_DOMAIN=frontend|all`. Each tool gets ≥2 queries; the
+/// vocabulary is intentionally drift-tested against the daagu-style workflow
+/// (component / hook / Promise / useEffect / Redux dispatch) where the 7d
+/// usage audit recorded zero MCP invocations across 1228 Bash commands.
+///
+/// Maintenance contract: any new core tool must add ≥1 entry here AND in
+/// `ORACLE` (enforced by `frontend_oracle_well_formed` / `oracle_well_formed`).
+const FRONTEND_ORACLE: &[(&str, &str)] = &[
+    // project_map
+    ("Show me the architecture of this React app", "project_map"),
+    ("Give me a high-level map of this Vue project", "project_map"),
+    ("Which top-level features depend on which?", "project_map"),
+    // module_overview
+    ("What's in the src/components/ directory?", "module_overview"),
+    ("Show me what's exported from src/hooks/", "module_overview"),
+    ("Give me an overview of the auth feature module", "module_overview"),
+    // semantic_code_search
+    ("Find the code that handles user login state", "semantic_code_search"),
+    ("Where is the Redux store wired up?", "semantic_code_search"),
+    ("Show me code that debounces search input", "semantic_code_search"),
+    // get_call_graph
+    ("Who calls the function fetchUserProfile?", "get_call_graph"),
+    ("What does handleSubmit invoke during execution?", "get_call_graph"),
+    ("Trace the call chain around dispatch in the reducer", "get_call_graph"),
+    // find_references
+    ("Find every place that imports the Button component", "find_references"),
+    ("Is it safe to delete useDebounce? Show all usage sites.", "find_references"),
+    // ast_search
+    ("Find all functions that return Promise<User>", "ast_search"),
+    ("List all React components in src/components/", "ast_search"),
+    ("Which functions take a useEffect dependency array as a parameter?", "ast_search"),
+    // get_ast_node
+    ("Show me the LoginForm component definition", "get_ast_node"),
+    ("What's the signature of the useAuth hook?", "get_ast_node"),
+    ("Display the implementation of getAuthHeaders", "get_ast_node"),
 ];
 
 /// Strict-A FP corpus: 10 queries that should route to a decoy (Grep or Read),
@@ -252,7 +307,8 @@ fn routing_recall_benchmark() {
         }
     };
     let mode = detect_mode();
-    eprintln!("[routing_bench] backend={} mode={:?}", backend.label(), mode);
+    let domain = detect_domain();
+    eprintln!("[routing_bench] backend={} mode={:?} domain={:?}", backend.label(), mode, domain);
 
     let registry = ToolRegistry::new();
     let registry_tools: Vec<Value> = registry
@@ -268,7 +324,8 @@ fn routing_recall_benchmark() {
 
     let tools = build_tools(mode, registry_tools);
     let system_prompt = build_system_prompt(mode);
-    let oracle = build_oracle(mode);
+    let active = active_oracle(domain);
+    let oracle = build_oracle(mode, domain);
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -298,15 +355,17 @@ fn routing_recall_benchmark() {
     // Mode-specific reporting.
     match mode {
         BenchMode::ToolOnly => {
-            let recall = compute_recall(&picks);
+            let recall = compute_recall(&picks, &active);
             eprintln!(
-                "\n[routing_bench] mode=tool-only backend={} P@1={}/{} = {:.1}% (threshold {:.0}%)",
+                "\n[routing_bench] mode=tool-only backend={} domain={:?} P@1={}/{} = {:.1}% (threshold {:.0}%)",
                 backend.label(),
-                (recall * ORACLE.len() as f64).round() as usize,
-                ORACLE.len(),
+                domain,
+                (recall * active.len() as f64).round() as usize,
+                active.len(),
                 recall * 100.0,
                 P_AT_1_THRESHOLD * 100.0,
             );
+            print_per_domain_recall(domain, &picks);
             print_misses(&all_misses);
             assert!(
                 recall >= P_AT_1_THRESHOLD,
@@ -315,21 +374,23 @@ fn routing_recall_benchmark() {
             );
         }
         BenchMode::ContextRich => {
-            let recall = compute_recall(&picks);
+            let recall = compute_recall(&picks, &active);
             let fp_rate = compute_fp_rate(&picks);
-            let overall = compute_overall(&picks);
+            let overall = compute_overall(&picks, &active);
             eprintln!(
-                "\n[routing_bench] mode=context-rich backend={}\n  Recall  = {:.1}% ({}/{})\n  FP-rate = {:.1}% ({}/{})\n  Overall = {:.1}% ({}/{}, threshold {:.0}%)",
+                "\n[routing_bench] mode=context-rich backend={} domain={:?}\n  Recall  = {:.1}% ({}/{})\n  FP-rate = {:.1}% ({}/{})\n  Overall = {:.1}% ({}/{}, threshold {:.0}%)",
                 backend.label(),
+                domain,
                 recall * 100.0,
-                (recall * ORACLE.len() as f64).round() as usize, ORACLE.len(),
+                (recall * active.len() as f64).round() as usize, active.len(),
                 fp_rate * 100.0,
                 (fp_rate * FP_ORACLE.len() as f64).round() as usize, FP_ORACLE.len(),
                 overall * 100.0,
-                (overall * (ORACLE.len() + FP_ORACLE.len()) as f64).round() as usize,
-                ORACLE.len() + FP_ORACLE.len(),
+                (overall * (active.len() + FP_ORACLE.len()) as f64).round() as usize,
+                active.len() + FP_ORACLE.len(),
                 P_AT_1_THRESHOLD * 100.0,
             );
+            print_per_domain_recall(domain, &picks);
             print_misses(&all_misses);
             assert!(
                 overall >= P_AT_1_THRESHOLD,
@@ -338,6 +399,26 @@ fn routing_recall_benchmark() {
             );
         }
     }
+}
+
+/// When `domain=All`, also print per-pool recall so frontend regressions
+/// don't hide behind backend wins. No-op for single-domain runs (the headline
+/// number already covers it).
+fn print_per_domain_recall(domain: BenchDomain, picks: &HashMap<String, String>) {
+    if !matches!(domain, BenchDomain::All) {
+        return;
+    }
+    let be_oracle: Vec<(&str, &str)> = ORACLE.to_vec();
+    let fe_oracle: Vec<(&str, &str)> = FRONTEND_ORACLE.to_vec();
+    let be = compute_recall(picks, &be_oracle);
+    let fe = compute_recall(picks, &fe_oracle);
+    eprintln!(
+        "  Backend recall  = {:.1}% ({}/{})\n  Frontend recall = {:.1}% ({}/{})",
+        be * 100.0,
+        (be * ORACLE.len() as f64).round() as usize, ORACLE.len(),
+        fe * 100.0,
+        (fe * FRONTEND_ORACLE.len() as f64).round() as usize, FRONTEND_ORACLE.len(),
+    );
 }
 
 fn print_misses(misses: &[(String, String, Vec<Option<String>>)]) {
@@ -370,6 +451,43 @@ fn detect_mode_for(env: Option<&str>) -> BenchMode {
 /// Production wrapper — reads `ROUTING_BENCH_MODE` env.
 fn detect_mode() -> BenchMode {
     detect_mode_for(std::env::var("ROUTING_BENCH_MODE").ok().as_deref())
+}
+
+/// Domain selector — which oracle pool drives recall. Default `Backend`
+/// keeps v0.17.2 baselines comparable; `Frontend` and `All` are opt-in via
+/// `ROUTING_BENCH_DOMAIN=frontend|all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchDomain {
+    Backend,
+    Frontend,
+    All,
+}
+
+/// Pure helper for testing — accepts the env value directly.
+fn detect_domain_for(env: Option<&str>) -> BenchDomain {
+    match env {
+        Some("frontend") => BenchDomain::Frontend,
+        Some("all") => BenchDomain::All,
+        _ => BenchDomain::Backend,
+    }
+}
+
+/// Production wrapper — reads `ROUTING_BENCH_DOMAIN` env.
+fn detect_domain() -> BenchDomain {
+    detect_domain_for(std::env::var("ROUTING_BENCH_DOMAIN").ok().as_deref())
+}
+
+/// The active oracle (without FP corpus) for a given domain.
+fn active_oracle(domain: BenchDomain) -> Vec<(&'static str, &'static str)> {
+    match domain {
+        BenchDomain::Backend => ORACLE.to_vec(),
+        BenchDomain::Frontend => FRONTEND_ORACLE.to_vec(),
+        BenchDomain::All => {
+            let mut v = ORACLE.to_vec();
+            v.extend_from_slice(FRONTEND_ORACLE);
+            v
+        }
+    }
 }
 
 /// Decoy tools added in context-rich mode. Mirrors the most common Claude
@@ -434,23 +552,26 @@ fn build_system_prompt(mode: BenchMode) -> String {
     }
 }
 
-/// Build the oracle (query → expected-tool pairs). ToolOnly returns ORACLE
-/// only; ContextRich appends FP_ORACLE.
-fn build_oracle(mode: BenchMode) -> Vec<(&'static str, &'static str)> {
-    let mut all = ORACLE.to_vec();
+/// Build the oracle (query → expected-tool pairs). Pulls the active-domain
+/// pool via `active_oracle`; ContextRich appends FP_ORACLE.
+fn build_oracle(mode: BenchMode, domain: BenchDomain) -> Vec<(&'static str, &'static str)> {
+    let mut all = active_oracle(domain);
     if matches!(mode, BenchMode::ContextRich) {
         all.extend_from_slice(FP_ORACLE);
     }
     all
 }
 
-/// Recall over ORACLE: fraction of code-graph queries where the picked tool
-/// matches the expected tool exactly.
-fn compute_recall(picks: &HashMap<String, String>) -> f64 {
-    let hits = ORACLE.iter()
+/// Recall over an oracle slice: fraction of queries in the slice where the
+/// picked tool matches the expected tool exactly. Returns 0.0 on empty slice.
+fn compute_recall(picks: &HashMap<String, String>, oracle: &[(&str, &str)]) -> f64 {
+    if oracle.is_empty() {
+        return 0.0;
+    }
+    let hits = oracle.iter()
         .filter(|(q, exp)| picks.get(*q).map(|p| p == exp).unwrap_or(false))
         .count();
-    hits as f64 / ORACLE.len() as f64
+    hits as f64 / oracle.len() as f64
 }
 
 /// FP-rate over FP_ORACLE: fraction of FP queries where the picked tool is
@@ -467,11 +588,12 @@ fn compute_fp_rate(picks: &HashMap<String, String>) -> f64 {
     violations as f64 / FP_ORACLE.len() as f64
 }
 
-/// Overall summary: (recall_hits + fp_avoidance) / total. Loose metric —
-/// FP_avoidance counts wrong-decoy picks as good (boundary held). Use
-/// recall and fp_rate separately for candidate comparison.
-fn compute_overall(picks: &HashMap<String, String>) -> f64 {
-    let recall_hits = ORACLE.iter()
+/// Overall summary: (recall_hits + fp_avoidance) / total over the active
+/// oracle plus FP_ORACLE. Loose metric — FP_avoidance counts wrong-decoy
+/// picks as good (boundary held). Use recall and fp_rate separately for
+/// candidate comparison.
+fn compute_overall(picks: &HashMap<String, String>, oracle: &[(&str, &str)]) -> f64 {
+    let recall_hits = oracle.iter()
         .filter(|(q, exp)| picks.get(*q).map(|p| p == exp).unwrap_or(false))
         .count();
     let fp_violations = FP_ORACLE.iter()
@@ -481,7 +603,10 @@ fn compute_overall(picks: &HashMap<String, String>) -> f64 {
         })
         .count();
     let fp_avoidance = FP_ORACLE.len() - fp_violations;
-    let total = ORACLE.len() + FP_ORACLE.len();
+    let total = oracle.len() + FP_ORACLE.len();
+    if total == 0 {
+        return 0.0;
+    }
     (recall_hits + fp_avoidance) as f64 / total as f64
 }
 
@@ -532,27 +657,51 @@ fn index_line_drift_check() {
     );
 }
 
-#[test]
-fn oracle_well_formed() {
-    // Invariant that runs without an API key: every expected tool in the oracle
-    // is a real tool in the live registry, and the oracle covers all 7 core tools.
+/// Shared invariant for any oracle pool: every expected tool exists in the
+/// live registry, and every registry tool has ≥1 query in this pool. Runs
+/// without an API key.
+fn assert_oracle_covers_registry(pool_name: &str, oracle: &[(&'static str, &'static str)]) {
     let registry = ToolRegistry::new();
     let names: std::collections::HashSet<&str> = registry.list_tools().iter()
         .map(|t| t.name.as_str()).collect();
     let mut covered: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for &(query, expected) in ORACLE {
+    for &(query, expected) in oracle {
         assert!(
             names.contains(expected),
-            "Oracle references unknown tool '{}' (query='{}'). Registry has: {:?}",
-            expected, query, names,
+            "[{}] Oracle references unknown tool '{}' (query='{}'). Registry has: {:?}",
+            pool_name, expected, query, names,
         );
         covered.insert(expected);
     }
     for name in &names {
         assert!(
             covered.contains(name),
-            "Tool '{}' has no oracle coverage — add at least one query.",
-            name,
+            "[{}] Tool '{}' has no oracle coverage — add at least one query.",
+            pool_name, name,
+        );
+    }
+}
+
+#[test]
+fn oracle_well_formed() {
+    assert_oracle_covers_registry("backend/ORACLE", ORACLE);
+}
+
+#[test]
+fn frontend_oracle_well_formed() {
+    assert_oracle_covers_registry("frontend/FRONTEND_ORACLE", FRONTEND_ORACLE);
+}
+
+#[test]
+fn frontend_oracle_distinct_from_backend() {
+    // Catches accidental copy-paste: queries must not be shared between pools,
+    // otherwise `domain=all` would double-count.
+    let be: std::collections::HashSet<&str> = ORACLE.iter().map(|(q, _)| *q).collect();
+    for &(query, _) in FRONTEND_ORACLE {
+        assert!(
+            !be.contains(query),
+            "FRONTEND_ORACLE shares query with backend ORACLE: {:?}",
+            query,
         );
     }
 }
@@ -583,6 +732,57 @@ mod mode_tests {
     fn detect_mode_unknown_value_falls_back_to_tool_only() {
         let m = detect_mode_for(Some("invalid"));
         assert!(matches!(m, BenchMode::ToolOnly));
+    }
+}
+
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+
+    #[test]
+    fn detect_domain_defaults_to_backend_when_unset() {
+        // Backward-compat: pre-domain runs (and any caller without the env
+        // set) must keep hitting the original ORACLE pool so v0.17.2 baselines
+        // remain comparable.
+        assert!(matches!(detect_domain_for(None), BenchDomain::Backend));
+    }
+
+    #[test]
+    fn detect_domain_explicit_backend() {
+        assert!(matches!(detect_domain_for(Some("backend")), BenchDomain::Backend));
+    }
+
+    #[test]
+    fn detect_domain_explicit_frontend() {
+        assert!(matches!(detect_domain_for(Some("frontend")), BenchDomain::Frontend));
+    }
+
+    #[test]
+    fn detect_domain_explicit_all() {
+        assert!(matches!(detect_domain_for(Some("all")), BenchDomain::All));
+    }
+
+    #[test]
+    fn detect_domain_unknown_value_falls_back_to_backend() {
+        assert!(matches!(detect_domain_for(Some("nonsense")), BenchDomain::Backend));
+    }
+
+    #[test]
+    fn active_oracle_backend_returns_only_backend() {
+        let o = active_oracle(BenchDomain::Backend);
+        assert_eq!(o.len(), ORACLE.len());
+    }
+
+    #[test]
+    fn active_oracle_frontend_returns_only_frontend() {
+        let o = active_oracle(BenchDomain::Frontend);
+        assert_eq!(o.len(), FRONTEND_ORACLE.len());
+    }
+
+    #[test]
+    fn active_oracle_all_concatenates() {
+        let o = active_oracle(BenchDomain::All);
+        assert_eq!(o.len(), ORACLE.len() + FRONTEND_ORACLE.len());
     }
 }
 
@@ -699,14 +899,34 @@ mod builder_tests {
 
     #[test]
     fn build_oracle_tool_only_returns_only_oracle() {
-        let o = build_oracle(BenchMode::ToolOnly);
+        let o = build_oracle(BenchMode::ToolOnly, BenchDomain::Backend);
         assert_eq!(o.len(), ORACLE.len());
     }
 
     #[test]
     fn build_oracle_context_rich_concatenates() {
-        let o = build_oracle(BenchMode::ContextRich);
+        let o = build_oracle(BenchMode::ContextRich, BenchDomain::Backend);
         assert_eq!(o.len(), ORACLE.len() + FP_ORACLE.len());
+    }
+
+    #[test]
+    fn build_oracle_frontend_returns_frontend_pool() {
+        let o = build_oracle(BenchMode::ToolOnly, BenchDomain::Frontend);
+        assert_eq!(o.len(), FRONTEND_ORACLE.len());
+        // Sanity: a backend-only query must not be in the frontend oracle.
+        assert!(!o.iter().any(|(q, _)| *q == ORACLE[0].0));
+    }
+
+    #[test]
+    fn build_oracle_all_concatenates_both_pools() {
+        let o = build_oracle(BenchMode::ToolOnly, BenchDomain::All);
+        assert_eq!(o.len(), ORACLE.len() + FRONTEND_ORACLE.len());
+    }
+
+    #[test]
+    fn build_oracle_all_context_rich_includes_fp() {
+        let o = build_oracle(BenchMode::ContextRich, BenchDomain::All);
+        assert_eq!(o.len(), ORACLE.len() + FRONTEND_ORACLE.len() + FP_ORACLE.len());
     }
 }
 
@@ -724,13 +944,27 @@ mod scoring_tests {
         let p: HashMap<String, String> = ORACLE.iter()
             .map(|(q, t)| (q.to_string(), t.to_string()))
             .collect();
-        assert_eq!(compute_recall(&p), 1.0);
+        assert_eq!(compute_recall(&p, ORACLE), 1.0);
+    }
+
+    #[test]
+    fn compute_recall_full_hit_frontend() {
+        let p: HashMap<String, String> = FRONTEND_ORACLE.iter()
+            .map(|(q, t)| (q.to_string(), t.to_string()))
+            .collect();
+        assert_eq!(compute_recall(&p, FRONTEND_ORACLE), 1.0);
     }
 
     #[test]
     fn compute_recall_zero_picks() {
         let p = HashMap::new();
-        assert_eq!(compute_recall(&p), 0.0);
+        assert_eq!(compute_recall(&p, ORACLE), 0.0);
+    }
+
+    #[test]
+    fn compute_recall_empty_oracle_returns_zero() {
+        let p = HashMap::new();
+        assert_eq!(compute_recall(&p, &[]), 0.0);
     }
 
     #[test]
