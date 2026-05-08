@@ -2141,6 +2141,50 @@ app.post('/api/login', handleLogin);
         }
     }
 
+    /// Regression: when a dense call graph triggers BOTH the rollup branch
+    /// (est_tokens > COMPRESSION_TOKEN_THRESHOLD) AND saturates the row limit
+    /// (CALL_GRAPH_ROW_LIMIT), `attach_truncation_flags` must still fire on
+    /// the rollup payload — without this the agent sees `mode="rollup_call_graph"`
+    /// without any signal that more callers may exist beyond the 200-row cap.
+    #[test]
+    fn test_call_graph_rollup_with_truncation() {
+        let project_dir = TempDir::new().unwrap();
+        // 250 distinct callers of `hub` in one file → CTE produces 251 rows
+        // (hub at depth 0 + 250 depth-1 callers), saturating the LIMIT 200 cap.
+        // 200-row JSON serialization clears the 2000-token rollup threshold.
+        let mut code = String::from("function hub() {}\n");
+        for i in 0..250 {
+            code.push_str(&format!("function caller_{}() {{ hub(); }}\n", i));
+        }
+        std::fs::write(project_dir.path().join("dense.ts"), &code).unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json("get_call_graph", json!({
+            "function_name": "hub",
+            "direction": "callers",
+            "depth": 1
+        }));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+
+        // Rollup branch fired (dense fanout collapsed to file-level summary).
+        assert_eq!(result["mode"], "rollup_call_graph",
+            "250 callers in one file must trip rollup, got mode={:?}", result["mode"]);
+
+        // Truncation provenance survives the rollup: row limit hit, warning present.
+        assert_eq!(result["limit_hit"], json!(true),
+            "200-row cap hit on 250-caller fixture must surface limit_hit=true");
+        assert!(
+            result["truncation_warning"].as_str()
+                .map(|s| s.contains("row limit"))
+                .unwrap_or(false),
+            "truncation_warning must mention row limit; got {:?}",
+            result["truncation_warning"],
+        );
+    }
+
     #[test]
     fn test_ast_node_compression() {
         let project_dir = TempDir::new().unwrap();
