@@ -24,7 +24,17 @@ pub const INDEX_VERSION: i32 = 5;
 pub const EMBEDDING_DIM: usize = 384;
 
 // -- Token estimation --
-/// Approximate characters per token for code content (1 token ≈ 3 chars).
+/// Approximate **bytes** per token for code content (1 token ≈ 3 bytes UTF-8).
+///
+/// Despite the historical name, all callers feed `s.len()` (UTF-8 byte length
+/// in Rust) into this divisor — not Unicode char counts — which is why the
+/// estimate stays sensible for CJK content too:
+///
+/// - ASCII: ~3-4 bytes/token in BPE → `bytes/3` slightly overestimates (safe).
+/// - CJK: one char = 3 bytes UTF-8, ~1 token/char in BPE → `bytes/3 ≈ chars ≈ tokens` (accurate).
+///
+/// Conservative overestimation is the safe error direction: fires compression
+/// earlier, never under-counts and overflows the downstream context window.
 /// Used for token budget estimation across compression and search.
 pub const CHARS_PER_TOKEN: usize = 3;
 

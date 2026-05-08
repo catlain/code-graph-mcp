@@ -20,20 +20,22 @@ pub enum CompressedOutput {
     Directories(Vec<GroupedResult>),
 }
 
-/// Estimate token count for results using CHARS_PER_TOKEN ratio.
+/// Estimate token count for results using CHARS_PER_TOKEN (bytes/token) ratio.
 /// context_string already includes name, signature, and code_content,
 /// so we use it exclusively when available to avoid double-counting.
+/// `.len()` is UTF-8 byte length — see CHARS_PER_TOKEN doc for why this is
+/// CJK-correct without per-language branching.
 fn estimate_tokens(results: &[crate::storage::queries::NodeResult]) -> usize {
-    let total_chars: usize = results.iter().map(|r| {
+    let total_bytes: usize = results.iter().map(|r| {
         r.context_string.as_ref().map_or_else(
             || r.code_content.len() + r.name.len() + r.signature.as_ref().map_or(0, |s| s.len()),
             |ctx| ctx.len(),
         )
     }).sum();
-    total_chars / crate::domain::CHARS_PER_TOKEN
+    total_bytes / crate::domain::CHARS_PER_TOKEN
 }
 
-/// Estimate token count for a JSON value using CHARS_PER_TOKEN ratio.
+/// Estimate token count for a JSON value using CHARS_PER_TOKEN (bytes/token) ratio.
 pub fn estimate_json_tokens(value: &serde_json::Value) -> usize {
     match serde_json::to_string(value) {
         Ok(s) => s.len() / crate::domain::CHARS_PER_TOKEN,
@@ -304,5 +306,38 @@ mod tests {
             ..default_node()
         }];
         assert!(estimate_tokens(&large) > 2000);
+    }
+
+    /// CJK contract: estimator counts UTF-8 BYTES not chars, so a CJK string
+    /// of N chars (3N bytes) estimates to ~N tokens — matching BPE reality
+    /// (~1 token/CJK-char). Regression guard against someone "fixing" the
+    /// estimator to char-count and silently halving CJK budgets.
+    #[test]
+    fn test_estimate_tokens_cjk_byte_based() {
+        // 1000 CJK chars = 3000 UTF-8 bytes → estimate ≈ 1000 tokens
+        // (close to real BPE: ~1 token per CJK char in cl100k_base).
+        let cjk = vec![NodeResult {
+            code_content: "你".repeat(1000),
+            ..default_node()
+        }];
+        let est = estimate_tokens(&cjk);
+        assert!(
+            (900..=1100).contains(&est),
+            "CJK 1000-char estimate must be ~1000 tokens (bytes/3), got {}",
+            est,
+        );
+        // ASCII 1000 chars (1000 bytes) → ~333 tokens — confirms divisor is
+        // bytes-based (an ill-fixed char-based version would also report ~333
+        // here, but would WRONGLY report ~333 for the CJK case above).
+        let ascii = vec![NodeResult {
+            code_content: "x".repeat(1000),
+            ..default_node()
+        }];
+        let est_ascii = estimate_tokens(&ascii);
+        assert!(
+            est_ascii < est,
+            "1000 CJK chars must estimate higher than 1000 ASCII chars: cjk={} ascii={}",
+            est, est_ascii,
+        );
     }
 }
