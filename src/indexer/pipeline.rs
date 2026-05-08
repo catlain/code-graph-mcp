@@ -161,6 +161,74 @@ pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&Embeddi
     index_files(db, project_root, &files, &current_hashes, model, &[], progress)
 }
 
+/// Reindex a single file when its on-disk hash differs from the stored hash.
+/// No-op when the hashes match (or `rel_path` was never indexed in a way that
+/// would currently reindex it). Returns true when a reindex (or stale-row
+/// cleanup) actually fired.
+///
+/// Used by query-time freshness: when an MCP tool receives an explicit
+/// `file_path` argument, the agent is signaling "I just edited this; please
+/// answer against the current bytes." The 30s `last_incremental_check`
+/// debounce in the server is too coarse for tight Edit→search loops.
+///
+/// Cross-file dirty-edge handling mirrors `run_incremental_index`: collect
+/// dirty node IDs **before** re-indexing (cascade delete strips old edges),
+/// then regenerate context strings + embeddings once the new nodes exist.
+pub fn ensure_file_indexed(
+    db: &Database,
+    project_root: &Path,
+    rel_path: &str,
+    model: Option<&EmbeddingModel>,
+) -> Result<bool> {
+    let abs_path = project_root.join(rel_path);
+
+    // Missing-file path: drop stale row so future queries don't return phantom nodes.
+    if !abs_path.is_file() {
+        let exists_in_db: Option<i64> = db.conn().query_row(
+            "SELECT id FROM files WHERE path = ?1",
+            [rel_path],
+            |row| row.get(0),
+        ).ok();
+        if exists_in_db.is_some() {
+            let tx = db.conn().unchecked_transaction()?;
+            delete_files_by_paths(db.conn(), &[rel_path.to_string()])?;
+            tx.commit()?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    // Skip files we wouldn't index in the first place (binary / wrong language).
+    if crate::utils::config::detect_language(rel_path).is_none() {
+        return Ok(false);
+    }
+
+    let on_disk_hash = crate::indexer::merkle::hash_file(&abs_path)?;
+    let stored_hash: Option<String> = db.conn().query_row(
+        "SELECT blake3_hash FROM files WHERE path = ?1",
+        [rel_path],
+        |row| row.get(0),
+    ).ok();
+
+    if stored_hash.as_deref() == Some(&on_disk_hash) {
+        return Ok(false);
+    }
+
+    // Cross-file edges into this file's nodes need their context strings rebuilt
+    // *after* the node IDs are replaced — capture the dirty set BEFORE re-indexing.
+    let dirty_node_ids = collect_dirty_node_ids(db, std::slice::from_ref(&rel_path.to_string()))?;
+
+    let mut hashes: HashMap<String, String> = HashMap::new();
+    hashes.insert(rel_path.to_string(), on_disk_hash);
+    let files = vec![rel_path.to_string()];
+    index_files(db, project_root, &files, &hashes, model, &[], None)?;
+
+    if !dirty_node_ids.is_empty() {
+        regenerate_context_strings(db, &dirty_node_ids, model)?;
+    }
+    Ok(true)
+}
+
 pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>, progress: Option<ProgressFn>) -> Result<IndexResult> {
     let start = std::time::Instant::now();
     let stored_hashes = get_all_file_hashes(db.conn())?;
@@ -1851,5 +1919,50 @@ impl fmt::Display for MyWriter {
             "should have MyWriter→Write implements edge, got: {:?}", edges);
         assert!(edges.contains(&("MyWriter".into(), "fmt::Display".into())),
             "should have MyWriter→fmt::Display implements edge, got: {:?}", edges);
+    }
+
+    /// ensure_file_indexed must (a) be a no-op when on-disk hash matches the
+    /// stored hash, and (b) actually pick up post-edit content when it doesn't.
+    /// This is the contract the MCP `ensure_file_fresh_opt` wrapper relies on
+    /// to close the post-Edit→pre-incremental-index window.
+    #[test]
+    fn test_ensure_file_indexed_picks_up_post_edit_changes() {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        // Initial state: file with `alpha`
+        fs::write(project_dir.path().join("a.ts"), "function alpha() {}\n").unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+        let names_before: Vec<String> = get_nodes_by_name(db.conn(), "alpha")
+            .unwrap().into_iter().map(|n| n.name).collect();
+        assert_eq!(names_before, vec!["alpha".to_string()]);
+
+        // No-op when hashes match
+        let did = ensure_file_indexed(&db, project_dir.path(), "a.ts", None).unwrap();
+        assert!(!did, "matching hash must be a no-op (got reindex)");
+
+        // Edit on disk; old `alpha` removed, new `beta` added
+        fs::write(project_dir.path().join("a.ts"), "function beta() {}\n").unwrap();
+        let did2 = ensure_file_indexed(&db, project_dir.path(), "a.ts", None).unwrap();
+        assert!(did2, "hash mismatch must trigger a reindex");
+
+        // alpha gone, beta present — post-Edit query would now see fresh state
+        assert!(get_nodes_by_name(db.conn(), "alpha").unwrap().is_empty(),
+            "old alpha must be evicted by single-file reindex");
+        let beta = get_nodes_by_name(db.conn(), "beta").unwrap();
+        assert_eq!(beta.len(), 1, "new beta must appear after single-file reindex");
+        assert_eq!(beta[0].name, "beta");
+
+        // Calling again with no on-disk change is a no-op
+        let did3 = ensure_file_indexed(&db, project_dir.path(), "a.ts", None).unwrap();
+        assert!(!did3, "second call with no edit must no-op");
+
+        // Deleting the file from disk drops the row
+        fs::remove_file(project_dir.path().join("a.ts")).unwrap();
+        let did4 = ensure_file_indexed(&db, project_dir.path(), "a.ts", None).unwrap();
+        assert!(did4, "missing file must trigger row cleanup");
+        assert!(get_nodes_by_name(db.conn(), "beta").unwrap().is_empty(),
+            "beta must be cascade-deleted with its file");
     }
 }

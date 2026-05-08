@@ -393,6 +393,9 @@ impl McpServer {
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
+            // Edit-aware: if the agent named a specific file, sync-refresh it
+            // before answering so post-Edit queries don't see stale call edges.
+            self.ensure_file_fresh_opt(file_path)?;
         }
 
         // Disambiguate: if no file_path provided, check if symbol matches multiple distinct nodes
@@ -697,6 +700,10 @@ impl McpServer {
     pub(super) fn tool_get_ast_node(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
+            // Edit-aware refresh fires only on the file_path branch — node_id
+            // lookups have no path to refresh against, and node_id stability
+            // across reindex isn't guaranteed.
+            self.ensure_file_fresh_opt(args["file_path"].as_str())?;
         }
 
         let include_refs = args["include_references"].as_bool().unwrap_or(false);
@@ -1340,6 +1347,15 @@ impl McpServer {
         // Normalize: strip leading "./" and treat "." as empty prefix (match all)
         let path = raw_path.strip_prefix("./").unwrap_or(raw_path);
         let path = if path == "." { "" } else { path };
+
+        // Edit-aware refresh: when `path` names a single file (not a directory)
+        // and the agent just edited it, sync-reindex before answering. Cache
+        // invalidation inside `ensure_file_fresh_opt` evicts the stale overview
+        // for this exact file path so the cached-result branch above doesn't
+        // serve a pre-edit answer on the next call.
+        if !should_skip_indexing(args) {
+            self.ensure_file_fresh_opt(Some(path))?;
+        }
 
         // Return cached result if fresh (< 60s), evict if expired
         {
@@ -2118,6 +2134,7 @@ impl McpServer {
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
+            self.ensure_file_fresh_opt(file_path)?;
         }
 
         // Resolve symbol to node_id(s)

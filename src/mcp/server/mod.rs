@@ -1025,6 +1025,41 @@ impl McpServer {
         Ok(())
     }
 
+    /// Sync-reindex a single file when its on-disk hash differs from the stored
+    /// hash. Closes the post-Edit→pre-incremental-index staleness window for
+    /// MCP tools that take an explicit `file_path`.
+    ///
+    /// No-op when:
+    ///
+    /// - this instance is a read-only secondary (only the primary holds the write capability),
+    /// - `path` is `None` / empty / a directory-shaped path (caller doesn't know which file to refresh),
+    /// - the on-disk hash already matches the stored hash.
+    ///
+    /// Reindex caches are invalidated only when the call actually re-indexed.
+    pub(super) fn ensure_file_fresh_opt(&self, path: Option<&str>) -> Result<()> {
+        if !self.is_primary {
+            return Ok(());
+        }
+        let Some(rel_path) = path else { return Ok(()); };
+        if rel_path.is_empty() || rel_path.ends_with('/') {
+            return Ok(());
+        }
+        let Some(root) = self.project_root.as_deref() else { return Ok(()); };
+
+        let did_reindex = {
+            let model_guard = lock_or_recover(&self.embedding_model, "embedding_model");
+            crate::indexer::pipeline::ensure_file_indexed(
+                &self.db, root, rel_path, model_guard.as_ref(),
+            )?
+        };
+        if did_reindex {
+            *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
+            lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
+            tracing::debug!("[fresh] sync-reindexed {} on query-time freshness", rel_path);
+        }
+        Ok(())
+    }
+
     /// Run incremental index with cache snapshot/restore on failure.
     ///
     /// If background embedding is in progress, waits briefly for it to finish
