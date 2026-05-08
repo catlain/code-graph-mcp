@@ -1,5 +1,93 @@
 # Changelog
 
+## v0.18.1 — query-time freshness + call-graph truncation provenance
+
+Three additive improvements to MCP tool surfaces, no breaking changes.
+All output-shape changes are strictly additive — non-truncated /
+non-edit-aware paths return the exact prior shape.
+
+**1. Query-time freshness for file_path-aware tools** (commits `30678d6`,
+`82f1526`).
+
+When an MCP tool receives an explicit `file_path` argument, the agent is
+signaling "I just edited this; please answer against the current bytes."
+The 30s `last_incremental_check` debounce in the server is too coarse for
+tight Edit→search loops — agents would see pre-edit call edges right after
+saving a file.
+
+- New `pipeline::ensure_file_indexed(db, root, rel_path, model)`: single-file
+  hash-compare reindex, no-op when on-disk hash matches stored hash. Drops
+  stale rows when the file is gone. Skips files we wouldn't index in the
+  first place (binary / unrecognized language). Cross-file dirty-edge
+  handling mirrors `run_incremental_index` (collect dirty node IDs BEFORE
+  re-indexing so cascade delete doesn't strip the context-string
+  regeneration target set).
+- New `McpServer::ensure_file_fresh_opt(path)`: server-side wrapper that's
+  a no-op on read-only secondaries, on missing/empty/directory paths, and
+  when the embedding lock is contended. Invalidates `project_map` and
+  `module_overview` caches only when a reindex actually fired.
+- Wired into 6 file_path-aware tools: `get_call_graph`, `get_ast_node`,
+  `module_overview`, `find_references`, `dependency_graph`,
+  `impact_analysis`. Agents no longer have to remember which tools
+  auto-refresh and which don't.
+
+`test_ensure_file_indexed_picks_up_post_edit_changes` covers the no-op /
+post-edit-pickup / repeat-no-op / file-deleted paths.
+
+**2. Call-graph truncation provenance** (commit `fd168fd`).
+
+The recursive CTE in `get_call_graph` silently caps at depth 10 and 200
+rows. Agents reading partial results couldn't tell when truncation fired
+vs. when the graph genuinely ended — a common failure mode for "who calls
+X?" on hot functions where the real answer is "200+ across the codebase,
+you're seeing a slice."
+
+- `graph::query::CallGraphResult` wraps `Vec<CallGraphNode>` with
+  `limit_hit` / `depth_capped` / `effective_max_depth` /
+  `requested_max_depth` flags.
+- `CALL_GRAPH_MAX_DEPTH` (10) and `CALL_GRAPH_ROW_LIMIT` (200) are now
+  public constants — single source of truth (was a magic number in two
+  places).
+- `query_direction` returns `(nodes, limit_hit)` so the `direction="both"`
+  merge can OR-combine saturation across both call directions.
+- New JSON fields appear **only** when truncation fires: `limit_hit`,
+  `depth_capped`, `effective_max_depth`, `requested_max_depth`,
+  `truncation_warning`. The warning text gives the agent a recovery move
+  ("pick a leaf node_id and re-query from there, or narrow with file_path").
+- Wired into MCP `get_call_graph` (incl. rollup branch) +
+  `trace_http_chain` (`call_chain_truncated` flag per handler), and CLI
+  `code-graph-mcp callgraph` / `trace`.
+
+`test_depth_capped_signal` verifies clamp + flag wiring with a depth=99
+request.
+
+**3. CHARS_PER_TOKEN clarified as bytes/token + CJK regression test**
+(commit `6dc10ff`).
+
+The constant has always been used with `s.len()` (UTF-8 byte count in
+Rust), not Unicode char counts. The historical name suggested otherwise
+and tempted "fixes" to char-count, which would silently halve the CJK
+budget — one CJK char = 3 bytes ≈ 1 BPE token, so `bytes/3 ≈ chars ≈
+tokens` (accidentally correct under the bytes interpretation).
+
+- Doc on `CHARS_PER_TOKEN` now explains ASCII vs CJK behavior and the
+  conservative-overestimation property that makes earlier-fire
+  compression the safe error direction.
+- `estimate_tokens` local rename `total_chars → total_bytes` to match.
+- `test_estimate_tokens_cjk_byte_based`: 1000 CJK chars (3000 bytes) must
+  estimate ~1000 tokens; ASCII 1000 chars (1000 bytes) must estimate
+  lower, confirming the divisor is bytes-based. Regression guard against
+  someone "fixing" the estimator to char-count.
+
+No behavior change in this commit — doc + test only.
+
+**Test count**: 265 default-features (was 264), 258 no-default-features
+(was 257). 3 new tests across the three changes.
+
+**Compatibility**: All 16 MCP tool schemas unchanged. CLI flags
+unchanged. Output JSON additive only. Zero breaking changes for plugins
+or downstream consumers.
+
 ## v0.18.0 — routing_bench frontend domain + project_map dedup hint
 
 Two changes driven by the v0.17.3 30-day usage audit. The audit found
