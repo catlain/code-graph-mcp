@@ -1253,6 +1253,10 @@ impl McpServer {
     pub(super) fn tool_impact_analysis(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
+            // Edit-aware: file_path is the disambiguator for "I just changed
+            // this symbol in this file, what breaks?" — refresh that file
+            // before computing impact so the result reflects post-edit edges.
+            self.ensure_file_fresh_opt(args.get("file_path").and_then(|v| v.as_str()))?;
         }
 
         let symbol_name = required_str(args, "symbol_name")?;
@@ -1568,6 +1572,9 @@ impl McpServer {
     pub(super) fn tool_dependency_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
+            // Edit-aware: file_path is required for this tool — post-edit
+            // staleness is the canonical failure mode here.
+            self.ensure_file_fresh_opt(args["file_path"].as_str())?;
         }
 
         let file_path = args["file_path"].as_str()
