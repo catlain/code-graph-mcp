@@ -1317,8 +1317,11 @@ fn resolve_pending_calls(db: &Database) -> Result<usize> {
         return Ok(0);
     }
 
-    // Build name → [(node_id, language)] map ONCE (cheap SELECT, indexed lookup),
-    // then iterate pending rows in memory.
+    // Build name → [(node_id, language)] map ONCE, then iterate pending rows
+    // in memory. Narrowed by `n.name IN (SELECT DISTINCT target_name ...)` so
+    // even a 1-row pending table doesn't trigger a full nodes-table scan on
+    // every incremental pass — for a 100K-node project the unfiltered SELECT
+    // was 100K rows × every index call, even with no work to do.
     use crate::storage::queries::{insert_edge_cached, delete_pending_unresolved_call};
     let mut name_to_lang_targets: HashMap<String, Vec<(i64, String)>> = HashMap::new();
     let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
@@ -1326,7 +1329,8 @@ fn resolve_pending_calls(db: &Database) -> Result<usize> {
         let mut stmt = db.conn().prepare(
             "SELECT n.id, n.name, COALESCE(f.language, ''), f.path
              FROM nodes n JOIN files f ON f.id = n.file_id
-             WHERE f.language IS NOT NULL"
+             WHERE f.language IS NOT NULL
+               AND n.name IN (SELECT DISTINCT target_name FROM pending_unresolved_calls)"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
