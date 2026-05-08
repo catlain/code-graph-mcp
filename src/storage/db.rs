@@ -445,6 +445,62 @@ mod tests {
         assert_eq!(version, schema::SCHEMA_VERSION);
     }
 
+    /// v7 → v8 adds the `pending_unresolved_calls` table that buffers REL_CALLS
+    /// edges Phase 2 couldn't resolve, plus the unique + lookup indexes that
+    /// make insert/sweep O(log N). Mirrors the pattern of every prior migration
+    /// test — bypassing it would silently drop the only safety net we have for
+    /// catching schema drift between create_tables_sql and migrate_v7_to_v8.
+    #[test]
+    fn test_v7_to_v8_migration_adds_pending_table() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // Build a v7 database by hand. Construct the v7 shape (files+nodes+edges
+        // tables) so the migration runs against realistic schema state.
+        {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            c.execute_batch(&schema::create_tables_sql()).unwrap();
+            c.pragma_update(None, "user_version", 7).unwrap();
+        }
+
+        // Open via Database::open — the v7→v8 migration must run.
+        let db = Database::open(&db_path).unwrap();
+
+        // (a) Pending table exists and is empty (fresh migration → no rows).
+        let pending_count = crate::storage::queries::count_pending_unresolved_calls(db.conn()).unwrap();
+        assert_eq!(pending_count, 0,
+            "fresh migration must leave pending_unresolved_calls empty");
+
+        // (b) The unique index (source_id, target_name, source_language) exists —
+        // without it, repeated Phase 2 invocations on the same file would
+        // grow the table unbounded.
+        let unique_idx_exists: bool = db.conn().query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_pending_unique'",
+            [],
+            |_| Ok(true),
+        ).unwrap_or(false);
+        assert!(unique_idx_exists,
+            "idx_pending_unique must exist after v7→v8 migration (insert idempotency depends on it)");
+
+        // (c) The (target_name, source_language) lookup index exists — the sweep
+        // depends on this for sub-O(N) name lookup.
+        let lookup_idx_exists: bool = db.conn().query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_pending_target_lang'",
+            [],
+            |_| Ok(true),
+        ).unwrap_or(false);
+        assert!(lookup_idx_exists,
+            "idx_pending_target_lang must exist after v7→v8 migration");
+
+        // (d) user_version pragma actually advanced.
+        let version: i32 = db.conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION);
+        assert!(version >= 8, "version must have advanced to at least 8");
+    }
+
     #[test]
     fn test_open_readonly_rejects_writes() {
         let tmp = TempDir::new().unwrap();

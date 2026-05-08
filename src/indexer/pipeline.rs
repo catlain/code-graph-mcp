@@ -564,9 +564,52 @@ fn index_files(
     let mut total_edges_created = 0usize;
     let mut all_indexed: Vec<FileIndexed> = Vec::new();
 
-    // Phase 0: Delete removed files in own transaction
+    // Phase 0: Delete removed files in own transaction.
+    //
+    // Before cascade strips inbound REL_CALLS edges, capture them as pending
+    // rows. Without this, deleting file A wipes B's edge to A.foo and B is
+    // not in `delete_paths` (so Phase 2 won't re-extract it), leaving B with
+    // neither an edge nor a pending row — the same staleness window the
+    // "callee added later" buffering closes, just from the deletion side.
+    // Both directions need to round-trip through pending or the v0.18.2 fix
+    // is only half-complete.
     if !delete_paths.is_empty() {
         let tx = db.conn().unchecked_transaction()?;
+
+        // Resolve file IDs once (delete_files_by_paths drops them) so we can
+        // query inbound calls before cascade fires.
+        let mut deleted_file_ids: Vec<i64> = Vec::with_capacity(delete_paths.len());
+        for path in delete_paths {
+            if let Ok(Some(fid)) = db.conn().query_row(
+                "SELECT id FROM files WHERE path = ?1",
+                [path],
+                |row| row.get::<_, Option<i64>>(0),
+            ) {
+                deleted_file_ids.push(fid);
+            }
+        }
+
+        let mut buffered = 0usize;
+        for fid in &deleted_file_ids {
+            let inbound = crate::storage::queries::get_inbound_calls_for_pending(db.conn(), *fid)?;
+            for (source_id, target_name, source_language, metadata) in inbound {
+                crate::storage::queries::insert_pending_unresolved_call(
+                    db.conn(),
+                    source_id,
+                    &target_name,
+                    &source_language,
+                    metadata.as_deref(),
+                )?;
+                buffered += 1;
+            }
+        }
+        if buffered > 0 {
+            tracing::info!(
+                "[index] Phase 0: buffered {} inbound calls before cascade-deleting {} file(s)",
+                buffered, deleted_file_ids.len()
+            );
+        }
+
         delete_files_by_paths(db.conn(), delete_paths)?;
         tx.commit()?;
     }
@@ -2193,5 +2236,135 @@ impl fmt::Display for MyWriter {
         // Pending row stays — sweep refused cross-language resolution.
         assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1,
             "cross-language target must NOT resolve a TS pending call to a Rust fn");
+    }
+
+    /// One caller with N undefined references must produce N pending rows;
+    /// when a single later-added file defines all N, all rows must resolve in
+    /// a single sweep. Real codebases hit this whenever a "barrel" or shared
+    /// utility module gets added after its consumers.
+    #[test]
+    fn test_pending_resolves_multiple_calls_in_same_caller() {
+        use crate::storage::queries::{count_pending_unresolved_calls, get_node_ids_by_name};
+
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        // B has three undefined call targets — foo, bar, baz.
+        fs::write(project_dir.path().join("b.ts"),
+            "function caller_b() { foo(); bar(); baz(); }\n").unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 3,
+            "three bare-name calls must produce three pending rows");
+
+        // A defines all three.
+        fs::write(project_dir.path().join("a.ts"),
+            "export function foo() {}\nexport function bar() {}\nexport function baz() {}\n").unwrap();
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
+            "all three pending rows must drain once their targets exist");
+
+        // All three resolved into real edges.
+        let caller_b_id = get_node_ids_by_name(db.conn(), "caller_b").unwrap()
+            .into_iter().next().unwrap().0;
+        let edges = crate::storage::queries::get_edges_from(db.conn(), caller_b_id).unwrap();
+        let calls_count = edges.iter().filter(|e| e.relation == REL_CALLS).count();
+        assert_eq!(calls_count, 3,
+            "caller_b must have exactly three calls edges (foo, bar, baz); got {} edges total: {:?}",
+            calls_count, edges.iter().map(|e| (&e.relation, e.target_id)).collect::<Vec<_>>());
+    }
+
+    /// When the caller's source file is reindexed (e.g. user edits B), the
+    /// cascade FK on pending_unresolved_calls(source_id) must drop B's pending
+    /// rows so a fresh Phase 2 can re-buffer them with the current source IDs.
+    /// This is the schema's load-bearing self-cleaning property — we test it
+    /// explicitly so a future migration that drops or weakens the FK fails
+    /// loudly here rather than leaking pending rows for ever-removed callers.
+    #[test]
+    fn test_pending_cascade_deletes_when_caller_file_reindexed() {
+        use crate::storage::queries::count_pending_unresolved_calls;
+
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        // B with undefined target → pending row created.
+        fs::write(project_dir.path().join("b.ts"),
+            "function caller_b() { undefined_target(); }\n").unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
+
+        // Edit B to remove the call entirely. caller_b's old node gets
+        // cascade-deleted on reindex (Phase 1 deletes prior rows), and its
+        // pending row must follow it via ON DELETE CASCADE on source_id.
+        fs::write(project_dir.path().join("b.ts"),
+            "function caller_b() { /* call removed */ }\n").unwrap();
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
+            "pending row must be cascade-deleted when its source caller is removed/reindexed");
+    }
+
+    /// Inverse-direction symmetry test for `feedback_incremental_edge_timing.md`:
+    /// existing edge B → A.foo gets cascade-deleted when A is removed, and B
+    /// is NOT in changed_paths (deletion doesn't re-extract B). Without Phase 0
+    /// pre-cascade buffering, B has neither edge nor pending row — a permanent
+    /// silent edge loss until full rebuild. The Phase 0 buffer (added by this
+    /// fix) must capture B's call as a pending row before cascade fires.
+    #[test]
+    fn test_pending_buffers_on_callee_file_deletion() {
+        use crate::storage::queries::{count_pending_unresolved_calls, get_node_ids_by_name};
+
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        // Initial: A defines foo, B calls foo — edge B.caller_b → A.foo exists.
+        fs::write(project_dir.path().join("a.ts"),
+            "export function foo() {}\n").unwrap();
+        fs::write(project_dir.path().join("b.ts"),
+            "function caller_b() { foo(); }\n").unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+        // No pending rows yet — call resolved at index time.
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
+            "fully-resolvable call must not produce a pending row");
+
+        let caller_b_id = get_node_ids_by_name(db.conn(), "caller_b").unwrap()
+            .into_iter().next().unwrap().0;
+        let foo_id_pre = get_node_ids_by_name(db.conn(), "foo").unwrap()
+            .into_iter().next().unwrap().0;
+        let edges_pre = crate::storage::queries::get_edges_from(db.conn(), caller_b_id).unwrap();
+        assert!(edges_pre.iter().any(|e| e.relation == REL_CALLS && e.target_id == foo_id_pre),
+            "edge caller_b → foo must exist pre-deletion");
+
+        // Delete A. Phase 0 must buffer B's now-orphaned call into pending
+        // BEFORE cascade strips the edge.
+        fs::remove_file(project_dir.path().join("a.ts")).unwrap();
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+        // foo is gone.
+        assert!(get_node_ids_by_name(db.conn(), "foo").unwrap().is_empty(),
+            "foo must be cascade-deleted with file a.ts");
+
+        // B's edge to old foo is gone, but pending row holds the call.
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1,
+            "Phase 0 must buffer the orphaned inbound call into pending");
+
+        // Re-add A — pending sweep promotes the buffered call to a fresh edge.
+        fs::write(project_dir.path().join("a.ts"),
+            "export function foo() {}\n").unwrap();
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
+            "pending must drain once foo reappears");
+
+        let foo_id_post = get_node_ids_by_name(db.conn(), "foo").unwrap()
+            .into_iter().next().unwrap().0;
+        let edges_post = crate::storage::queries::get_edges_from(db.conn(), caller_b_id).unwrap();
+        assert!(edges_post.iter().any(|e| e.relation == REL_CALLS && e.target_id == foo_id_post),
+            "edge caller_b → foo must reappear post re-add via pending sweep");
     }
 }

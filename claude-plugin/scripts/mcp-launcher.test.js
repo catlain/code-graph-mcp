@@ -53,7 +53,10 @@ function runLauncherInitialize(timeoutMs = 15000) {
       if (stdout.includes('"result"') || stdout.includes('"error"')) {
         clearTimeout(timer);
         child.kill('SIGTERM');
-        resolve({ stdout, stderr });
+        // Wait for the child to actually exit so the test doesn't leave an
+        // orphan mid-write (matters on macOS / Windows where SIGTERM
+        // delivery is less synchronous than on Linux).
+        child.once('exit', () => resolve({ stdout, stderr }));
       }
     });
     child.stderr.on('data', (d) => { stderr += d.toString(); });

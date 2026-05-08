@@ -88,9 +88,17 @@ function readJson(p) {
 
 test('sync-versions bumps Cargo.toml + 8 JSON files atomically', (t) => {
   const root = setupFixture(t);
-  execFileSync(process.execPath, [path.join(root, 'scripts', 'sync-versions.js'), '1.2.3'], {
-    cwd: root, stdio: 'pipe',
-  });
+  const stdout = execFileSync(
+    process.execPath,
+    [path.join(root, 'scripts', 'sync-versions.js'), '1.2.3'],
+    { cwd: root, stdio: 'pipe', encoding: 'utf8' },
+  );
+  // Lock the success-path total. A regression that drops one of the 9 targets
+  // without removing the per-target assertions below would otherwise pass
+  // (each remaining target gets checked individually) — the count assertion
+  // is the only thing that flags "we silently stopped touching one of them".
+  assert.match(stdout, /\(9 files updated\)/,
+    'atomic-bump on a complete fixture must report exactly 9 files updated');
 
   // Cargo.toml uses regex replace, not JSON
   const cargoToml = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');

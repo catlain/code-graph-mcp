@@ -289,6 +289,43 @@ pub fn delete_nodes_by_file(conn: &Connection, file_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Returns inbound REL_CALLS edges into nodes of the given file from callers
+/// in OTHER files, projected as (source_id, target_name, source_language,
+/// metadata) — exactly what `pending_unresolved_calls` needs to buffer.
+///
+/// Used right before Phase 0 cascade-deletes the target file's nodes. The
+/// cascade strips B→A.foo edges via target_id FK; without buffering these
+/// callers' bare-name calls into pending, B never gets a chance to re-resolve
+/// them when A reappears later. Same shape of bug as the "callee added later"
+/// case, just from the deletion direction.
+#[allow(clippy::type_complexity)]
+pub fn get_inbound_calls_for_pending(
+    conn: &Connection,
+    file_id: i64,
+) -> Result<Vec<(i64, String, String, Option<String>)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT e.source_id, nt.name, COALESCE(fs.language, ''), e.metadata
+         FROM edges e
+         JOIN nodes nt ON nt.id = e.target_id
+         JOIN nodes ns ON ns.id = e.source_id
+         JOIN files fs ON fs.id = ns.file_id
+         WHERE nt.file_id = ?1 AND ns.file_id != ?1 AND e.relation = 'calls'
+           AND fs.language IS NOT NULL"
+    )?;
+    let rows = stmt.query_map([file_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    rows.filter_map(Result::ok)
+        .filter(|(_, _, lang, _)| !lang.is_empty())
+        .map(Ok)
+        .collect()
+}
+
 #[cfg(test)]
 pub fn update_context_string(conn: &Connection, node_id: i64, context_string: &str) -> Result<()> {
     conn.execute(
