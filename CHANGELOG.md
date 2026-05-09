@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.22.0 — 三巨头 source-file split (queries / relations / pipeline)
+
+Pure refactor release — zero behavior change, public surface preserved across
+all three splits. The three biggest source files (8049 lines as monoliths) are
+now decomposed into 26 per-concern submodules so future edits don't need to
+load 2000+ lines of context per touch.
+
+### What moved
+
+| Original | Lines | New tree | Files |
+|---|---:|---|---:|
+| `src/storage/queries.rs` | 2892 | `src/storage/queries/` | 10 |
+| `src/parser/relations.rs` | 2783 | `src/parser/relations/` | 9 |
+| `src/indexer/pipeline.rs` | 2374 | `src/indexer/pipeline/` | 7 |
+
+Submodule items use `pub(super)`; mod.rs re-exports the items external callers
+already depend on. External call sites in `cli.rs`, `mcp/server`, `tests/`,
+`benches/`, and `claude-plugin/` need zero edits — paths like
+`crate::storage::queries::upsert_file`, `crate::parser::relations::ParsedRelation`,
+`crate::indexer::pipeline::run_full_index` continue to resolve.
+
+The three orchestrator-style functions stay whole in their respective `mod.rs`
+or `index_files.rs` — `walk_for_relations` (~650 lines) and the Phase-0..3
+indexer dispatch (~770 lines) share local state across their match arms /
+phases that splitting would either duplicate or thread back via large arg
+lists. Splitting per-language inside `walk_for_relations` would lose the
+shared `current_scope` / `current_class` propagation; splitting per-phase
+inside `index_files` would break the shared `tx` / atomics / `batch_parsed`
+/ `name_to_ids` / `global_name_map` state. Both are kept whole deliberately.
+
+### Verification
+
+- `cargo check` clean
+- `cargo +1.95.0 clippy --no-default-features -- -D warnings` clean
+- `cargo +1.95.0 clippy --all-targets -- -D warnings` clean
+- `cargo test --release`: 292 lib + 129 integration = 421 tests, 0 failed
+  (1 pre-existing `#[ignore]`)
+- Pre-merge CI green on all three PRs (#15, #16, #17)
+- Independent code-reviewer subagent passed each split with zero Critical /
+  Important issues
+
+### Commit references
+
+- queries.rs: 657a1f9 (#15)
+- relations.rs: 2dfbab9 (#16)
+- pipeline.rs: aef55b2 (#17)
+
 ## v0.21.0 — Opt-in plugin hooks (token discipline) + callgraph caller_count ordering + multi-model routing bench
 
 ### Migration notes (read first)
