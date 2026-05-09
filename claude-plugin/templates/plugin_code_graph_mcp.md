@@ -21,6 +21,16 @@ type: reference
 > 显式启用：`CODE_GRAPH_VERBOSE_HOOKS=1` —— Bash 调 `code-graph-mcp map --compact`
 > 也是等价的按需替代。
 > 向后兼容：`CODE_GRAPH_QUIET_HOOKS=0` 强制 noisy / `=1` 强制 quiet（优先级最高）。
+>
+> **v0.18.4 起**：原"进阶 5"（impact / similar / deps / dead-code / trace）已折叠
+> 进核心 7 的 flag —— Claude Code 现在能直接通过 MCP 调用，不必落到 CLI:
+> - `get_ast_node include_impact=true` / `include_similar=true`
+> - `module_overview include_deps=true` / `include_dead=true`
+> - `get_call_graph route_path="GET /api/x"`
+>
+> 旧名（`impact_analysis` 等）仍作为向后兼容 dispatcher 别名可调（raw JSON-RPC /
+> SDK 脚本场景），但 Claude Code 内强烈建议用上面的新 flag 形式。CLI 子命令
+> （`code-graph-mcp impact|similar|deps|dead-code|trace`）保持不变，给 Bash 工作流。
 
 ## 何时调用 MCP/CLI（替代多步 Grep/Read）
 
@@ -39,27 +49,29 @@ type: reference
 | "找做 Z 的代码"（概念） | MCP `semantic_code_search`（RRF 混合）；CLI `search`（纯 FTS5） | 不知道精确名；要向量召回走 MCP |
 | "返回 T 类型的函数" | `ast_search --returns T` | 结构化筛选 |
 | "X 在哪被引用？" | `find_references` / `refs X` | 含 callers/importers |
-| "看 X 的源码 / 签名" | `get_ast_node` / `show X` | `include_impact=true` 含影响面（替代 impact_analysis） |
+| "看 X 的源码 / 签名" | `get_ast_node` / `show X` | `include_impact=true` 影响面 / `include_similar=true` 嵌入近邻 |
 | "项目结构总览" | `project_map` / `map` | 起手势用 `--compact` |
+| "X 文件依赖谁？" / "Y 模块下的死代码" | `module_overview path=Y include_deps=true` / `include_dead=true` | 文件路径走 deps；目录/文件走 dead |
+| HTTP 路由 → handler 链 | `get_call_graph route_path="GET /api/x"` | 取代 trace_http_chain |
 
-### 进阶 5（Claude Code 里走 CLI；MCP 名调用仅限脚本/SDK）
+### 旧名兼容 + CLI 速查（v0.18.4 fold 后）
 
-⚠ **实测**：从 Claude Code 里直接调 `mcp__plugin_code-graph-mcp_code-graph__<tool>`
-会得到 `No such tool available`——Claude Code 的 `ToolSearch` 只为 `tools/list`
-里的工具生成 schema，hidden 5 在 list 之外就加载不到。**Claude Code 场景一律用
-下表 CLI 列**。raw JSON-RPC (`tools/call`) 仍接受这 5 个名字（含向后兼容别名
-`find_http_route` → `trace_http_chain`, `read_snippet` → `get_ast_node`）。
+v0.18.4 把原"进阶 5"折叠进核心 7 的 flag。**Claude Code 内**首选上表的新 flag 形式。
+旧名（`impact_analysis` / `find_similar_code` / `dependency_graph` / `find_dead_code` /
+`trace_http_chain` + alias `find_http_route`）作为 dispatcher 向后兼容**仍可调用**
+（raw JSON-RPC / MCP SDK / 既有脚本不破），但 Claude Code 的 ToolSearch 仍然不为
+hidden 5 加载 schema —— 实操中走新 flag。CLI 子命令保持原样：
 
-| 意图 | CLI（Claude Code 首选） | MCP 工具名（SDK/脚本） | 关键参数 |
-|------|--------------------------|------------------------|----------|
-| "改 X 会炸啥？" | `code-graph-mcp impact X` | `impact_analysis` | `symbol_name` (必), `file_path`, `change_type` ∈ {signature,behavior,remove}, `depth` |
-| HTTP 路由 → handler 链路 | `code-graph-mcp trace /api/x` | `trace_http_chain` | **`route_path`** ⚠ (不是 `route`), `depth` |
-| "X 文件依赖谁？" | `code-graph-mcp deps src/x.rs` | `dependency_graph` | `file_path` (必), `direction` ∈ {outgoing,incoming,both}, `depth`, `compact` |
-| "相似/重复函数"（需 embedding） | `code-graph-mcp similar X` | `find_similar_code` | `symbol_name` 或 `node_id` (必), `top_k`, `max_distance` |
-| "未使用的代码" | `code-graph-mcp dead-code [path]` | `find_dead_code` | `path`, `node_type`, `include_tests`, `min_lines`, `compact`, **`ignore_paths`** (prefix glob 数组；默认 `["claude-plugin/"]`，传 `[]` 关闭默认豁免) |
+| 意图 | CLI（Bash 工作流） | 等价 MCP 新形式 |
+|------|--------------------|------------------|
+| "改 X 会炸啥？" | `code-graph-mcp impact X` | `get_ast_node symbol_name=X include_impact=true` |
+| HTTP 路由 → handler 链路 | `code-graph-mcp trace /api/x` | `get_call_graph route_path="GET /api/x"` |
+| "X 文件依赖谁？" | `code-graph-mcp deps src/x.rs` | `module_overview path="src/x.rs" include_deps=true` |
+| "相似/重复函数"（需 embedding） | `code-graph-mcp similar X` | `get_ast_node symbol_name=X include_similar=true` |
+| "未使用的代码" | `code-graph-mcp dead-code [path]` | `module_overview path=<path> include_dead=true` |
 
-**替代路径**：核心 7 里的 `get_ast_node include_impact=true` 覆盖 `impact_analysis`
-的常用场景（风险等级 + 直接/传递调用者 + 受影响文件/路由），不必跳到 CLI。
+**dead-code 的 `ignore_paths`**：CLI 默认豁免 `["claude-plugin/", "benches/"]`
+（macro/shell 入口点）；`--no-ignore` 关闭。MCP 端也接同名参数。
 
 ## 不要替代
 

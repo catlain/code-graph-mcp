@@ -2,19 +2,19 @@ use super::types::ToolDefinition;
 use serde_json::json;
 
 /// Expected tool count — update this when adding/removing tools.
+///
+/// v0.18.4 fold: 5 niche tools (impact_analysis / dependency_graph /
+/// find_similar_code / find_dead_code / trace_http_chain) collapsed into
+/// flags on the core 7 — `get_ast_node include_similar / include_impact`,
+/// `module_overview include_deps / include_dead`, `get_call_graph route_path`.
+/// The standalone tool names no longer dispatch; CLI subcommands
+/// (`code-graph-mcp impact|deps|similar|dead-code|trace`) keep the
+/// out-of-MCP path open for Bash workflows.
+///
 /// Management tools (start_watch, stop_watch, get_index_status, rebuild_index)
 /// are still callable via tools/call but hidden from tools/list to save tokens.
-/// Niche tools (trace_http_chain, impact_analysis, dependency_graph,
-/// find_similar_code, find_dead_code) are also hidden. NOTE: "hidden but
-/// callable" only holds for clients that invoke `tools/call` by literal name
-/// (raw JSON-RPC, MCP SDKs, CLI). Claude Code's MCP integration derives its
-/// callable tool set from `tools/list` and will refuse calls to hidden names
-/// with "No such tool available" — for those flows, use the CLI subcommands
-/// (`impact`, `trace`, `deps`, `similar`, `dead-code`) via Bash instead.
-/// Hiding trades this partial reachability for ~40% reduction in tools/list
-/// payload at session start.
-/// Merged tools (find_http_route → trace_http_chain, read_snippet → get_ast_node)
-/// remain callable as aliases for backward compatibility.
+/// Legacy alias `read_snippet → get_ast_node` remains callable for backward
+/// compatibility (it was always a same-shape rename, never a hidden tool).
 pub const TOOL_COUNT: usize = 7;
 
 pub struct ToolRegistry {
@@ -48,23 +48,24 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_call_graph".into(),
-                description: "Who calls X, what X calls: multi-hop call-chain for a named function. Use when: 'who calls X?' or 'what does X call?' or tracing flow with depth. Returns a graph.".into(),
+                description: "Who calls X / what X calls: multi-hop call chain. Use when: 'who calls X?' or tracing flow. For HTTP routes pass route_path='GET /api/x' to trace from handler down.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "symbol_name": { "type": "string", "description": "Function/method name" },
-                        "direction": { "type": "string", "enum": ["callers", "callees", "both"], "description": "Direction (default 'both')" },
+                        "symbol_name": { "type": "string", "description": "Function/method name (mutually exclusive with route_path)" },
+                        "route_path": { "type": "string", "description": "HTTP route like 'GET /api/users' — traces from matched route handler(s) down. Mutually exclusive with symbol_name." },
+                        "direction": { "type": "string", "enum": ["callers", "callees", "both"], "description": "Direction (default 'both'); ignored when route_path is set (always 'callees')" },
                         "depth": { "type": "number", "description": "Max depth (default 3)" },
                         "file_path": { "type": "string", "description": "Disambiguate same-name functions" },
+                        "include_middleware": { "type": "boolean", "description": "For route_path mode: include downstream middleware/calls (default true)" },
                         "compact": { "type": "boolean", "description": "Compact mode: name+file+depth only (saves tokens)" },
                         "include_tests": { "type": "boolean", "description": "Include test callers (default false)" }
-                    },
-                    "required": ["symbol_name"]
+                    }
                 }),
             },
             ToolDefinition {
                 name: "get_ast_node".into(),
-                description: "Inspect ONE named symbol: signature, full source, optional references/impact. Use when: query names a symbol asking for its definition/body/signature/implementation. PREFER over semantic_code_search.".into(),
+                description: "Inspect ONE named symbol: signature, source, opt references/impact/similar. Use when: query names a symbol asking for definition/body/implementation. PREFER over semantic_code_search.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -74,6 +75,8 @@ impl ToolRegistry {
                         "include_references": { "type": "boolean", "description": "Include callers/callees (default false)" },
                         "include_tests": { "type": "boolean", "description": "Include test callers in references (default false)" },
                         "include_impact": { "type": "boolean", "description": "Include impact summary: risk level, caller count, affected files/routes (default false)" },
+                        "include_similar": { "type": "boolean", "description": "Include embedding-similar nodes (default false; requires embed-model + indexed embeddings)" },
+                        "similar_top_k": { "type": "number", "description": "With include_similar: max similar results (default 5)" },
                         "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0, default 3 when using node_id)" },
                         "compact": { "type": "boolean", "description": "Compact mode: type+signature+location only, no code_content (saves tokens)" }
                     },
@@ -93,12 +96,17 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "module_overview".into(),
-                description: "Module structure and symbols. Use when: exploring a directory/module you haven't seen, or finding the right file to edit. Shows exports, hot paths, files; callers count includes tests.".into(),
+                description: "Module structure / symbols. Use when: exploring a module or finding the right file to edit. Shows exports, hot paths, files. include_deps=true (file path): dep graph; include_dead=true: unreferenced.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "File or directory path (e.g. 'src/auth/')" },
-                        "compact": { "type": "boolean", "description": "Compact mode: name+type+callers only, no signatures (saves tokens)" }
+                        "compact": { "type": "boolean", "description": "Compact mode: name+type+callers only, no signatures (saves tokens)" },
+                        "include_deps": { "type": "boolean", "description": "When path is a single file: include outgoing/incoming file dependencies (default false)" },
+                        "deps_direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "With include_deps: direction filter (default 'both')" },
+                        "deps_depth": { "type": "number", "description": "With include_deps: max transitive depth (default 2)" },
+                        "include_dead": { "type": "boolean", "description": "Include unreferenced symbols (orphans + exported-unused) under this path (default false). Macro/shell-invoked entry points are pre-filtered." },
+                        "dead_min_lines": { "type": "number", "description": "With include_dead: min line count to flag (default 3)" }
                     },
                     "required": ["path"]
                 }),

@@ -1,10 +1,17 @@
 [package]
 name = "code-graph-mcp"
-version = "0.18.3"
+version = "0.18.4"
 edition = "2021"
 
 [features]
-default = ["embed-model"]
+# v0.18.4: default flipped to [] for direct `cargo install` users — gives a
+# small (~10 MB) FTS5-only binary without the ~120 MB candle/tokenizers stack.
+# Opt in to embedding via `cargo install code-graph-mcp --features embed-model`.
+# npm releases still ship with embed-model (release.yml builds with the flag),
+# so npm/npx/plugin users see no behavior change. Embedding model files are
+# downloaded lazily on first semantic_code_search invocation (load() returns
+# Ok(None) gracefully when files missing — search degrades to FTS5-only).
+default = []
 embed-model = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers",
                "dep:tokenizers", "dep:ureq", "dep:flate2", "dep:tar", "dep:dirs"]
 

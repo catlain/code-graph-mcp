@@ -328,12 +328,16 @@ Data is stored in `.code-graph/index.db` under the project root (auto-created, g
 ### Build
 
 ```bash
-# Default build (with local embedding model)
+# Default build — FTS5-only (~10 MB binary, no embedding model)
 cargo build --release
 
-# Without embedding model (lighter build)
-cargo build --release --no-default-features
+# With local embedding model (~150 MB binary; downloads ~120 MB model lazily on first semantic search)
+cargo build --release --features embed-model
 ```
+
+> Direct `cargo install` users get the FTS5-only build by default. npm/npx/plugin
+> users get the full hybrid (FTS5 + vector) build automatically — release CI
+> compiles with `--features embed-model` for shipped binaries.
 
 ### Configure (from source)
 

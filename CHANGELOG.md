@@ -1,5 +1,88 @@
 # Changelog
 
+## v0.18.4 — Hidden-5 fold + tools.rs split + Cargo default lite + routing-bench CI
+
+### Migration notes (read first)
+
+**Cargo default features changed** (direct `cargo install code-graph-mcp` users):
+the default build is now FTS5-only (~10 MB binary). Opt back into the full
+hybrid (FTS5 + vector) with `cargo install code-graph-mcp --features
+embed-model`. **npm/npx/plugin users see no change** — `release.yml` now passes
+`--features embed-model` explicitly, so shipped binaries keep the same
+capabilities they had in v0.18.3.
+
+**MCP `instructions` shrunk from ~700 B to ~330 B** (visible in `initialize`
+response). Removes the "5 advanced tools CLI-only" caveat that was the
+v0.18.3 reality but is no longer true after the fold below. Compile-time
+guard at 1500 B is unchanged.
+
+**Hidden 5 names still callable** (`impact_analysis`, `find_similar_code`,
+`dependency_graph`, `find_dead_code`, `trace_http_chain` + alias
+`find_http_route`). Dispatcher entries kept for raw JSON-RPC / SDK clients
+and existing integration tests. Claude Code is expected to use the new flag
+forms below.
+
+### Fold: hidden 5 → core 7 flags
+
+The 5 niche tools that were registered-but-hidden from `tools/list` (and
+therefore unreachable from Claude Code, which derives its callable set from
+`tools/list`) are now reachable as flags on the core 7. Same backing logic;
+new entry path:
+
+| Old (hidden, still callable as alias) | New flag form (preferred) |
+|---|---|
+| `impact_analysis symbol_name=X` | `get_ast_node symbol_name=X include_impact=true` |
+| `find_similar_code node_id=N` | `get_ast_node node_id=N include_similar=true` |
+| `dependency_graph file_path=F` | `module_overview path=F include_deps=true` |
+| `find_dead_code path=P` | `module_overview path=P include_dead=true` |
+| `trace_http_chain route_path="GET /x"` | `get_call_graph route_path="GET /x"` |
+
+`get_ast_node include_impact` was already in v0.18.3 — the other four flags
+are new. CLI subcommands (`code-graph-mcp impact|similar|deps|dead-code|trace`)
+are unchanged for Bash workflows.
+
+### Refactor: `src/mcp/server/tools.rs` split (no behavior change)
+
+The 2354-line tool dispatch file is now 9 focused modules under
+`src/mcp/server/tools/`:
+
+```
+tools/
+├── search.rs        — semantic_code_search
+├── callgraph.rs     — get_call_graph + format helpers + truncation flags
+├── ast_node.rs      — get_ast_node + ast_node_by_id + impact summary + similar attach
+├── ast_search.rs    — ast_search
+├── refs.rs          — find_references
+├── overview.rs      — module_overview + compact + dep/dead fold
+├── project_map.rs   — project_map
+├── advanced.rs      — backing logic for the folded 5 (still pub(in server))
+└── management.rs    — start/stop watch, get_index_status, rebuild_index
+```
+
+Visibility for handler methods is now `pub(in crate::mcp::server)` so the
+dispatcher in `mod.rs` can still reach them across the new module boundary.
+No public API change; the matching commit is the bisect target if you're
+cherry-picking.
+
+### CI: weekly routing-bench tracking
+
+New `.github/workflows/routing-bench.yml` runs `tests/routing_bench.rs`
+weekly (Sunday 03:17 UTC), on every release tag, and on manual dispatch.
+Asserts P@1 ≥ 0.70 against the live 7-tool MCP schema using OpenRouter
+(Claude Sonnet 4.5 default, override via workflow input). Cost ~$0.10 per
+run. Requires `OPENROUTER_API_KEY` repo secret; without it the job no-ops
+gracefully. Per-release P@1 lands in the GitHub Actions step summary +
+artifact retention 90 days.
+
+### Adoption template refresh
+
+`claude-plugin/templates/plugin_code_graph_mcp.md` reflects the fold —
+core-7 decision table now shows the new `include_*` and `route_path` flags
+inline, and the legacy "进阶 5 走 CLI" section is rewritten as "old names
+still work; prefer flag form in Claude Code". Adopted projects with
+`CODE_GRAPH_NO_TEMPLATE_REFRESH` unset will pick this up on next
+SessionStart.
+
 ## v0.18.3 — release-pipeline supply-chain hardening + pending-sweep narrow
 
 Maintenance release. No public-API or schema changes; CLI flags, MCP tool

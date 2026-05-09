@@ -1,0 +1,96 @@
+name: Routing Bench
+
+# LLM-in-the-loop tool-routing recall benchmark.
+# Asks a Claude-family model "which tool would you pick for this query?" against
+# the live 7-tool MCP schema, asserts P@1 ≥ 0.70 (threshold pinned in
+# tests/routing_bench.rs::P_AT_1_THRESHOLD), and surfaces the score to the
+# GitHub Actions summary so per-release drift is visible at a glance.
+#
+# Cost: ~$0.10 per run via OpenRouter (Claude Sonnet 4.5). Schedule: weekly
+# Sunday + manual dispatch + on every release tag (post-tag tracking, not
+# pre-merge gating — keeps tag pushes from blocking on transient API failures).
+#
+# Setup: add OPENROUTER_API_KEY to repo secrets (Settings → Secrets and
+# variables → Actions). Without the secret the test silently no-ops, so a
+# missing secret on a fork is benign.
+
+on:
+  schedule:
+    # Sundays 03:17 UTC — odd minute to avoid the on-the-hour scheduler stampede.
+    - cron: '17 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'OpenRouter model id (default anthropic/claude-sonnet-4.5)'
+        required: false
+        default: 'anthropic/claude-sonnet-4.5'
+  push:
+    tags: ['v*']
+
+jobs:
+  bench:
+    name: P@1 routing recall
+    runs-on: ubuntu-latest
+    # Don't fail the whole workflow on transient API hiccups — the assertion
+    # itself (in test code) is what we care about. Job summary still records
+    # what happened.
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: routing-bench
+
+      - name: Run routing benchmark
+        id: bench
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ROUTING_BENCH_MODEL: ${{ github.event.inputs.model || 'anthropic/claude-sonnet-4.5' }}
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "::warning::OPENROUTER_API_KEY not set — skipping routing bench"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Capture full output; tee so we can grep for the P@1 line below.
+          set -o pipefail
+          cargo test --test routing_bench --no-default-features -- \
+            --ignored --nocapture 2>&1 | tee bench-output.txt
+
+      - name: Summarize P@1
+        if: always() && steps.bench.outputs.skipped != 'true'
+        run: |
+          {
+            echo "## Routing Bench — $(date -u +'%Y-%m-%d')"
+            echo ""
+            echo "Model: \`${ROUTING_BENCH_MODEL:-anthropic/claude-sonnet-4.5}\`"
+            echo ""
+            # Grep the canonical lines from tests/routing_bench.rs eprintln!s.
+            if grep -E "P@1=|Overall =" bench-output.txt > p1.txt 2>/dev/null; then
+              echo "### Scores"
+              echo '```'
+              cat p1.txt
+              echo '```'
+            fi
+            if grep -E "^\[routing_bench\] misses" bench-output.txt > /dev/null; then
+              echo "### Misses"
+              echo '```'
+              grep -A100 "^\[routing_bench\] misses" bench-output.txt | head -50
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          ROUTING_BENCH_MODEL: ${{ github.event.inputs.model || 'anthropic/claude-sonnet-4.5' }}
+
+      - name: Upload bench output
+        if: always() && steps.bench.outputs.skipped != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: routing-bench-output
+          path: bench-output.txt
+          retention-days: 90

@@ -725,7 +725,7 @@ impl McpServer {
     /// Spawn a background thread to embed nodes that don't yet have vectors.
     /// The thread opens its own DB connection and model (EmbeddingModel is not Send)
     /// to avoid blocking the main stdio loop.
-    fn spawn_background_embedding(&self) {
+    pub(super) fn spawn_background_embedding(&self) {
         // Guard: only spawn if model and vec are available
         if lock_or_recover(&self.embedding_model, "embedding_model").is_none() || !self.db.vec_enabled() {
             return;
@@ -823,7 +823,7 @@ impl McpServer {
 
     /// Try lazy loading: if model was None but cache now has files, load it.
     /// Called at the start of semantic search / find_similar_code.
-    fn try_lazy_load_model(&self) {
+    pub(super) fn try_lazy_load_model(&self) {
         let needs_load = lock_or_recover(&self.embedding_model, "embedding_model").is_none();
         if !needs_load {
             return;
@@ -843,7 +843,7 @@ impl McpServer {
     /// `find_functions_by_fuzzy_name("handle_tool")` would return the exact
     /// `handle_tool` alongside substring matches like `handle_tools_list` and
     /// trigger false "ambiguous" reports in find_references/impact_analysis.
-    fn resolve_fuzzy_name(&self, name: &str) -> Result<FuzzyResolution> {
+    pub(super) fn resolve_fuzzy_name(&self, name: &str) -> Result<FuzzyResolution> {
         let candidates: Vec<_> = queries::find_functions_by_fuzzy_name(self.db.conn(), name)?
             .into_iter()
             .filter(|c| !is_test_symbol(&c.name, &c.file_path))
@@ -881,7 +881,7 @@ impl McpServer {
     /// latter needs `node_id`/`start_line` to disambiguate because `file_path`
     /// alone doesn't uniquely identify the target.
     /// Returns Some(suggestions) if ambiguous, None if unambiguous or not found.
-    fn disambiguate_symbol(&self, name: &str) -> Result<Option<Vec<serde_json::Value>>> {
+    pub(super) fn disambiguate_symbol(&self, name: &str) -> Result<Option<Vec<serde_json::Value>>> {
         let candidates = queries::get_nodes_with_files_by_name(self.db.conn(), name)?;
         let non_test: Vec<_> = candidates.iter()
             .filter(|nf| !is_test_symbol(&nf.node.name, &nf.file_path))
@@ -920,7 +920,7 @@ impl McpServer {
     }
 
     /// Send MCP progress notification.
-    fn send_progress(&self, token: &str, current: usize, total: usize) {
+    pub(super) fn send_progress(&self, token: &str, current: usize, total: usize) {
         self.send_notification("notifications/progress", json!({
             "progressToken": token,
             "progress": current,
@@ -929,7 +929,7 @@ impl McpServer {
     }
 
     /// Send MCP log notification.
-    fn send_log(&self, level: &str, message: &str) {
+    pub(super) fn send_log(&self, level: &str, message: &str) {
         self.send_notification("notifications/message", json!({
             "level": level,
             "logger": "code-graph",
@@ -940,7 +940,7 @@ impl McpServer {
     /// Ensure index is up-to-date. On first call, runs full index.
     /// If background startup indexing is running, waits for it to complete.
     /// If watcher is active, checks for pending events to decide if incremental needed.
-    fn ensure_indexed(&self) -> Result<()> {
+    pub(super) fn ensure_indexed(&self) -> Result<()> {
         let project_root = match &self.project_root {
             Some(p) => p.clone(),
             None => return Ok(()),
@@ -1160,7 +1160,7 @@ impl McpServer {
     }
 
     /// Returns whether the file watcher is currently active.
-    fn is_watching(&self) -> bool {
+    pub(super) fn is_watching(&self) -> bool {
         lock_or_recover(&self.watcher, "watcher").is_some()
     }
 
@@ -1215,18 +1215,18 @@ impl McpServer {
         // rules live in MEMORY.md's plugin detail file (invited-memory pattern).
         let quiet = std::env::var("CODE_GRAPH_QUIET_HOOKS").ok().as_deref() == Some("1");
         let instructions = if quiet {
-            "code-graph-mcp ready. Tools: project_map, semantic_code_search, module_overview, get_call_graph, impact_analysis, find_references, ast_search, dependency_graph, find_dead_code, find_similar_code, get_ast_node, trace_http_chain. Run `code-graph-mcp --help` for CLI. See MEMORY.md → plugin_code_graph_mcp.md for decision rules (if adopted)."
+            "code-graph-mcp ready. See MEMORY.md \u{2192} plugin_code_graph_mcp.md for tool decision table (run `code-graph-mcp adopt` if missing). CLI: `code-graph-mcp --help`."
         } else {
-            // v0.17.0: trimmed from 1418B to ~700B by dropping the 10 per-tool
-            // decision rows that already live in tool descriptions and in
-            // MEMORY.md \u{2192} plugin_code_graph_mcp.md. What remains is the
-            // boundary signal (Grep/Read still applies) and the CLI-only-tools
-            // pointer that the MCP tools/list cannot convey on its own.
+            // v0.18.4: trimmed from ~700B to ~330B after the hidden-5 fold.
+            // The "CLI-only" caveat is gone — impact/similar/deps/dead/route
+            // are now reachable as flags on the core 7 (get_ast_node /
+            // module_overview / get_call_graph). What remains: the boundary
+            // signal (Grep/Read still applies), the CLI escape hatch, and the
+            // pointer to the full decision table.
             const NOISY: &str = concat!(
-                "Code Graph MCP \u{2014} this project is indexed. The 7 registered tools cover code structure, calls, references, and concept search; their own descriptions carry the routing rules.\n",
-                "Five advanced tools (impact / dead-code / similar / deps / trace) are CLI-only \u{2014} Claude Code's MCP integration cannot call them by name. Invoke via Bash: `code-graph-mcp impact|dead-code|similar|deps|trace`.\n",
-                "Still Grep for: exact strings, constants, regex, non-code files. Still Read for: files you will edit.\n",
-                "Diagnostics: `code-graph-mcp health-check`. Prompts: impact-analysis, understand-module, trace-request.\n",
+                "Code Graph MCP \u{2014} project indexed. 7 tools cover structure / calls / refs / concept search; impact, similar, deps, dead, and route are folded into flags on get_ast_node, module_overview, and get_call_graph.\n",
+                "Still Grep for exact strings/regex; still Read files you will edit.\n",
+                "CLI escape hatch: `code-graph-mcp <impact|similar|deps|dead-code|trace>`. Diagnostics: `code-graph-mcp health-check`.\n",
                 "Full decision table: MEMORY.md \u{2192} plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
             );
             // Compile-time guard: calibrated from observed Claude Code truncation
