@@ -1,5 +1,135 @@
 # Changelog
 
+## v0.21.0 — Opt-in plugin hooks (token discipline) + callgraph caller_count ordering + multi-model routing bench
+
+### Migration notes (read first)
+
+**Two LLM-visible default behaviors flipped to opt-in.** Both have explicit env
+opt-out paths; existing users who set the legacy `CODE_GRAPH_QUIET_HOOKS=1` see
+no change. Users on default settings will feel the new behavior on next session.
+
+- **`user-prompt-context.js` (UserPromptSubmit hook) — default-quiet.** Per-prompt
+  CLI exec was costing 200–500 tokens/turn injecting outline/callgraph context
+  the agent would have asked for via MCP itself. v0.20.0 routing-bench backend
+  P@1 = 100% on Sonnet 4.5 proves the agent picks the right tool without
+  push-injection. Restore the v0.20.0 noisy default: set
+  `CODE_GRAPH_VERBOSE_HOOKS=1` in `~/.claude/settings.json` env block. Legacy
+  `CODE_GRAPH_QUIET_HOOKS=0` still forces noisy for back-compat.
+- **`incremental-index.js` (PostToolUse Edit/Write hook) — default-off.**
+  v0.18.0 added query-time `ensure_file_indexed` (single-file hash + sync
+  reindex) inside MCP tools that take `file_path`, so the PostToolUse hook
+  spawning a fresh process per edit was redundant for the MCP-driven workflow
+  and burnt ~80ms cold-start per edit. CLI-only workflows (running
+  `code-graph-mcp search` after Bash-side edits without going through MCP)
+  need the hook for freshness — opt back in with `CODE_GRAPH_HOOK_INDEX=on`.
+
+The two knobs are independent: setting one does not affect the other. CLI-only
+users typically want `CODE_GRAPH_HOOK_INDEX=on` only; users who relied on
+per-prompt outline injection want `CODE_GRAPH_VERBOSE_HOOKS=1` only.
+
+One internal-but-user-perceptible change: `get_call_graph` (and the underlying
+`get_call_graph_query`) now orders results within each depth by `caller_count
+DESC`. Previously ties broke by row order, which silently dropped the most-
+relevant subtree under `CALL_GRAPH_ROW_LIMIT` truncation. Hot functions like
+`conn` (51 callers + 72 test in this repo) are now guaranteed to surface
+their high-connectivity subtrees first. No JSON shape change — only ordering.
+
+### Plugin hook default flips (the headline)
+
+`claude-plugin/scripts/user-prompt-context.js` — replaced 6 mixed-language
+intent regex piles with per-keyword weighted patterns under `INTENT_PATTERNS`.
+Each (regex, weight) row is testable in isolation; threshold 0.5 + uniform
+weight 1.0 preserves the original OR-of-alternatives behavior 1:1. Future
+tuning can downweight noisy short keywords (`bug`, `什么`) once false-positive
+data accumulates. Maintenance cost: ~150 lines of table vs 6 × 200-char
+regexes — the regex form had two prior silent-bug regressions (#5754, #7713).
+
+`computeQuietHooks(env)` priority chain (high → low):
+
+1. `CODE_GRAPH_QUIET_HOOKS=0` → forced noisy (legacy)
+2. `CODE_GRAPH_QUIET_HOOKS=1` → forced quiet (legacy)
+3. `CODE_GRAPH_VERBOSE_HOOKS=1` → opt-in noisy (new)
+4. default → quiet (v0.21 flip)
+
+`claude-plugin/scripts/incremental-index.js` — pure passthrough refactor
+behind `shouldRun(env)` gate. `CODE_GRAPH_HOOK_INDEX=on|1|true` opts in;
+default and any other value skip the binary exec. `module.exports =
+{ shouldRun }` exposes the gate for the test file.
+
+Both hook scripts gain dedicated `*.test.js` files: 91 new lines of tests
+on user-prompt-context.js (covers the env-precedence chain + per-keyword
+intent table) and 55 new lines on incremental-index.js (covers the env
+gate + idempotent skip).
+
+### Callgraph: caller_count DESC tie-breaker (`src/graph/query.rs`)
+
+The recursive CTE in `query_direction` gained a `caller_counts` CTE
+(non-correlated `GROUP BY target_id` over `edges WHERE relation = ?4`,
+covered by `idx_edges_target_rel`) and a `LEFT JOIN` into the outer SELECT.
+Final `ORDER BY` is now `depth ASC, caller_count DESC`. When the result set
+saturates `CALL_GRAPH_ROW_LIMIT`, high-connectivity subtrees survive the
+truncation instead of being silently dropped. Test:
+`test_callees_ordered_by_caller_count` (3 callees, 5/1/0 external callers,
+asserts the depth-1 ordering matches caller-count rank).
+
+`caller_count` is computed for every node in the result, not just the
+truncation boundary — small CPU overhead, big interpretability win for
+`module_overview` and `find_references` consumers downstream that read
+the same field for sort ordering.
+
+### Routing-bench multi-model dispatch (`tests/routing_bench.rs`)
+
+New `ROUTING_BENCH_MODELS` env var accepts a comma-separated model list
+(`sonnet-4.5,sonnet-4.6,opus-4.7,haiku-4.5`) and dispatches one Backend
+per name, sharing a single API key. Single-model `ROUTING_BENCH_MODEL`
+still works (legacy callers unchanged). When more than one backend ran,
+the bench prints a multi-model summary table:
+
+```
+=== Multi-model P@1 summary (threshold 70%) ===
+  sonnet-4.5      backend  recall 22/22 (100.0%)  fp 0/10
+  sonnet-4.6      backend  recall 22/22 (100.0%)  fp 0/10
+  opus-4.7        backend  recall 21/22 ( 95.5%)  fp 0/10
+  haiku-4.5       backend  recall 18/22 ( 81.8%)  fp 0/10
+```
+
+Use case: weekly CI cron walking the Anthropic family to catch routing
+regression when Claude Code rotates the default model. v0.20.0 measured
+100% P@1 on Sonnet 4.5 only — the rest of the family had no signal until
+this hook existed.
+
+`detect_backend()` (legacy single-model) is preserved and still backs
+the default `ROUTING_BENCH_MODEL` path. New `detect_backends()` returns
+a `Vec<Backend>`; pure helpers `parse_models_env(s)` and
+`build_backends(models, anthropic_key, openrouter_key)` are unit-tested
+without API keys (4 new tests under `multi_model_dispatch_tests`).
+
+### Effectiveness benchmark harness (`tests/effectiveness_bench.rs`, new)
+
+Turns the README's "40-60% session token savings" vibe-claim into a
+regression-tracked number. For each navigation task in the corpus, runs
+the equivalent `code-graph-mcp` CLI command on a fixture project and
+compares the byte count of the response to a hardcoded `baseline_bytes`
+representing the historical Grep+Read approach. Asserts the overall
+ratio stays ≤ 0.60 (matches the headline claim's worst case).
+
+Bytes are a token proxy; for English / TS source they correlate ~1:3
+with BPE tokens, so a 50% byte reduction maps to a 50% token reduction
+at the same ratio. The harness intentionally avoids a tokenizer
+dependency — bytes-as-proxy is good enough for tracking trend over
+releases. Run with:
+
+```
+cargo build --no-default-features
+cargo test --test effectiveness_bench --no-default-features -- --ignored --nocapture
+```
+
+`#[ignore]`-gated like `routing_bench`, so it doesn't fire on default
+`cargo test` — opt in with `--ignored`. New tasks added by hand-counting
+(or by running grep/Read for the same intent and summing the bytes
+touched), set `baseline_bytes` once, commit. Subsequent regressions move
+the ratio without touching the baseline.
+
 ## v0.20.0 — Adversarial tool descriptions + single-file outline + project-typed memdir + 100% routing P@1
 
 ### Migration notes (read first)

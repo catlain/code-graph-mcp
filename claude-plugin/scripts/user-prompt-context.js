@@ -8,28 +8,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// --- Mid-session install detection ---
-// If hooks are running but lifecycle install() hasn't executed yet (no manifest),
-// the plugin was installed mid-session and the MCP server isn't connected.
-// Claude Code only starts MCP servers at session startup; /mcp reconnect cannot
-// start servers that were never initialized.
+// Mid-session install detection: hook fires but no manifest yet.
 const MANIFEST_PATH = path.join(os.homedir(), '.cache', 'code-graph', 'install-manifest.json');
-if (!fs.existsSync(MANIFEST_PATH)) {
-  const noticeFile = path.join(os.tmpdir(), '.code-graph-mcp-restart-notice');
-  try {
-    // Show once per hour to avoid spam
-    if (Date.now() - fs.statSync(noticeFile).mtimeMs < 3600000) process.exit(0);
-  } catch { /* first notice */ }
-  try { fs.writeFileSync(noticeFile, ''); } catch { /* ok */ }
-  process.stdout.write(
-    '[code-graph] Plugin installed — MCP server requires a session restart to connect.\n' +
-    'MCP servers are only initialized at session startup. To activate:\n' +
-    '  1. Press Ctrl+C to exit the current session\n' +
-    '  2. Re-run `claude` to start a new session\n' +
-    'Meanwhile, CLI tools work directly: code-graph-mcp search <query>, code-graph-mcp map, etc.\n'
-  );
-  process.exit(0);
-}
 
 // --- Per-type rate limiting (replaces single global cooldown) ---
 const COOLDOWNS = {
@@ -53,25 +33,24 @@ function markCooldown(type) {
   } catch { /* ok */ }
 }
 
-// CODE_GRAPH_QUIET_HOOKS=1 → skip passive per-prompt injection entirely.
-// Users opt in to this mode when MEMORY.md + explicit tool calls cover their needs.
-if (process.env.CODE_GRAPH_QUIET_HOOKS === '1') process.exit(0);
-
-// --- Read user message ---
-let message;
-try {
-  const input = JSON.parse(fs.readFileSync('/dev/stdin', 'utf8'));
-  message = (input && input.message) || '';
-} catch {
-  process.exit(0);
+// v0.21 — flipped to opt-in default. Routing-bench backend P@1=100% (v0.20.0)
+// proves Sonnet 4.5 picks tools correctly without push injection; per-prompt
+// CLI exec was costing 200-500 tokens/turn across N turns to repeat what the
+// agent would have called itself. Mirrors session-init.js computeQuietHooks
+// priority chain so a single env knob covers both hooks.
+//
+// Priority (high → low):
+//   1. CODE_GRAPH_QUIET_HOOKS=0 → forced noisy (legacy back-compat)
+//   2. CODE_GRAPH_QUIET_HOOKS=1 → forced quiet (legacy back-compat)
+//   3. CODE_GRAPH_VERBOSE_HOOKS=1 → opt-in noisy (new, recommended)
+//   4. default → quiet
+function computeQuietHooks(env = process.env) {
+  const envQuiet = env.CODE_GRAPH_QUIET_HOOKS;
+  if (envQuiet === '0') return false;
+  if (envQuiet === '1') return true;
+  if (env.CODE_GRAPH_VERBOSE_HOOKS === '1') return false;
+  return true;
 }
-// Chinese chars are ~3 bytes but 1 char; "看看 fts5_search" is only 16 chars
-if (!message || message.length < 8) process.exit(0);
-
-// --- Check index ---
-const cwd = process.cwd();
-const dbPath = path.join(cwd, '.code-graph', 'index.db');
-if (!fs.existsSync(dbPath)) process.exit(0);
 
 // --- Pure logic (exported for testing) ---
 
@@ -121,14 +100,203 @@ function extractSymbols(msg) {
   return { symbols: candidates, lowConfidence };
 }
 
+// v0.21 — replaced 6 mixed-language regex piles with per-keyword weighted
+// patterns. Each row is testable in isolation, weights ready for tuning when
+// false-positive data accumulates. Threshold 0.5 + uniform weight 1.0
+// preserves the original OR-of-alternatives behavior 1:1; future tuning can
+// downweight noisy short keywords like "bug" or "什么" that currently fire
+// too eagerly. Maintenance cost: ~150 lines of table vs 6 × 200-char regex —
+// regression history (#5754, #7713) shows the regex form was the higher
+// silent-bug surface.
+const INTENT_PATTERNS = {
+  impact: [
+    [/impact/i, 1.0],
+    [/影响/, 1.0],
+    [/修改前/, 1.0],
+    [/改之前/, 1.0],
+    [/blast radius/i, 1.0],
+    [/before (?:edit|chang|modif)/i, 1.0],
+    [/risk/i, 1.0],
+    [/风险/, 1.0],
+    [/改动范围/, 1.0],
+    [/波及/, 1.0],
+    [/问题在/, 1.0],
+    [/bug/i, 1.0],
+    [/干扰/, 1.0],
+    [/冲突/, 1.0],
+    [/卡/, 1.0],
+  ],
+  modify: [
+    [/改(?!变)/, 1.0],
+    [/修改/, 1.0],
+    [/修复/, 1.0],
+    [/重构/, 1.0],
+    [/优化/, 1.0],
+    [/简化/, 1.0],
+    [/精简/, 1.0],
+    [/适配/, 1.0],
+    [/统一/, 1.0],
+    [/修正/, 1.0],
+    [/调整/, 1.0],
+    [/去掉/, 1.0],
+    [/整理/, 1.0],
+    [/清理/, 1.0],
+    [/解耦/, 1.0],
+    [/更新/, 1.0],
+    [/\brefactor\b/i, 1.0],
+    [/\bchange\b/i, 1.0],
+    [/\brename\b/i, 1.0],
+    [/\bfix\b/i, 1.0],
+    [/移动/, 1.0],
+    [/\bmove\b/i, 1.0],
+    [/删(?!除文件)/, 1.0],
+    [/\bremove\b/i, 1.0],
+    [/替换/, 1.0],
+    [/\breplace\b/i, 1.0],
+    [/\bupdate\b/i, 1.0],
+    [/升级/, 1.0],
+    [/\bmigrate\b/i, 1.0],
+    [/迁移/, 1.0],
+    [/拆分/, 1.0],
+    [/\bsplit\b/i, 1.0],
+    [/合并/, 1.0],
+    [/\bmerge\b/i, 1.0],
+    [/提取/, 1.0],
+    [/\bextract\b/i, 1.0],
+    [/改成/, 1.0],
+    [/改为/, 1.0],
+    [/换成/, 1.0],
+    [/转为/, 1.0],
+    [/异步/, 1.0],
+    [/同步/, 1.0],
+  ],
+  implement: [
+    [/\badd\b/i, 1.0],
+    [/\bimplement\b/i, 1.0],
+    [/\bcreate\b/i, 1.0],
+    [/\bbuild\b/i, 1.0],
+    [/\bwrite\b/i, 1.0],
+    [/新增/, 1.0],
+    [/添加/, 1.0],
+    [/实现/, 1.0],
+    [/创建/, 1.0],
+    [/编写/, 1.0],
+    [/开发/, 1.0],
+    [/增加/, 1.0],
+    [/加上/, 1.0],
+    [/加个/, 1.0],
+    [/写/, 1.0],
+    [/做个/, 1.0],
+    [/搭建/, 1.0],
+    [/补充/, 1.0],
+    [/引入/, 1.0],
+    [/支持/, 1.0],
+    [/封装/, 1.0],
+    [/接入/, 1.0],
+    [/对接/, 1.0],
+    [/配置/, 1.0],
+  ],
+  understand: [
+    [/how does/i, 1.0],
+    [/怎么工作/, 1.0],
+    [/怎么实现/, 1.0],
+    [/怎么做/, 1.0],
+    [/什么/, 1.0],
+    [/理解/, 1.0],
+    [/看看/, 1.0],
+    [/看一下/, 1.0],
+    [/了解/, 1.0],
+    [/分析/, 1.0],
+    [/explain/i, 1.0],
+    [/understand/i, 1.0],
+    [/架构/, 1.0],
+    [/architecture/i, 1.0],
+    [/structure/i, 1.0],
+    [/overview/i, 1.0],
+    [/模块/, 1.0],
+    [/概览/, 1.0],
+    [/干什么/, 1.0],
+    [/做什么/, 1.0],
+    [/工作原理/, 1.0],
+    [/逻辑/, 1.0],
+    [/机制/, 1.0],
+    [/流程/, 1.0],
+    [/功能/, 1.0],
+    [/结合度/, 1.0],
+    [/效率/, 1.0],
+    [/评估/, 1.0],
+    [/调研/, 1.0],
+    [/是什么/, 1.0],
+    [/有什么/, 1.0],
+    [/能用不/, 1.0],
+    [/高效不/, 1.0],
+    [/达标/, 1.0],
+    [/起作用/, 1.0],
+    [/科学/, 1.0],
+    [/深入思考/, 1.0],
+    [/源码/, 1.0],
+    [/检查/, 1.0],
+    [/审核/, 1.0],
+    [/审查/, 1.0],
+    [/验证/, 1.0],
+    [/诊断/, 1.0],
+  ],
+  callgraph: [
+    [/who calls/i, 1.0],
+    [/what calls/i, 1.0],
+    [/调用/, 1.0],
+    [/call(?:graph|er|ee)/i, 1.0],
+    [/trace/i, 1.0],
+    [/链路/, 1.0],
+    [/追踪/, 1.0],
+    [/谁调/, 1.0],
+    [/被谁调/, 1.0],
+    [/调了谁/, 1.0],
+    [/上下游/, 1.0],
+    [/依赖关系/, 1.0],
+    [/触发/, 1.0],
+    [/路径/, 1.0],
+    [/覆盖/, 1.0],
+    [/介入/, 1.0],
+  ],
+  search: [
+    [/where is/i, 1.0],
+    [/在哪/, 1.0],
+    [/find/i, 1.0],
+    [/search/i, 1.0],
+    [/搜索/, 1.0],
+    [/找/, 1.0],
+    [/locate/i, 1.0],
+    [/哪里用/, 1.0],
+    [/哪里定义/, 1.0],
+    [/定义在/, 1.0],
+    [/实现在/, 1.0],
+    [/处理没/, 1.0],
+    [/在源码/, 1.0],
+    [/加不加/, 1.0],
+  ],
+};
+
+const INTENT_THRESHOLD = 0.5;
+
+function scoreIntent(msg, intent) {
+  const patterns = INTENT_PATTERNS[intent];
+  if (!patterns) return 0;
+  let max = 0;
+  for (const [pattern, weight] of patterns) {
+    if (pattern.test(msg) && weight > max) max = weight;
+  }
+  return max;
+}
+
 function detectIntents(msg) {
   return {
-    impact: /(?:impact|影响|修改前|改之前|blast radius|before (?:edit|chang|modif)|risk|风险|改动范围|波及|问题在|bug|干扰|冲突|卡)/i.test(msg),
-    modify: /(?:改(?!变)|修改|修复|重构|优化|简化|精简|适配|统一|修正|调整|去掉|整理|清理|解耦|更新|\brefactor\b|\bchange\b|\brename\b|\bfix\b|移动|\bmove\b|删(?!除文件)|\bremove\b|替换|\breplace\b|\bupdate\b|升级|\bmigrate\b|迁移|拆分|\bsplit\b|合并|\bmerge\b|提取|\bextract\b|改成|改为|换成|转为|异步|同步)/i.test(msg),
-    implement: /(?:\badd\b|\bimplement\b|\bcreate\b|\bbuild\b|\bwrite\b|新增|添加|实现|创建|编写|开发|增加|加上|加个|写|做个|搭建|补充|引入|支持|封装|接入|对接|配置)/i.test(msg),
-    understand: /(?:how does|怎么工作|怎么实现|怎么做|什么|理解|看看|看一下|了解|分析|explain|understand|架构|architecture|structure|overview|模块|概览|干什么|做什么|工作原理|逻辑|机制|流程|功能|结合度|效率|评估|调研|是什么|有什么|能用不|高效不|达标|起作用|科学|深入思考|源码|检查|审核|审查|验证|诊断)/i.test(msg),
-    callgraph: /(?:who calls|what calls|调用|call(?:graph|er|ee)|trace|链路|追踪|谁调|被谁调|调了谁|上下游|依赖关系|触发|路径|覆盖|介入)/i.test(msg),
-    search: /(?:where is|在哪|find|search|搜索|找|locate|哪里用|哪里定义|定义在|实现在|处理没|在源码|加不加)/i.test(msg),
+    impact: scoreIntent(msg, 'impact') >= INTENT_THRESHOLD,
+    modify: scoreIntent(msg, 'modify') >= INTENT_THRESHOLD,
+    implement: scoreIntent(msg, 'implement') >= INTENT_THRESHOLD,
+    understand: scoreIntent(msg, 'understand') >= INTENT_THRESHOLD,
+    callgraph: scoreIntent(msg, 'callgraph') >= INTENT_THRESHOLD,
+    search: scoreIntent(msg, 'search') >= INTENT_THRESHOLD,
   };
 }
 
@@ -152,15 +320,55 @@ function determineQueryType(intents, symbols, filePaths, isCoolingDownFn) {
 }
 
 // --- Main execution (only when run directly) ---
-if (require.main === module) {
-  if (shouldSkip(message)) process.exit(0);
+// All exit-on-condition checks (manifest, computeQuietHooks, message length,
+// db presence) live INSIDE this guard so `require()` from tests doesn't
+// terminate the test process on module load.
+function runMain() {
+  // Mid-session install: lifecycle.js install() hasn't run yet (no manifest).
+  // MCP server only starts at session startup — tell the user to restart.
+  if (!fs.existsSync(MANIFEST_PATH)) {
+    const noticeFile = path.join(os.tmpdir(), '.code-graph-mcp-restart-notice');
+    try {
+      // Show once per hour to avoid spam
+      if (Date.now() - fs.statSync(noticeFile).mtimeMs < 3600000) return;
+    } catch { /* first notice */ }
+    try { fs.writeFileSync(noticeFile, ''); } catch { /* ok */ }
+    process.stdout.write(
+      '[code-graph] Plugin installed — MCP server requires a session restart to connect.\n' +
+      'MCP servers are only initialized at session startup. To activate:\n' +
+      '  1. Press Ctrl+C to exit the current session\n' +
+      '  2. Re-run `claude` to start a new session\n' +
+      'Meanwhile, CLI tools work directly: code-graph-mcp search <query>, code-graph-mcp map, etc.\n'
+    );
+    return;
+  }
+
+  if (computeQuietHooks()) return;
+
+  // --- Read user message ---
+  let message;
+  try {
+    const input = JSON.parse(fs.readFileSync('/dev/stdin', 'utf8'));
+    message = (input && input.message) || '';
+  } catch {
+    return;
+  }
+  // Chinese chars are ~3 bytes but 1 char; "看看 fts5_search" is only 16 chars
+  if (!message || message.length < 8) return;
+
+  // --- Check index ---
+  const cwd = process.cwd();
+  const dbPath = path.join(cwd, '.code-graph', 'index.db');
+  if (!fs.existsSync(dbPath)) return;
+
+  if (shouldSkip(message)) return;
 
   const filePaths = extractFilePaths(message);
   const symbols = extractSymbols(message);
   const intents = detectIntents(message);
   const query = determineQueryType(intents, symbols, filePaths, isCoolingDown);
 
-  if (!query) process.exit(0);
+  if (!query) return;
 
   const PREFIXES = {
     impact:    '[code-graph:impact] Blast radius — review before editing:',
@@ -168,6 +376,15 @@ if (require.main === module) {
     callgraph: '[code-graph:callgraph] Call relationships:',
     search:    '[code-graph:search] Relevant code:',
   };
+
+  function run(cmd, args) {
+    return execFileSync(cmd, args, {
+      cwd,
+      timeout: 3000,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  }
 
   try {
     let result = '';
@@ -181,19 +398,12 @@ if (require.main === module) {
       process.stdout.write(`${PREFIXES[query.type]}\n${result.trim()}\n`);
     }
   } catch {
-    process.exit(0);
+    /* return silently */
   }
 }
 
-module.exports = { shouldSkip, extractFilePaths, extractSymbols, detectIntents, determineQueryType, STOP_WORDS, PLAIN_WORD_EXCLUDE };
-
-// --- Helpers ---
-
-function run(cmd, args) {
-  return execFileSync(cmd, args, {
-    cwd,
-    timeout: 3000,
-    encoding: 'utf8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
+if (require.main === module) {
+  runMain();
 }
+
+module.exports = { shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE };

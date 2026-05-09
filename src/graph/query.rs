@@ -133,6 +133,15 @@ fn query_direction(
     // depth alone (which collapses sibling subtrees under the last depth-N
     // entry). On dedup we keep the parent on the shortest path via
     // ROW_NUMBER() ... ORDER BY depth.
+    //
+    // Truncation ordering: when a hot function (e.g. `conn` in this repo with
+    // 51 callers + 72 test) saturates CALL_GRAPH_ROW_LIMIT at depth=3, the
+    // pre-LIMIT sort is `depth ASC, caller_count DESC` so high-connectivity
+    // subtrees survive the truncation. Without the secondary key, alphabetical
+    // / id-order ties would silently drop the most-relevant subtree. The
+    // `caller_count` LEFT JOIN is a single non-correlated GROUP BY scan over
+    // edges (idx_edges_target_rel covers the predicate); rowcount is bounded
+    // by node count, not edge count.
     let sql = format!(
         "WITH RECURSIVE call_graph(node_id, name, type, depth, visited, parent_id) AS (
             SELECT n.id, n.name, n.type, 0, CAST(n.id AS TEXT), NULL
@@ -151,15 +160,23 @@ fn query_direction(
             {next_node_join}
             WHERE cg.depth < ?3
             AND (',' || cg.visited || ',') NOT LIKE '%,' || CAST(t.id AS TEXT) || ',%'
+        ),
+        caller_counts AS (
+            SELECT target_id AS node_id, COUNT(*) AS callers
+            FROM edges
+            WHERE relation = ?4
+            GROUP BY target_id
         )
         SELECT node_id, name, type, file_path, depth, parent_id FROM (
             SELECT cg.node_id, cg.name, cg.type, f.path AS file_path, cg.depth, cg.parent_id,
+                   COALESCE(cc.callers, 0) AS caller_count,
                    ROW_NUMBER() OVER (PARTITION BY cg.node_id ORDER BY cg.depth) AS rn
             FROM call_graph cg
             JOIN nodes n ON n.id = cg.node_id
             JOIN files f ON f.id = n.file_id
+            LEFT JOIN caller_counts cc ON cc.node_id = cg.node_id
         ) WHERE rn = 1
-        ORDER BY depth
+        ORDER BY depth ASC, caller_count DESC
         LIMIT {row_limit}",
         row_limit = CALL_GRAPH_ROW_LIMIT,
     );
@@ -423,6 +440,52 @@ mod tests {
         assert_eq!(a_node.parent_id, Some(b), "depth-2 caller A's parent is depth-1 B (NOT C)");
         let d_node = result.nodes.iter().find(|n| n.name == "D").unwrap();
         assert_eq!(d_node.parent_id, Some(b), "depth-2 caller D's parent is depth-1 B (NOT C)");
+    }
+
+    /// Within a single depth, results are ordered by caller_count DESC so
+    /// high-connectivity subtrees survive CALL_GRAPH_ROW_LIMIT truncation.
+    /// Setup: R calls A1, A2, A3 (all depth 1).
+    /// Additional callers boost A1 (5 extra) > A2 (1 extra) > A3 (0 extra).
+    /// Query callees of R depth 1 → expect order [R, A1, A2, A3].
+    #[test]
+    fn test_callees_ordered_by_caller_count() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        let fid = upsert_file(conn, &FileRecord {
+            path: "test.ts".into(),
+            blake3_hash: "h1".into(),
+            last_modified: 1,
+            language: Some("typescript".into()),
+        }).unwrap();
+
+        let r = insert_node(conn, &node("R", fid)).unwrap();
+        let a1 = insert_node(conn, &node("A1", fid)).unwrap();
+        let a2 = insert_node(conn, &node("A2", fid)).unwrap();
+        let a3 = insert_node(conn, &node("A3", fid)).unwrap();
+
+        // R calls each A_i (gives every A_i one caller from R).
+        insert_edge(conn, r, a1, REL_CALLS, None).unwrap();
+        insert_edge(conn, r, a2, REL_CALLS, None).unwrap();
+        insert_edge(conn, r, a3, REL_CALLS, None).unwrap();
+
+        // External callers: 5 callers for A1, 1 caller for A2, 0 for A3.
+        for i in 0..5 {
+            let ext = insert_node(conn, &node(&format!("ext_a1_{}", i), fid)).unwrap();
+            insert_edge(conn, ext, a1, REL_CALLS, None).unwrap();
+        }
+        let ext_a2 = insert_node(conn, &node("ext_a2", fid)).unwrap();
+        insert_edge(conn, ext_a2, a2, REL_CALLS, None).unwrap();
+
+        let result = get_call_graph(conn, "R", "callees", 1, None).unwrap();
+
+        // Filter to depth=1 only (R itself is depth=0).
+        let depth_1: Vec<&str> = result.nodes.iter()
+            .filter(|n| n.depth == 1)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(depth_1, vec!["A1", "A2", "A3"],
+            "depth-1 callees must be ordered by caller_count DESC: A1(6) > A2(2) > A3(1)");
     }
 
     /// requested depth > CALL_GRAPH_MAX_DEPTH must set depth_capped and clamp

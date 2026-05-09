@@ -217,6 +217,68 @@ fn detect_backend() -> Option<Backend> {
     None
 }
 
+/// Parse comma-separated model list. Pure helper for testability.
+/// Trims whitespace, drops empty entries, preserves order.
+fn parse_models_env(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect()
+}
+
+/// Build N backends from a model list + API keys. Pure helper for testability.
+/// Anthropic key takes precedence over OpenRouter (mirrors detect_backend).
+/// Returns empty when no key or no models.
+fn build_backends(
+    models: Vec<String>,
+    anthropic_key: Option<&str>,
+    openrouter_key: Option<&str>,
+) -> Vec<Backend> {
+    if models.is_empty() {
+        return Vec::new();
+    }
+    if let Some(k) = anthropic_key.filter(|s| !s.is_empty()) {
+        return models.into_iter()
+            .map(|m| Backend::Anthropic { key: k.to_string(), model: m })
+            .collect();
+    }
+    if let Some(k) = openrouter_key.filter(|s| !s.is_empty()) {
+        return models.into_iter()
+            .map(|m| Backend::OpenRouter { key: k.to_string(), model: m })
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Multi-model dispatch — comma-separated `ROUTING_BENCH_MODELS` overrides
+/// the single-model `ROUTING_BENCH_MODEL` and produces one Backend per name.
+/// All models share the same API key (Anthropic preferred, OpenRouter fallback)
+/// — this matches detect_backend's single-model precedence.
+///
+/// Use case: weekly CI cron that walks Sonnet 4.5 + Sonnet 4.6 + Opus 4.7 +
+/// Haiku 4.5 to catch routing-quality regression when Claude Code rotates
+/// the default model. v0.20.0 measured 100% P@1 on Sonnet 4.5 only — the
+/// other models in the family had no signal until this hook existed.
+///
+/// Behavior:
+///   - empty / unset → falls back to `detect_backend()` for legacy callers
+///   - set with at least one non-empty model → returns that list of backends
+///   - set but no API key → returns empty (caller should skip the test)
+pub(crate) fn detect_backends() -> Vec<Backend> {
+    let models_env = std::env::var("ROUTING_BENCH_MODELS").ok()
+        .filter(|s| !s.is_empty());
+    let Some(models_str) = models_env else {
+        return detect_backend().into_iter().collect();
+    };
+    let models = parse_models_env(&models_str);
+    if models.is_empty() {
+        return detect_backend().into_iter().collect();
+    }
+    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let openrouter_key = std::env::var("OPENROUTER_API_KEY").ok();
+    build_backends(models, anthropic_key.as_deref(), openrouter_key.as_deref())
+}
+
 /// Call the backend, return the picked tool name, or None if the model produced no tool_use.
 fn call_backend(
     client: &reqwest::blocking::Client,
@@ -302,16 +364,18 @@ fn call_backend(
 #[test]
 #[ignore = "requires ANTHROPIC_API_KEY or OPENROUTER_API_KEY; run: cargo test --test routing_bench -- --ignored"]
 fn routing_recall_benchmark() {
-    let backend = match detect_backend() {
-        Some(b) => b,
-        None => {
-            eprintln!("[routing_bench] Neither ANTHROPIC_API_KEY nor OPENROUTER_API_KEY set — skipping.");
-            return;
-        }
-    };
+    let backends = detect_backends();
+    if backends.is_empty() {
+        eprintln!("[routing_bench] Neither ANTHROPIC_API_KEY nor OPENROUTER_API_KEY set — skipping.");
+        return;
+    }
     let mode = detect_mode();
     let domain = detect_domain();
-    eprintln!("[routing_bench] backend={} mode={:?} domain={:?}", backend.label(), mode, domain);
+    eprintln!(
+        "[routing_bench] backends=[{}] mode={:?} domain={:?}",
+        backends.iter().map(|b| b.label()).collect::<Vec<_>>().join(", "),
+        mode, domain,
+    );
 
     let registry = ToolRegistry::new();
     let registry_tools: Vec<Value> = registry
@@ -337,71 +401,100 @@ fn routing_recall_benchmark() {
 
     // 3-run majority vote per query.
     const RUNS: usize = 3;
-    let mut picks: HashMap<String, String> = HashMap::new();
-    let mut all_misses: Vec<(String, String, Vec<Option<String>>)> = Vec::new();
 
-    for &(query, expected) in &oracle {
-        let mut run_picks: Vec<Option<String>> = Vec::with_capacity(RUNS);
-        for _ in 0..RUNS {
-            run_picks.push(call_backend(&client, &backend, &tools, &system_prompt, query));
+    // Per-backend recall accumulator for the multi-model summary.
+    let mut all_results: Vec<(String, f64, usize)> = Vec::new();
+    let mut any_below_threshold: Vec<String> = Vec::new();
+
+    for backend in &backends {
+        if backends.len() > 1 {
+            eprintln!("\n--- Backend: {} ---", backend.label());
         }
-        let pick_strs: Vec<&str> = run_picks.iter()
-            .map(|p| p.as_deref().unwrap_or("(none)"))
-            .collect();
-        let voted = majority_vote(&pick_strs).unwrap_or_else(|| "(none)".to_string());
-        if !matches_expected(&voted, expected) {
-            all_misses.push((query.to_string(), expected.to_string(), run_picks.clone()));
+
+        let mut picks: HashMap<String, String> = HashMap::new();
+        let mut all_misses: Vec<(String, String, Vec<Option<String>>)> = Vec::new();
+
+        for &(query, expected) in &oracle {
+            let mut run_picks: Vec<Option<String>> = Vec::with_capacity(RUNS);
+            for _ in 0..RUNS {
+                run_picks.push(call_backend(&client, backend, &tools, &system_prompt, query));
+            }
+            let pick_strs: Vec<&str> = run_picks.iter()
+                .map(|p| p.as_deref().unwrap_or("(none)"))
+                .collect();
+            let voted = majority_vote(&pick_strs).unwrap_or_else(|| "(none)".to_string());
+            if !matches_expected(&voted, expected) {
+                all_misses.push((query.to_string(), expected.to_string(), run_picks.clone()));
+            }
+            picks.insert(query.to_string(), voted);
         }
-        picks.insert(query.to_string(), voted);
+
+        // Mode-specific reporting + assertion accumulator.
+        let headline_recall = match mode {
+            BenchMode::ToolOnly => {
+                let recall = compute_recall(&picks, &active);
+                eprintln!(
+                    "\n[routing_bench] mode=tool-only backend={} domain={:?} P@1={}/{} = {:.1}% (threshold {:.0}%)",
+                    backend.label(),
+                    domain,
+                    (recall * active.len() as f64).round() as usize,
+                    active.len(),
+                    recall * 100.0,
+                    P_AT_1_THRESHOLD * 100.0,
+                );
+                print_per_domain_recall(domain, &picks);
+                print_misses(&all_misses);
+                recall
+            }
+            BenchMode::ContextRich => {
+                let recall = compute_recall(&picks, &active);
+                let fp_rate = compute_fp_rate(&picks);
+                let overall = compute_overall(&picks, &active);
+                eprintln!(
+                    "\n[routing_bench] mode=context-rich backend={} domain={:?}\n  Recall  = {:.1}% ({}/{})\n  FP-rate = {:.1}% ({}/{})\n  Overall = {:.1}% ({}/{}, threshold {:.0}%)",
+                    backend.label(),
+                    domain,
+                    recall * 100.0,
+                    (recall * active.len() as f64).round() as usize, active.len(),
+                    fp_rate * 100.0,
+                    (fp_rate * FP_ORACLE.len() as f64).round() as usize, FP_ORACLE.len(),
+                    overall * 100.0,
+                    (overall * (active.len() + FP_ORACLE.len()) as f64).round() as usize,
+                    active.len() + FP_ORACLE.len(),
+                    P_AT_1_THRESHOLD * 100.0,
+                );
+                print_per_domain_recall(domain, &picks);
+                print_misses(&all_misses);
+                overall
+            }
+        };
+
+        all_results.push((backend.label(), headline_recall, all_misses.len()));
+        if headline_recall < P_AT_1_THRESHOLD {
+            any_below_threshold.push(format!(
+                "{}: {:.1}% ({} misses)",
+                backend.label(), headline_recall * 100.0, all_misses.len(),
+            ));
+        }
     }
 
-    // Mode-specific reporting.
-    match mode {
-        BenchMode::ToolOnly => {
-            let recall = compute_recall(&picks, &active);
-            eprintln!(
-                "\n[routing_bench] mode=tool-only backend={} domain={:?} P@1={}/{} = {:.1}% (threshold {:.0}%)",
-                backend.label(),
-                domain,
-                (recall * active.len() as f64).round() as usize,
-                active.len(),
-                recall * 100.0,
-                P_AT_1_THRESHOLD * 100.0,
-            );
-            print_per_domain_recall(domain, &picks);
-            print_misses(&all_misses);
-            assert!(
-                recall >= P_AT_1_THRESHOLD,
-                "Routing P@1 {:.1}% below threshold {:.0}% — {} miss(es)",
-                recall * 100.0, P_AT_1_THRESHOLD * 100.0, all_misses.len(),
-            );
-        }
-        BenchMode::ContextRich => {
-            let recall = compute_recall(&picks, &active);
-            let fp_rate = compute_fp_rate(&picks);
-            let overall = compute_overall(&picks, &active);
-            eprintln!(
-                "\n[routing_bench] mode=context-rich backend={} domain={:?}\n  Recall  = {:.1}% ({}/{})\n  FP-rate = {:.1}% ({}/{})\n  Overall = {:.1}% ({}/{}, threshold {:.0}%)",
-                backend.label(),
-                domain,
-                recall * 100.0,
-                (recall * active.len() as f64).round() as usize, active.len(),
-                fp_rate * 100.0,
-                (fp_rate * FP_ORACLE.len() as f64).round() as usize, FP_ORACLE.len(),
-                overall * 100.0,
-                (overall * (active.len() + FP_ORACLE.len()) as f64).round() as usize,
-                active.len() + FP_ORACLE.len(),
-                P_AT_1_THRESHOLD * 100.0,
-            );
-            print_per_domain_recall(domain, &picks);
-            print_misses(&all_misses);
-            assert!(
-                overall >= P_AT_1_THRESHOLD,
-                "Overall P@1 {:.1}% below threshold {:.0}% — {} miss(es)",
-                overall * 100.0, P_AT_1_THRESHOLD * 100.0, all_misses.len(),
-            );
+    // Multi-model summary table when more than one backend ran.
+    if backends.len() > 1 {
+        eprintln!("\n=== Multi-model P@1 summary (threshold {:.0}%) ===", P_AT_1_THRESHOLD * 100.0);
+        for (label, recall, misses) in &all_results {
+            let marker = if *recall >= P_AT_1_THRESHOLD { "PASS" } else { "FAIL" };
+            eprintln!("  [{}] {:<40} {:.1}%  ({} miss)", marker, label, recall * 100.0, misses);
         }
     }
+
+    // Single failing assertion at the end so all backends' reports print first.
+    assert!(
+        any_below_threshold.is_empty(),
+        "Routing P@1 below threshold {:.0}% on {} backend(s):\n  {}",
+        P_AT_1_THRESHOLD * 100.0,
+        any_below_threshold.len(),
+        any_below_threshold.join("\n  "),
+    );
 }
 
 /// When `domain=All`, also print per-pool recall so frontend regressions
@@ -706,6 +799,43 @@ fn oracle_well_formed() {
 #[test]
 fn frontend_oracle_well_formed() {
     assert_oracle_covers_registry("frontend/FRONTEND_ORACLE", FRONTEND_ORACLE);
+}
+
+/// Drift check: every tool registered in `ToolRegistry` must be referenced
+/// in the adoption template's decision table. Prevents "added a tool but
+/// forgot to update the routing decision table" — the regression that
+/// `index_line_drift_check` catches for the MEMORY.md INDEX_LINE, this
+/// catches for the per-tool decision rows.
+///
+/// Lightweight by design: substring match, not structural Markdown parsing.
+/// Full build.rs codegen is over-engineered for current churn rate (~3 tool
+/// surface changes per year per CHANGELOG); a single failing assertion at
+/// CI time is enough to remind the developer.
+#[test]
+fn decision_table_covers_registry() {
+    let template_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("claude-plugin/templates/plugin_code_graph_mcp.md");
+    let content = std::fs::read_to_string(&template_path)
+        .unwrap_or_else(|e| panic!("read {}: {}", template_path.display(), e));
+
+    let registry = ToolRegistry::new();
+    let mut missing: Vec<&str> = Vec::new();
+    for tool in registry.list_tools() {
+        // Match the tool name as a word — must be wrapped in non-identifier
+        // chars on at least one side. Avoids false positives if a tool name
+        // were a substring of a longer identifier (none are today, but defends
+        // against future additions like `find_references` vs `find_references_v2`).
+        let needle = tool.name.as_str();
+        if !content.contains(needle) {
+            missing.push(needle);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "Decision-table drift: {} tool(s) registered in ToolRegistry but absent from \
+         claude-plugin/templates/plugin_code_graph_mcp.md — add a row for: {:?}",
+        missing.len(), missing,
+    );
 }
 
 #[test]
@@ -1054,6 +1184,106 @@ mod scoring_tests {
     fn majority_vote_empty_returns_none() {
         let v: Option<String> = majority_vote(&[] as &[&str]);
         assert_eq!(v, None);
+    }
+}
+
+#[cfg(test)]
+mod backends_tests {
+    use super::*;
+
+    fn label_of(b: &Backend) -> String { b.label() }
+
+    #[test]
+    fn parse_models_env_basic() {
+        let v = parse_models_env("a,b,c");
+        assert_eq!(v, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn parse_models_env_trims_whitespace() {
+        let v = parse_models_env(" claude-sonnet-4-6 , claude-opus-4-7 ,claude-haiku-4-5 ");
+        assert_eq!(v, vec!["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5"]);
+    }
+
+    #[test]
+    fn parse_models_env_drops_empty_entries() {
+        let v = parse_models_env(",,a,, ,b,");
+        assert_eq!(v, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_models_env_empty_returns_empty() {
+        assert_eq!(parse_models_env(""), Vec::<String>::new());
+        assert_eq!(parse_models_env("   "), Vec::<String>::new());
+        assert_eq!(parse_models_env(",,,"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn build_backends_anthropic_preferred_over_openrouter() {
+        let backends = build_backends(
+            vec!["claude-opus-4-7".into(), "claude-haiku-4-5".into()],
+            Some("ant-key"),
+            Some("or-key"),
+        );
+        assert_eq!(backends.len(), 2);
+        // Anthropic key wins — both backends should be Anthropic variant.
+        for b in &backends {
+            assert!(matches!(b, Backend::Anthropic { .. }), "expected Anthropic, got {:?}", label_of(b));
+        }
+        assert_eq!(label_of(&backends[0]), "anthropic/claude-opus-4-7");
+        assert_eq!(label_of(&backends[1]), "anthropic/claude-haiku-4-5");
+    }
+
+    #[test]
+    fn build_backends_openrouter_fallback_when_no_anthropic() {
+        let backends = build_backends(
+            vec!["anthropic/claude-sonnet-4.5".into()],
+            None,
+            Some("or-key"),
+        );
+        assert_eq!(backends.len(), 1);
+        assert!(matches!(backends[0], Backend::OpenRouter { .. }));
+        assert_eq!(label_of(&backends[0]), "openrouter/anthropic/claude-sonnet-4.5");
+    }
+
+    #[test]
+    fn build_backends_no_keys_returns_empty() {
+        let backends = build_backends(
+            vec!["claude-sonnet-4-6".into()],
+            None,
+            None,
+        );
+        assert!(backends.is_empty(), "no keys → empty backends, got {} entries", backends.len());
+    }
+
+    #[test]
+    fn build_backends_empty_keys_treated_as_missing() {
+        // detect_backend treats empty-string keys as "not set"; build_backends mirrors that.
+        let backends = build_backends(
+            vec!["claude-sonnet-4-6".into()],
+            Some(""),
+            Some(""),
+        );
+        assert!(backends.is_empty());
+    }
+
+    #[test]
+    fn build_backends_empty_models_returns_empty() {
+        let backends = build_backends(vec![], Some("k"), Some("k2"));
+        assert!(backends.is_empty());
+    }
+
+    #[test]
+    fn build_backends_preserves_model_order() {
+        let backends = build_backends(
+            vec!["m1".into(), "m2".into(), "m3".into()],
+            Some("k"),
+            None,
+        );
+        assert_eq!(backends.len(), 3);
+        assert_eq!(label_of(&backends[0]), "anthropic/m1");
+        assert_eq!(label_of(&backends[1]), "anthropic/m2");
+        assert_eq!(label_of(&backends[2]), "anthropic/m3");
     }
 }
 

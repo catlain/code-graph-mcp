@@ -9,7 +9,11 @@ const {
   extractFilePaths,
   extractSymbols,
   detectIntents,
+  scoreIntent,
+  INTENT_PATTERNS,
+  INTENT_THRESHOLD,
   determineQueryType,
+  computeQuietHooks,
 } = require('./user-prompt-context');
 
 // ── shouldSkip ──────────────────────────────────────────
@@ -250,6 +254,48 @@ test('detectIntents: search (ZH)', () => {
   assert.ok(detectIntents('在哪里用了这个常量').search);
 });
 
+// --- Per-keyword scoring (v0.21 weighted-scorer refactor) ---
+test('scoreIntent: matched keyword returns its weight, unmatched returns 0', () => {
+  // Each pattern in INTENT_PATTERNS is testable in isolation now.
+  assert.equal(scoreIntent('this bug is critical', 'impact'), 1.0);
+  assert.equal(scoreIntent('hello world', 'impact'), 0);
+  assert.equal(scoreIntent('refactor this module', 'modify'), 1.0);
+  assert.equal(scoreIntent('refactor this module', 'implement'), 0);
+});
+
+test('scoreIntent: max weight wins when multiple patterns match', () => {
+  // "this bug needs a fix and impact analysis" matches `impact`, `bug`,
+  // `risk`-no, all three impact rows are weight 1.0 currently — score is 1.0.
+  // Spec: scoreIntent returns max(weight) of matching patterns, never sum.
+  const score = scoreIntent('this bug needs impact analysis', 'impact');
+  assert.equal(score, 1.0);
+});
+
+test('scoreIntent: unknown intent returns 0 (no throw)', () => {
+  assert.equal(scoreIntent('anything', 'nonexistent_intent'), 0);
+});
+
+test('INTENT_PATTERNS: every intent has at least 5 patterns and uniform weights', () => {
+  // v0.21 starts with uniform weights; future tuning can vary them per-pattern.
+  // This test guards against regression to the giant single-regex form.
+  const intents = ['impact', 'modify', 'implement', 'understand', 'callgraph', 'search'];
+  for (const intent of intents) {
+    const patterns = INTENT_PATTERNS[intent];
+    assert.ok(Array.isArray(patterns), `${intent} must have patterns array`);
+    assert.ok(patterns.length >= 5, `${intent} must have >=5 patterns, got ${patterns.length}`);
+    for (const [pattern, weight] of patterns) {
+      assert.ok(pattern instanceof RegExp, `${intent} pattern must be RegExp`);
+      assert.ok(typeof weight === 'number' && weight > 0 && weight <= 1, `${intent} weight must be (0, 1]`);
+    }
+  }
+});
+
+test('INTENT_THRESHOLD is 0.5 — single weight-1.0 match fires the intent', () => {
+  // Threshold contract: any pattern @ weight >= 0.5 → intent fires.
+  // If we lower a pattern to weight 0.4, it must NOT fire alone.
+  assert.equal(INTENT_THRESHOLD, 0.5);
+});
+
 // --- No false positives ---
 test('detectIntents: simple confirmations have no code intent', () => {
   const r = detectIntents('好的');
@@ -478,4 +524,49 @@ test('CODE_GRAPH_QUIET_HOOKS=1 short-circuits silently on stdout, stderr, exit 0
   assert.equal(proc.stdout, '', 'stdout must be empty');
   assert.equal(proc.stderr, '', 'stderr must be empty');
   assert.equal(proc.status, 0, 'must exit 0');
+});
+
+// ── computeQuietHooks priority chain (v0.21 opt-in flip) ────────
+
+test('computeQuietHooks: default (no env) is QUIET', () => {
+  // v0.21: flipped from opt-out to opt-in. Routing-bench P@1=100% earned
+  // the right to stop pushing context the agent would have requested.
+  assert.equal(computeQuietHooks({}), true);
+});
+
+test('computeQuietHooks: CODE_GRAPH_VERBOSE_HOOKS=1 enables push (opt-in)', () => {
+  assert.equal(computeQuietHooks({ CODE_GRAPH_VERBOSE_HOOKS: '1' }), false);
+});
+
+test('computeQuietHooks: legacy CODE_GRAPH_QUIET_HOOKS=0 forces noisy (back-compat)', () => {
+  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '0' }), false);
+});
+
+test('computeQuietHooks: legacy CODE_GRAPH_QUIET_HOOKS=1 forces quiet (back-compat)', () => {
+  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '1' }), true);
+});
+
+test('computeQuietHooks: legacy QUIET_HOOKS=0 wins over VERBOSE_HOOKS=1 (priority chain)', () => {
+  // Priority order: CODE_GRAPH_QUIET_HOOKS=0/1 > CODE_GRAPH_VERBOSE_HOOKS > default.
+  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '0', CODE_GRAPH_VERBOSE_HOOKS: '0' }), false);
+  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '1', CODE_GRAPH_VERBOSE_HOOKS: '1' }), true);
+});
+
+test('default env (no flags) short-circuits silently — opt-in flip', () => {
+  // End-to-end check: with the opt-in flip, a default-env spawn produces
+  // no stdout/stderr even on a message that previously would have injected.
+  const { spawnSync } = require('node:child_process');
+  const script = path.join(__dirname, 'user-prompt-context.js');
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.CODE_GRAPH_QUIET_HOOKS;
+  delete cleanEnv.CODE_GRAPH_VERBOSE_HOOKS;
+  const proc = spawnSync(process.execPath, [script], {
+    input: JSON.stringify({ message: 'impact of refactoring parse_code function' }),
+    env: cleanEnv,
+    encoding: 'utf8',
+    timeout: 2000,
+  });
+  assert.equal(proc.stdout, '', 'default must be silent on stdout');
+  assert.equal(proc.stderr, '', 'default must be silent on stderr');
+  assert.equal(proc.status, 0, 'default must exit 0');
 });
