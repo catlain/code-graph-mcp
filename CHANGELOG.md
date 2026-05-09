@@ -1,5 +1,77 @@
 # Changelog
 
+## v0.19.0 — Tier-aware language support: bash/json + C/C++ #include/gtest + Dart top-level fix
+
+### Migration notes (read first)
+
+**No breaking changes.** All additions are backward-compatible. Existing indexes
+pick up new edges and test markers on the next incremental update — no rebuild
+required. Users feel three new behaviors automatically:
+
+- New file extensions are now indexed: `.sh` / `.bash` (Bash), `.json` (JSON, file-FTS only).
+- C/C++ `#include` directives now produce IMPORTS edges in the dependency graph.
+- gtest macro invocations (`TEST` / `TEST_F` / `TEST_P` / `TEST_CASE` / `TYPED_TEST` / `TYPED_TEST_P`) are now marked `is_test=true` and named `Suite.Name`.
+
+To revert any individual feature, pin to v0.18.4 (`cargo install code-graph-mcp@0.18.4`
+or downgrade the npm-installed binary). No env-flag opt-out — the additions are
+graph data shape, not behavior toggles.
+
+### New language coverage
+
+- **Bash** (`tree-sitter-bash 0.23.3`) — function definitions, command-style
+  calls (with static-identifier filter rejecting `$VAR` / `$(...)` / shell
+  built-ins like `[` and `:`), and IMPORTS edges from `source <file>` / `. <file>`
+  (path prefix and `.sh` / `.bash` extension stripped; dynamic paths skipped).
+- **JSON** (`tree-sitter-json 0.24.8`) — file-FTS indexing only. No AST symbols
+  extracted by design (JSON has no function/class concepts); files are searchable
+  via FTS5 like any other indexed text.
+
+### C/C++ improvements
+
+- `#include "foo/bar.h"` and `#include <stdio.h>` now emit IMPORTS edges from
+  `<module>` to the bare module name. Path prefix and `.h` / `.hpp` / `.hxx` / `.hh`
+  extensions stripped so cross-file resolution can match header file nodes.
+  Closes a long-standing gap where C/C++ projects had near-empty import graphs.
+- gtest macros parsed by tree-sitter as `function_definition` now extract
+  `Suite.Name` (e.g. `MathSuite.Addition`) instead of colliding under the macro
+  name (`TEST`), and force `is_test=true` on the resulting node. Six macros
+  covered: `TEST`, `TEST_F`, `TEST_P`, `TEST_CASE`, `TYPED_TEST`, `TYPED_TEST_P`.
+
+### Bugfixes
+
+- **Dart top-level function scope** (silent call-graph hole): the `function_body`
+  scope_name arm in `relations.rs` previously only matched `method_signature`
+  prev-siblings. Top-level Dart functions wrap as `declaration > function_signature
+  + function_body` — that AST path was silently dropped, so every call inside any
+  top-level Dart function was missing from the call graph. Now both top-level
+  and class-method shapes resolve correctly.
+
+### Tier-aware language support docs
+
+README and project `CLAUDE.md` previously claimed "16 languages" as a flat list.
+Reality is a continuum of extraction depth. Updated to a 5-tier breakdown:
+
+- **Full** (calls + imports + inheritance + HTTP routes + test markers):
+  TS/TSX, JS, Go, Python, Rust, Java
+- **Smoke-tested** (calls + imports + inheritance): C#, Kotlin, Ruby, PHP, Swift, Dart
+- **Limited** (functions + calls + `#include` imports + gtest test markers;
+  `Class::method` scope qualification still deferred): C, C++
+- **Scripting**: Bash (with `source`/`.` imports), Markdown (headings)
+- **File-FTS only** (no AST symbols extracted): HTML, CSS, JSON
+
+### Test coverage
+
+Parser test suite: 65 → 87 (+22). New tests:
+
+- 6 inheritance smoke tests for C#/Kotlin/Ruby/PHP/Swift/Dart (audit confirmed
+  baseline shapes work for `delegation_specifiers` / `inheritance_specifier` /
+  `base_clause` / `class_interface_clause` / `superclass` / `base_list` with
+  IFoo heuristic).
+- 12 calls + imports smoke tests for the same 6 languages (Tier 2).
+- 3 tests for C/C++ `#include` IMPORTS + gtest macro detection.
+- Test infrastructure now provides regression protection for the 6 Tier 2
+  languages that had zero specific tests before this release.
+
 ## v0.18.4 — Hidden-5 fold + tools.rs split + Cargo default lite + routing-bench CI
 
 ### Migration notes (read first)
