@@ -1103,6 +1103,8 @@ pub struct ModuleExport {
     pub signature: Option<String>,
     pub file_path: String,
     pub caller_count: i64,
+    pub start_line: i64,
+    pub end_line: i64,
 }
 
 /// Get all exported symbols from files under a directory prefix.
@@ -1118,7 +1120,8 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     // whose names don't match the name-heuristic in is_test_symbol.
     let sql_exports =
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
-                COALESCE(cc.cnt, 0) as caller_count
+                COALESCE(cc.cnt, 0) as caller_count,
+                n.start_line, n.end_line
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          JOIN edges e ON e.target_id = n.id AND e.relation = ?1
@@ -1136,6 +1139,8 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
             signature: row.get(3)?,
             file_path: row.get(4)?,
             caller_count: row.get(5)?,
+            start_line: row.get(6)?,
+            end_line: row.get(7)?,
         })
     })?;
     let results: Vec<ModuleExport> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1147,7 +1152,8 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     // Phase 2: Fallback for non-JS/TS — all named top-level symbols in matching files
     let sql_fallback =
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
-                COALESCE(cc.cnt, 0) as caller_count
+                COALESCE(cc.cnt, 0) as caller_count,
+                n.start_line, n.end_line
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          LEFT JOIN (SELECT target_id, COUNT(*) as cnt FROM edges WHERE relation = ?2 GROUP BY target_id) cc
@@ -1166,6 +1172,8 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
             signature: row.get(3)?,
             file_path: row.get(4)?,
             caller_count: row.get(5)?,
+            start_line: row.get(6)?,
+            end_line: row.get(7)?,
         })
     })?;
     let all: Vec<ModuleExport> = rows2.collect::<std::result::Result<Vec<_>, _>>()?;

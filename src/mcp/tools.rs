@@ -32,7 +32,7 @@ impl ToolRegistry {
         let tools = vec![
             ToolDefinition {
                 name: "semantic_code_search".into(),
-                description: "Concept search when no symbol/module is named. If a symbol is named (e.g., 'show X struct'), use get_ast_node; if module path is known, use module_overview. Use when grep is noisy.".into(),
+                description: "Concept search (vector + FTS RRF). Use INSTEAD OF multi-round Grep when query is fuzzy / no exact symbol. Named symbol → get_ast_node; known module path → module_overview.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -48,7 +48,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_call_graph".into(),
-                description: "Who calls X / what X calls: multi-hop call chain. Use when: 'who calls X?' or tracing flow. For HTTP routes pass route_path='GET /api/x' to trace from handler down.".into(),
+                description: "Multi-hop call chain. Replaces N rounds of `grep \"X(\"` + Read. Pass route_path='GET /api/x' to trace HTTP handler → downstream (folds the old trace_http_chain).".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -65,7 +65,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_ast_node".into(),
-                description: "Inspect ONE named symbol: signature, source, opt references/impact/similar. Use when: query names a symbol asking for definition/body/implementation. PREFER over semantic_code_search.".into(),
+                description: "ONE named symbol: signature + source + opt impact/refs/similar. Use BEFORE editing X to see signature + blast radius. Repo-wide index (LSP only handles open files).".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -85,7 +85,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "project_map".into(),
-                description: "Project architecture map. SessionStart hook already injects this at boot. Call only if structure changed mid-session: major refactor, rebuild-index, or many new modules.".into(),
+                description: "Architecture map (modules / deps / hot fns). Replaces Glob+Read of N top-level files. SessionStart already injected; recall only after major refactor or rebuild-index.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -96,7 +96,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "module_overview".into(),
-                description: "Module structure / symbols. Use when: exploring a module or finding the right file to edit. Shows exports, hot paths, files. include_deps=true (file path): dep graph; include_dead=true: unreferenced.".into(),
+                description: "Symbols in a directory or file, grouped by type + caller count. Replaces Glob + Read×N for big dirs / huge files. Single file: include_deps=dep graph, include_dead=unreferenced.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -113,7 +113,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "ast_search".into(),
-                description: "Enumerate MULTIPLE symbols by structural criteria (type, return, params). Use when: 'all structs in module X' or 'all fns returning Vec<T>'. For ONE known symbol, use get_ast_node.".into(),
+                description: "Enumerate symbols by typed filters (type/returns/params) Grep can't express. Use for 'all fns returning Result<T>' / 'all structs implementing X'. ONE known symbol → get_ast_node.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -128,7 +128,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "find_references".into(),
-                description: "Usage sites (calls/imports/inherits/implements). Use when: rename/remove audit of a defined symbol. For plain literals (string/regex), prefer Grep. For 'who calls X?', use get_call_graph.".into(),
+                description: "Rename/remove audits — every site that imports/inherits/implements/calls a symbol. Repo-wide cross-language (LSP needs file open). Literals → Grep; 'who calls X?' → get_call_graph.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

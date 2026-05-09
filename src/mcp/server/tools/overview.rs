@@ -86,6 +86,8 @@ impl McpServer {
                 "file": e.file_path,
                 "caller_count": e.caller_count,
                 "signature": e.signature,
+                "start_line": e.start_line,
+                "end_line": e.end_line,
             }))
             .collect();
 

@@ -7,6 +7,7 @@ const os = require('os');
 const {
   adopt, unadopt, memoryDir, stripSentinelBlock,
   isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
+  detectProjectType, buildIndexLine,
   SENTINEL_BEGIN, SENTINEL_END, INDEX_LINE, TEMPLATE_PATH, TARGET_NAME,
   PROJECT_MARKERS,
 } = require('./adopt');
@@ -583,5 +584,236 @@ test('needsRefresh ignores the adopted-by marker when bytewise comparing', () =>
     adopt({ cwd: sb.cwd, home: sb.home });
     assert.strictEqual(needsRefresh({ cwd: sb.cwd, home: sb.home }), false,
       'needsRefresh should be false right after adopt — marker must not trigger drift');
+  } finally { sb.cleanup(); }
+});
+
+// memdir L1 升格 — project-typed INDEX_LINE coverage.
+
+test('detectProjectType returns generic for an empty cwd', () => {
+  const sb = makeSandbox();
+  try {
+    assert.strictEqual(detectProjectType(sb.cwd), 'generic');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType returns rust for a Cargo.toml without web framework', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'), '[package]\nname="x"\n[dependencies]\nserde="1"\n');
+    assert.strictEqual(detectProjectType(sb.cwd), 'rust');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType returns web-rs when Cargo.toml has axum/actix/etc', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'), '[dependencies]\naxum = "0.7"\n');
+    assert.strictEqual(detectProjectType(sb.cwd), 'web-rs');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType returns frontend for package.json with React/Next/Vue', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'package.json'),
+      '{"dependencies":{"next":"^14","react":"^18"}}');
+    assert.strictEqual(detectProjectType(sb.cwd), 'frontend');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType returns web-node for package.json with express/fastify', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'package.json'),
+      '{"dependencies":{"express":"^4"}}');
+    assert.strictEqual(detectProjectType(sb.cwd), 'web-node');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType returns web-py for FastAPI in pyproject.toml', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'pyproject.toml'),
+      '[tool.poetry.dependencies]\nfastapi = "^0.115"\n');
+    assert.strictEqual(detectProjectType(sb.cwd), 'web-py');
+  } finally { sb.cleanup(); }
+});
+
+test('buildIndexLine generic returns the canonical INDEX_LINE byte-for-byte', () => {
+  // Critical: keeps backward compatibility with adopted projects that have no
+  // markers. Any drift here invalidates needsRefresh's idempotency assumption.
+  assert.strictEqual(buildIndexLine('generic'), INDEX_LINE);
+  assert.strictEqual(buildIndexLine(undefined), INDEX_LINE);
+});
+
+test('buildIndexLine web-rs prepends route/trace tags + handler-focused lead', () => {
+  const line = buildIndexLine('web-rs');
+  assert.match(line, /\[trace, route,/, 'web-rs index line should lead with trace/route tags');
+  assert.match(line, /HTTP 路由/, 'lead sentence should mention HTTP routes');
+});
+
+test('buildIndexLine frontend emphasizes refs/overview, drops HTTP route priming', () => {
+  const line = buildIndexLine('frontend');
+  assert.match(line, /组件重命名|find_references/, 'frontend should mention rename audit / refs');
+  assert.match(line, /HTTP route 通常不适用/, 'frontend should explicitly demote HTTP route tracing');
+});
+
+test('adopt + needsRefresh agree on typed INDEX_LINE — no spurious refresh in a Rust project', () => {
+  // The detection function is deterministic + adopt and needsRefresh both call
+  // it; together they must produce a consistent indexLine, otherwise every
+  // SessionStart triggers a rewrite.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'), '[package]\nname="x"\n');
+    adopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(needsRefresh({ cwd: sb.cwd, home: sb.home }), false,
+      'needsRefresh must be false right after adopt for a Rust project');
+    const indexPath = path.join(sb.dir, 'MEMORY.md');
+    const index = fs.readFileSync(indexPath, 'utf8');
+    assert.ok(index.includes('优先于 Grep'),
+      'MEMORY.md should contain the rust-typed index line');
+  } finally { sb.cleanup(); }
+});
+
+// 2A — false-positive hardening: comment-strip + section-aware scan.
+
+test('detectProjectType ignores commented-out web-framework deps in Cargo.toml', () => {
+  // Pre-fix: `# axum = "0.7"` substring-matched and falsely promoted to web-rs.
+  // Post-fix: comment stripping happens before section scan.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'),
+      '[package]\nname="x"\n[dependencies]\n# axum = "0.7"  # disabled, was for prototype\nserde = "1"\n');
+    assert.strictEqual(detectProjectType(sb.cwd), 'rust',
+      'commented dep must not promote to web-rs');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType ignores axum in [dev-dependencies] only', () => {
+  // axum used solely for tests does not make this a web project.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'),
+      '[package]\nname="x"\n[dependencies]\nserde = "1"\n[dev-dependencies]\naxum = "0.7"\n');
+    assert.strictEqual(detectProjectType(sb.cwd), 'rust',
+      'axum in dev-dependencies must not promote to web-rs');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType ignores axum in [build-dependencies] only', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'),
+      '[package]\nname="x"\n[dependencies]\nserde = "1"\n[build-dependencies]\naxum = "0.7"\n');
+    assert.strictEqual(detectProjectType(sb.cwd), 'rust',
+      'axum in build-dependencies must not promote to web-rs');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType ignores react in devDependencies of package.json', () => {
+  // A library that lists react in devDependencies for testing should not
+  // be classified as a frontend app.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'package.json'),
+      JSON.stringify({
+        dependencies: { lodash: '^4' },
+        devDependencies: { react: '^18', 'react-dom': '^18' },
+      }));
+    assert.strictEqual(detectProjectType(sb.cwd), 'node',
+      'react in devDependencies must not promote to frontend');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType ignores // indirect deps in go.mod', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'go.mod'),
+      'module example.com/x\n\nrequire (\n\tgithub.com/some/cli v1.0.0\n\tgithub.com/gin-gonic/gin v1.9.0 // indirect\n)\n');
+    assert.strictEqual(detectProjectType(sb.cwd), 'go',
+      'indirect gin must not promote to web-go');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType handles malformed package.json without throwing', () => {
+  // JSON.parse failure must not crash detection; falls back to 'node' since
+  // package.json exists but is unreadable.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'package.json'), '{not valid json');
+    assert.strictEqual(detectProjectType(sb.cwd), 'node',
+      'malformed package.json should fall back to node bucket');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType detects PEP 621 [project] dependencies block', () => {
+  // PEP 621 puts `dependencies = [...]` inside [project], not a separate
+  // [project.dependencies] section — our state machine accepts both.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'pyproject.toml'),
+      '[project]\nname = "x"\ndependencies = ["fastapi>=0.115", "uvicorn"]\n');
+    assert.strictEqual(detectProjectType(sb.cwd), 'web-py');
+  } finally { sb.cleanup(); }
+});
+
+test('detectProjectType reads requirements.txt as fallback', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'requirements.txt'),
+      '# web stack\nflask>=3.0\ngunicorn\n');
+    assert.strictEqual(detectProjectType(sb.cwd), 'web-py');
+  } finally { sb.cleanup(); }
+});
+
+// 2D — env override.
+
+test('CODE_GRAPH_PROJECT_TYPE env override beats file-based detection', () => {
+  const sb = makeSandbox();
+  try {
+    // Cargo.toml says rust — env says web-rs. Env wins.
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'), '[package]\nname="x"\n');
+    assert.strictEqual(
+      detectProjectType(sb.cwd, { CODE_GRAPH_PROJECT_TYPE: 'web-rs' }),
+      'web-rs',
+    );
+  } finally { sb.cleanup(); }
+});
+
+test('CODE_GRAPH_PROJECT_TYPE env override falls through on invalid value', () => {
+  // Typo'd / unknown bucket name should not silently classify everything as
+  // 'generic' — fall through to file-based detection so the project still
+  // gets a meaningful index line.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'), '[package]\nname="x"\n');
+    assert.strictEqual(
+      detectProjectType(sb.cwd, { CODE_GRAPH_PROJECT_TYPE: 'web-rust' /* typo */ }),
+      'rust',
+      'invalid override must fall through to file detection',
+    );
+  } finally { sb.cleanup(); }
+});
+
+test('CODE_GRAPH_PROJECT_TYPE env override unset uses file detection', () => {
+  // Empty env reaches file-based detection unchanged.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'), '[package]\nname="x"\n');
+    assert.strictEqual(detectProjectType(sb.cwd, {}), 'rust');
+  } finally { sb.cleanup(); }
+});
+
+test('CODE_GRAPH_PROJECT_TYPE env override forces generic in a Rust project', () => {
+  // Power-user case: explicit opt-out of typed routing for a project that
+  // would otherwise be auto-classified.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'),
+      '[package]\nname="x"\n[dependencies]\naxum = "0.7"\n');
+    assert.strictEqual(
+      detectProjectType(sb.cwd, { CODE_GRAPH_PROJECT_TYPE: 'generic' }),
+      'generic',
+    );
   } finally { sb.cleanup(); }
 });

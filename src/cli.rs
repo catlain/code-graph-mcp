@@ -1837,6 +1837,8 @@ pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
                     "file": e.file_path,
                     "signature": e.signature,
                     "caller_count": e.caller_count,
+                    "start_line": e.start_line,
+                    "end_line": e.end_line,
                 })
             })
             .collect();
@@ -1849,6 +1851,36 @@ pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
         std::collections::BTreeMap::new();
     for e in &exports {
         by_file.entry(&e.file_path).or_default().push(e);
+    }
+
+    // Single-file path → outline format (sorted by line, signature + line range visible).
+    // Replaces Read on huge files: a 3000+ line source emits ~symbol-count lines instead.
+    if by_file.len() == 1 {
+        let (file, symbols) = by_file.iter().next().unwrap();
+        writeln!(stdout, "{}", file)?;
+        let mut sorted: Vec<&queries::ModuleExport> = symbols.to_vec();
+        sorted.sort_by_key(|e| e.start_line);
+        for s in sorted {
+            let callers = if s.caller_count > 0 {
+                format!(" ({}×)", s.caller_count)
+            } else {
+                String::new()
+            };
+            if compact {
+                writeln!(stdout, "  L{}-{}  {}  {}{}",
+                    s.start_line, s.end_line, s.node_type, s.name, callers)?;
+            } else {
+                let sig = s.signature.as_deref().unwrap_or("");
+                let sig_display = if sig.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", sig.lines().next().unwrap_or("").trim())
+                };
+                writeln!(stdout, "  L{}-{}  {}  {}{}{}",
+                    s.start_line, s.end_line, s.node_type, s.name, callers, sig_display)?;
+            }
+        }
+        return Ok(());
     }
 
     for (file, symbols) in &by_file {

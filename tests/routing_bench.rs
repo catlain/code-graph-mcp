@@ -95,7 +95,10 @@ const ORACLE: &[(&str, &str)] = &[
     ("Where is the embedding model loaded from disk?", "semantic_code_search"),
     ("Show me code related to change detection via Merkle hashing", "semantic_code_search"),
     // get_call_graph
-    ("Who calls the function ensure_indexed?", "get_call_graph"),
+    // Alternates accepted: at depth=1, find_references with relation=calls
+    // returns the same callers list as get_call_graph. Pinning a single answer
+    // over-fits the oracle — semantic equivalence both routes are correct.
+    ("Who calls the function ensure_indexed?", "get_call_graph|find_references"),
     ("What does run_full_index call during execution?", "get_call_graph"),
     ("Trace the call chain around extract_relations", "get_call_graph"),
     // find_references
@@ -146,7 +149,7 @@ const FRONTEND_ORACLE: &[(&str, &str)] = &[
     ("Where is the Redux store wired up?", "semantic_code_search"),
     ("Show me code that debounces search input", "semantic_code_search"),
     // get_call_graph
-    ("Who calls the function fetchUserProfile?", "get_call_graph"),
+    ("Who calls the function fetchUserProfile?", "get_call_graph|find_references"),
     ("What does handleSubmit invoke during execution?", "get_call_graph"),
     ("Trace the call chain around dispatch in the reducer", "get_call_graph"),
     // find_references
@@ -346,7 +349,7 @@ fn routing_recall_benchmark() {
             .map(|p| p.as_deref().unwrap_or("(none)"))
             .collect();
         let voted = majority_vote(&pick_strs).unwrap_or_else(|| "(none)".to_string());
-        if voted != expected {
+        if !matches_expected(&voted, expected) {
             all_misses.push((query.to_string(), expected.to_string(), run_picks.clone()));
         }
         picks.insert(query.to_string(), voted);
@@ -562,14 +565,25 @@ fn build_oracle(mode: BenchMode, domain: BenchDomain) -> Vec<(&'static str, &'st
     all
 }
 
+/// Match a single pick against an oracle expected string. Expected may be a
+/// single tool name (`"get_call_graph"`) or a pipe-separated list of equally
+/// valid alternates (`"get_call_graph|find_references"`). Alternates exist
+/// because some natural-language queries route to genuinely-equivalent tools
+/// at depth=1 — pinning a single answer over-fits routing-bench to oracle
+/// preference rather than measuring real routing capability.
+fn matches_expected(picked: &str, expected: &str) -> bool {
+    expected.split('|').any(|e| e == picked)
+}
+
 /// Recall over an oracle slice: fraction of queries in the slice where the
-/// picked tool matches the expected tool exactly. Returns 0.0 on empty slice.
+/// picked tool matches the expected tool (or any alternate). Returns 0.0 on
+/// empty slice.
 fn compute_recall(picks: &HashMap<String, String>, oracle: &[(&str, &str)]) -> f64 {
     if oracle.is_empty() {
         return 0.0;
     }
     let hits = oracle.iter()
-        .filter(|(q, exp)| picks.get(*q).map(|p| p == exp).unwrap_or(false))
+        .filter(|(q, exp)| picks.get(*q).map(|p| matches_expected(p, exp)).unwrap_or(false))
         .count();
     hits as f64 / oracle.len() as f64
 }
@@ -594,7 +608,7 @@ fn compute_fp_rate(picks: &HashMap<String, String>) -> f64 {
 /// candidate comparison.
 fn compute_overall(picks: &HashMap<String, String>, oracle: &[(&str, &str)]) -> f64 {
     let recall_hits = oracle.iter()
-        .filter(|(q, exp)| picks.get(*q).map(|p| p == exp).unwrap_or(false))
+        .filter(|(q, exp)| picks.get(*q).map(|p| matches_expected(p, exp)).unwrap_or(false))
         .count();
     let fp_violations = FP_ORACLE.iter()
         .filter(|(q, _)| {
@@ -666,12 +680,14 @@ fn assert_oracle_covers_registry(pool_name: &str, oracle: &[(&'static str, &'sta
         .map(|t| t.name.as_str()).collect();
     let mut covered: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for &(query, expected) in oracle {
-        assert!(
-            names.contains(expected),
-            "[{}] Oracle references unknown tool '{}' (query='{}'). Registry has: {:?}",
-            pool_name, expected, query, names,
-        );
-        covered.insert(expected);
+        for alt in expected.split('|') {
+            assert!(
+                names.contains(alt),
+                "[{}] Oracle references unknown tool '{}' (query='{}'). Registry has: {:?}",
+                pool_name, alt, query, names,
+            );
+            covered.insert(alt);
+        }
     }
     for name in &names {
         assert!(
@@ -941,8 +957,10 @@ mod scoring_tests {
 
     #[test]
     fn compute_recall_full_hit() {
+        // Pick the first alternate from each pipe-separated expected — matches_expected
+        // accepts any of them, so the first one is sufficient for a "full hit" simulation.
         let p: HashMap<String, String> = ORACLE.iter()
-            .map(|(q, t)| (q.to_string(), t.to_string()))
+            .map(|(q, t)| (q.to_string(), t.split('|').next().unwrap().to_string()))
             .collect();
         assert_eq!(compute_recall(&p, ORACLE), 1.0);
     }
@@ -950,9 +968,21 @@ mod scoring_tests {
     #[test]
     fn compute_recall_full_hit_frontend() {
         let p: HashMap<String, String> = FRONTEND_ORACLE.iter()
-            .map(|(q, t)| (q.to_string(), t.to_string()))
+            .map(|(q, t)| (q.to_string(), t.split('|').next().unwrap().to_string()))
             .collect();
         assert_eq!(compute_recall(&p, FRONTEND_ORACLE), 1.0);
+    }
+
+    #[test]
+    fn compute_recall_alternates_first_alt_hits() {
+        // matches_expected splits on '|'; either alt should count as a hit.
+        let oracle: &[(&str, &str)] = &[("q1", "get_call_graph|find_references")];
+        let p1: HashMap<String, String> = [("q1".to_string(), "get_call_graph".to_string())].into_iter().collect();
+        assert_eq!(compute_recall(&p1, oracle), 1.0, "first alt should match");
+        let p2: HashMap<String, String> = [("q1".to_string(), "find_references".to_string())].into_iter().collect();
+        assert_eq!(compute_recall(&p2, oracle), 1.0, "second alt should match");
+        let p3: HashMap<String, String> = [("q1".to_string(), "module_overview".to_string())].into_iter().collect();
+        assert_eq!(compute_recall(&p3, oracle), 0.0, "non-alt should miss");
     }
 
     #[test]
