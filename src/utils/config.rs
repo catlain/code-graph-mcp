@@ -23,6 +23,8 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
         "swift" => Some("swift"),
         "dart" => Some("dart"),
         "md" | "mdx" | "markdown" => Some("markdown"),
+        "sh" | "bash" => Some("bash"),
+        "json" => Some("json"),
         _ => None,
     }
 }
@@ -45,6 +47,9 @@ mod tests {
         assert_eq!(detect_language("index.html"), Some("html"));
         assert_eq!(detect_language("style.css"), Some("css"));
         assert_eq!(detect_language("Program.cs"), Some("csharp"));
+        assert_eq!(detect_language("install.sh"), Some("bash"));
+        assert_eq!(detect_language(".github/release.bash"), Some("bash"));
+        assert_eq!(detect_language("package.json"), Some("json"));
         assert_eq!(detect_language("image.png"), None);
     }
 

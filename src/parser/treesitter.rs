@@ -170,9 +170,16 @@ fn extract_nodes(
 
         "function_definition" => {
             if config.name == "c" || config.name == "cpp" {
-                // C/C++: name is in declarator child, not name field
+                // C/C++: name is in declarator child, not name field.
+                // gtest macros (`TEST(Suite, Name) { ... }`) parse as
+                // function_definition with declarator name = the macro;
+                // we extract `Suite.Name` instead and mark is_test=true.
                 if let Some(declarator) = node.child_by_field_name("declarator") {
-                    if let Some(name) = extract_declarator_name(&declarator, source) {
+                    let gtest_name = extract_gtest_test_name(&declarator, source);
+                    let is_gtest = gtest_name.is_some();
+                    let name = gtest_name
+                        .or_else(|| extract_declarator_name(&declarator, source));
+                    if let Some(name) = name {
                         let sig_info = extract_c_signature_info(&node, source);
                         results.push(ParsedNode {
                             node_type: "function".into(),
@@ -185,7 +192,7 @@ fn extract_nodes(
                             doc_comment: get_preceding_comment(&node, source),
                             return_type: sig_info.return_type,
                             param_types: sig_info.param_types,
-                            is_test: node_is_test,
+                            is_test: node_is_test || is_gtest,
                         });
                     }
                 }
@@ -684,6 +691,47 @@ fn extract_declarator_name(node: &tree_sitter::Node, source: &str) -> Option<Str
     extract_declarator_name_inner(node, source, 0)
 }
 
+/// Detect gtest macro invocations parsed as function_definition.
+/// `TEST(Suite, Name) { ... }` has a function_declarator whose inner
+/// declarator is `TEST` and parameters are two type_identifiers.
+/// Returns `Some("Suite.Name")` when the macro matches; None otherwise.
+fn extract_gtest_test_name(declarator: &tree_sitter::Node, source: &str) -> Option<String> {
+    if declarator.kind() != "function_declarator" { return None; }
+    let inner = declarator.child_by_field_name("declarator")?;
+    if !matches!(inner.kind(), "identifier" | "field_identifier") { return None; }
+    let macro_name = node_text(&inner, source);
+    const GTEST_MACROS: &[&str] = &[
+        "TEST", "TEST_F", "TEST_P", "TEST_CASE",
+        "TYPED_TEST", "TYPED_TEST_P",
+    ];
+    if !GTEST_MACROS.contains(&macro_name) { return None; }
+
+    let params = declarator.child_by_field_name("parameters")?;
+    let mut suite: Option<String> = None;
+    let mut test: Option<String> = None;
+    let mut idx = 0;
+    for i in 0..params.named_child_count() {
+        let Some(param) = params.named_child(i) else { continue };
+        // parameter_declaration > type_identifier (gtest args parsed as types)
+        let id_text = (0..param.named_child_count())
+            .filter_map(|j| param.named_child(j))
+            .find(|c| matches!(c.kind(), "type_identifier" | "identifier"))
+            .map(|c| node_text(&c, source).to_string());
+        if let Some(t) = id_text {
+            match idx {
+                0 => suite = Some(t),
+                1 => test = Some(t),
+                _ => {}
+            }
+            idx += 1;
+        }
+    }
+    match (suite, test) {
+        (Some(s), Some(t)) => Some(format!("{}.{}", s, t)),
+        _ => None,
+    }
+}
+
 fn extract_declarator_name_inner(node: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
     if depth > MAX_AST_DEPTH { return None; }
     // C/C++ function_declarator -> identifier
@@ -973,6 +1021,45 @@ describe('Widget', () => {
         assert_eq!(by_name.get("Important Patterns").copied(), Some("h3"));
         assert_eq!(by_name.get("Subsection X").copied(), Some("h2"),
             "setext h2 (dashes) should be detected");
+    }
+
+    #[test]
+    fn test_parse_cpp_gtest_marks_is_test() {
+        let code = "#include <gtest/gtest.h>\n\nTEST(MathSuite, Addition) {\n    EXPECT_EQ(1 + 1, 2);\n}\n\nTEST_F(FixtureSuite, ScopedTest) {\n    EXPECT_TRUE(true);\n}\n\nint regular_func() { return 0; }\n";
+        let nodes = parse_code(code, "cpp").unwrap();
+        let by_name: std::collections::HashMap<&str, bool> = nodes.iter()
+            .map(|n| (n.name.as_str(), n.is_test))
+            .collect();
+        assert_eq!(by_name.get("MathSuite.Addition").copied(), Some(true),
+            "TEST(MathSuite, Addition) should yield Suite.Name + is_test=true; nodes: {:?}",
+            nodes.iter().map(|n| (&n.name, n.is_test)).collect::<Vec<_>>());
+        assert_eq!(by_name.get("FixtureSuite.ScopedTest").copied(), Some(true),
+            "TEST_F should also be detected, got: {:?}",
+            nodes.iter().map(|n| (&n.name, n.is_test)).collect::<Vec<_>>());
+        assert_eq!(by_name.get("regular_func").copied(), Some(false),
+            "non-gtest function should not be is_test");
+    }
+
+    #[test]
+    fn test_parse_bash_functions() {
+        let code = "#!/usr/bin/env bash\n\ngreet() {\n    echo \"hi\"\n}\n\nfunction backup_files {\n    cp \"$1\" \"$2\"\n}\n";
+        let nodes = parse_code(code, "bash").unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"greet"), "missing greet, got: {:?}", names);
+        assert!(names.contains(&"backup_files"),
+            "missing backup_files, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_parse_json_loads_grammar() {
+        // JSON has no function/class concept; we verify the grammar links + parses
+        // without panicking. Empty symbol list is the expected, correct outcome —
+        // file still gets file-level indexing for FTS via the indexer.
+        let code = "{\n  \"name\": \"foo\",\n  \"version\": \"1.0.0\",\n  \"deps\": [\"a\", \"b\"]\n}\n";
+        let nodes = parse_code(code, "json").unwrap();
+        assert!(nodes.is_empty(),
+            "json should yield no symbol nodes, got: {:?}",
+            nodes.iter().map(|n| (&n.name, &n.node_type)).collect::<Vec<_>>());
     }
 
     #[test]

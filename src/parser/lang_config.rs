@@ -63,6 +63,16 @@ impl LanguageConfig {
                 has_class_context: true,
                 interface_by_prefix: true,
             },
+            "bash" => Self {
+                name: "bash",
+                has_test_attributes: false,
+                method_signature_kind: None,
+                method_via_sibling: false,
+                function_body_has_methods: false,
+                call_node_kind: "command",
+                has_class_context: false,
+                interface_by_prefix: false,
+            },
             // Default config for most languages — enumerate known names for 'static lifetime,
             // fall through to "unknown" for unsupported languages.
             other => {
@@ -81,6 +91,7 @@ impl LanguageConfig {
                     "html" => "html",
                     "css" => "css",
                     "markdown" => "markdown",
+                    "json" => "json",
                     _ => "unknown",
                 };
                 Self {
@@ -152,6 +163,19 @@ mod tests {
         assert_eq!(config.call_node_kind, "invocation_expression");
         assert!(config.has_class_context);
         assert!(config.interface_by_prefix);
+    }
+
+    #[test]
+    fn test_bash_config() {
+        let config = LanguageConfig::for_language("bash");
+        assert_eq!(config.name, "bash");
+        assert!(!config.has_test_attributes);
+        assert!(config.method_signature_kind.is_none());
+        assert!(!config.method_via_sibling);
+        assert!(!config.function_body_has_methods);
+        assert_eq!(config.call_node_kind, "command");
+        assert!(!config.has_class_context);
+        assert!(!config.interface_by_prefix);
     }
 
     #[test]

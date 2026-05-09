@@ -7,7 +7,12 @@ Rust MCP server that indexes codebases into an AST knowledge graph with semantic
 ## Tech Stack
 
 - **Language**: Rust 2021 edition
-- **Parser**: Tree-sitter (16 languages: TS, JS, Go, Python, Rust, Java, C, C++, C#, Kotlin, Ruby, PHP, Swift, Dart, HTML, CSS)
+- **Parser**: Tree-sitter — extraction depth varies by language:
+  - **Full** (symbols + calls + imports + inheritance + routes + test markers): TS/TSX, JS, Go, Python, Rust, Java
+  - **Smoke-tested** (symbols + calls + imports + inheritance): C#, Kotlin, Ruby, PHP, Swift, Dart
+  - **Limited** (symbols + calls + `#include` imports + gtest test markers; no `Class::method` scope): C, C++
+  - **Scripting**: Bash (functions + commands + `source`/`.` imports), Markdown (headings)
+  - **File-FTS only** (no AST symbols extracted): HTML, CSS, JSON
 - **Storage**: SQLite (rusqlite with bundled-full) + FTS5 + sqlite-vec (bundled C extension via build.rs)
 - **Embedding**: Candle (optional, feature-gated `embed-model`)
 - **File watching**: notify crate

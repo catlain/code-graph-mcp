@@ -4,7 +4,12 @@ A high-performance code knowledge graph server implementing the [Model Context P
 
 ## Features
 
-- **Multi-language parsing** — Tree-sitter AST extraction for 16 languages: TypeScript, JavaScript, Go, Python, Rust, Java, C, C++, C#, Kotlin, Ruby, PHP, Swift, Dart, HTML, CSS
+- **Multi-language parsing** — Tree-sitter AST extraction across tiers of depth:
+  - **Full** (calls + imports + inheritance + HTTP routes + test markers): TypeScript/TSX, JavaScript, Go, Python, Rust, Java
+  - **Smoke-tested** (calls + imports + inheritance): C#, Kotlin, Ruby, PHP, Swift, Dart
+  - **Limited** (functions + calls + `#include` imports + gtest test markers; `Class::method` scope qualification deferred): C, C++
+  - **Scripting**: Bash (functions + commands + `source`/`.` imports), Markdown (headings)
+  - **File-FTS only** (no AST symbol extraction): HTML, CSS, JSON
 - **Semantic code search** — Hybrid BM25 full-text + vector semantic search with Reciprocal Rank Fusion (RRF), powered by sqlite-vec
 - **Call graph traversal** — Recursive CTE queries to trace callers/callees with cycle detection
 - **HTTP route tracing** — Map route paths to backend handler functions (Express, Flask/FastAPI, Go `net/http`)

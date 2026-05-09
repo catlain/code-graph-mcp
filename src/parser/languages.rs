@@ -20,6 +20,8 @@ pub fn get_language(name: &str) -> Option<Language> {
         "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
         "dart" => Some(tree_sitter_dart_orchard::LANGUAGE.into()),
         "markdown" => Some(tree_sitter_md::LANGUAGE.into()),
+        "bash" => Some(tree_sitter_bash::LANGUAGE.into()),
+        "json" => Some(tree_sitter_json::LANGUAGE.into()),
         _ => None,
     }
 }

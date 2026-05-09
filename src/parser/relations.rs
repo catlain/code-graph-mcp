@@ -83,24 +83,28 @@ fn walk_for_relations(
                     }
                 })
         }
-        // Dart: function_body is a sibling of method_signature in class_body
-        // Look at previous sibling to find the method name
+        // Dart: function_body is a sibling of either method_signature
+        // (in class_body) or function_signature (top-level declaration).
+        // Look at previous sibling to find the function/method name.
         "function_body" if config.function_body_has_methods => {
             node.prev_sibling()
-                .filter(|s| s.kind() == "method_signature")
-                .and_then(|s| {
-                    // method_signature -> function_signature -> name
-                    (0..s.named_child_count())
+                .and_then(|s| match s.kind() {
+                    // Top-level Dart function: declaration > function_signature + function_body
+                    "function_signature" => s.child_by_field_name("name")
+                        .map(|n| node_text(&n, source).to_string()),
+                    // Class method: method_signature wraps function_signature
+                    "method_signature" => (0..s.named_child_count())
                         .filter_map(|i| s.named_child(i))
-                        .find(|c| matches!(c.kind(), "function_signature" | "constructor_signature" | "getter_signature" | "setter_signature"))
+                        .find(|c| matches!(c.kind(),
+                            "function_signature" | "constructor_signature"
+                            | "getter_signature" | "setter_signature"))
                         .and_then(|sig| sig.child_by_field_name("name"))
-                        .map(|n| {
-                            let name = node_text(&n, source).to_string();
-                            match current_class {
-                                Some(cls) => format!("{}.{}", cls, name),
-                                None => name,
-                            }
-                        })
+                        .map(|n| node_text(&n, source).to_string()),
+                    _ => None,
+                })
+                .map(|name| match current_class {
+                    Some(cls) => format!("{}.{}", cls, name),
+                    None => name,
                 })
         }
         _ => None,
@@ -560,6 +564,97 @@ fn walk_for_relations(
         "expression_statement" if config.name == "dart" => {
             if let Some(scope) = active_scope {
                 extract_dart_calls(&node, source, scope, results);
+            }
+        }
+
+        // C/C++: `#include "foo.h"` → IMPORTS to "foo"
+        //         `#include <stdio.h>` → IMPORTS to "stdio"
+        // Header extension stripped so cross-file resolution can match the
+        // bare module name (mirrors JS require pattern).
+        "preproc_include" if matches!(config.name, "c" | "cpp") => {
+            let path_node = (0..node.named_child_count())
+                .filter_map(|i| node.named_child(i))
+                .find(|c| matches!(c.kind(), "string_literal" | "system_lib_string"));
+            if let Some(p) = path_node {
+                let raw = node_text(&p, source);
+                // string_literal text includes quotes; system_lib_string
+                // includes angle brackets. Trim both forms uniformly.
+                let unquoted = raw.trim_matches(|c| c == '"' || c == '<' || c == '>');
+                if !unquoted.is_empty() {
+                    let last = unquoted.rsplit('/').next().unwrap_or(unquoted);
+                    let stem = last.trim_end_matches(".hpp")
+                        .trim_end_matches(".hxx")
+                        .trim_end_matches(".hh")
+                        .trim_end_matches(".h");
+                    if !stem.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: "<module>".into(),
+                            target_name: stem.to_string(),
+                            relation: REL_IMPORTS.into(),
+                            metadata: None,
+                            source_language: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Bash command invocation:
+        //   `source <file>` / `. <file>` → IMPORTS edge (mirrors JS require).
+        //   Otherwise: CALLS edge to command_name.
+        // External commands (cat, grep, ...) without a function_definition
+        // in any indexed shell file get dropped at Phase 2 same-language
+        // edge resolution (see feedback_edge_resolution_same_language).
+        "command" if config.name == "bash" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let raw = node_text(&name_node, source).trim();
+
+                if raw == "source" || raw == "." {
+                    // First non-command_name word/string sibling = the file path arg.
+                    let arg = (0..node.named_child_count())
+                        .filter_map(|i| node.named_child(i))
+                        .find(|n| matches!(n.kind(), "word" | "string" | "raw_string"));
+                    if let Some(arg_node) = arg {
+                        let text = node_text(&arg_node, source);
+                        let unquoted = text.trim_matches(|c| c == '"' || c == '\'');
+                        // Skip dynamic paths ($VAR, $(...), ${...}).
+                        if !unquoted.is_empty() && !unquoted.contains('$') {
+                            let last = unquoted.rsplit('/').next().unwrap_or(unquoted);
+                            let stem = last.trim_end_matches(".sh").trim_end_matches(".bash");
+                            if !stem.is_empty() {
+                                results.push(ParsedRelation {
+                                    source_name: "<module>".into(),
+                                    target_name: stem.to_string(),
+                                    relation: REL_IMPORTS.into(),
+                                    metadata: None,
+                                    source_language: String::new(),
+                                });
+                            }
+                        }
+                    }
+                } else if let Some(scope) = active_scope {
+                    // Strip path prefix: ./foo, /usr/bin/foo, path/to/foo → foo
+                    let short = raw.rsplit('/').next().unwrap_or(raw);
+                    // Reject variable expansions ($VAR, ${VAR}), substitutions
+                    // ($(...), `...`), and concatenations (foo$VAR) — not statically
+                    // resolvable. Allow [a-zA-Z_.][a-zA-Z0-9_.-]* (covers `cat`,
+                    // `_helper`, `Backup_Files`, `script.sh`, `.bashrc`).
+                    let first_ok = short.chars().next()
+                        .map(|c| c == '_' || c == '.' || c.is_ascii_alphabetic())
+                        .unwrap_or(false);
+                    let all_ok = short.chars().all(|c|
+                        c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
+                    );
+                    if first_ok && all_ok {
+                        results.push(ParsedRelation {
+                            source_name: scope.to_string(),
+                            target_name: short.to_string(),
+                            relation: REL_CALLS.into(),
+                            metadata: None,
+                            source_language: String::new(),
+                        });
+                    }
+                }
             }
         }
 
@@ -1551,6 +1646,127 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_extract_bash_call_relations() {
+        let code = r#"#!/usr/bin/env bash
+
+run_pipeline() {
+    fetch_data "$1"
+    transform_records
+    /usr/bin/cat report.txt
+    ./scripts/finalize.sh
+    : noop
+    [ -f /tmp/lock ] && exit 1
+    echo "$RESULT"
+    foo$VAR something
+    $(dynamic_cmd)
+}
+"#;
+        let relations = extract_relations(code, "bash").unwrap();
+        let calls: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS && r.source_name == "run_pipeline")
+            .map(|r| r.target_name.as_str())
+            .collect();
+        // Static, identifier-shaped callees → emitted (path prefix stripped).
+        assert!(calls.contains(&"fetch_data"), "missing fetch_data, got: {:?}", calls);
+        assert!(calls.contains(&"transform_records"), "missing transform_records, got: {:?}", calls);
+        assert!(calls.contains(&"cat"), "missing cat (path prefix stripped), got: {:?}", calls);
+        assert!(calls.contains(&"finalize.sh"), "missing finalize.sh (./prefix stripped), got: {:?}", calls);
+        assert!(calls.contains(&"echo"), "missing echo, got: {:?}", calls);
+        // Non-static / non-identifier-shaped → skipped.
+        assert!(!calls.contains(&":"), "':' should be skipped, got: {:?}", calls);
+        assert!(!calls.contains(&"["), "'[' test command should be skipped, got: {:?}", calls);
+        assert!(!calls.iter().any(|c| c.contains('$')),
+            "variable expansions / substitutions should be skipped, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_c_include_imports() {
+        let code = "#include \"local/utils.h\"\n#include <stdio.h>\n#include \"helpers.hpp\"\n\nint main() { return 0; }\n";
+        let relations = extract_relations(code, "c").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(imports.contains(&"utils"),
+            "C: missing utils (.h stripped, path stripped), got: {:?}", imports);
+        assert!(imports.contains(&"stdio"),
+            "C: missing stdio (system_lib_string), got: {:?}", imports);
+        assert!(imports.contains(&"helpers"),
+            "C: missing helpers (.hpp stripped), got: {:?}", imports);
+        let import_sources: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.source_name.as_str())
+            .collect();
+        assert!(import_sources.iter().all(|s| *s == "<module>"),
+            "all C #include sources should be <module>, got: {:?}", import_sources);
+    }
+
+    #[test]
+    fn test_extract_cpp_include_imports() {
+        let code = "#include <vector>\n#include \"my/header.hpp\"\n\nint main() { return 0; }\n";
+        let relations = extract_relations(code, "cpp").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(imports.contains(&"vector"),
+            "C++: missing vector (system header, no extension), got: {:?}", imports);
+        assert!(imports.contains(&"header"),
+            "C++: missing header (.hpp stripped + path stripped), got: {:?}", imports);
+    }
+
+    #[test]
+    fn test_extract_bash_source_imports() {
+        let code = r#"#!/usr/bin/env bash
+source ./lib/utils.sh
+source "/etc/profile.d/lang.sh"
+source 'helpers.bash'
+. ~/.bashrc
+. /usr/local/etc/init
+source $HOME/dynamic.sh
+source "${LIB_DIR}/runtime.sh"
+
+bootstrap() {
+    source ./conditional/feature.sh
+    fetch_data
+}
+"#;
+        let relations = extract_relations(code, "bash").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        // Static, .sh-stripped, path-stripped targets.
+        assert!(imports.contains(&"utils"), "missing utils, got: {:?}", imports);
+        assert!(imports.contains(&"lang"), "missing lang (double-quoted), got: {:?}", imports);
+        assert!(imports.contains(&"helpers"),
+            "missing helpers (single-quoted, .bash stripped), got: {:?}", imports);
+        assert!(imports.contains(&".bashrc"),
+            "missing .bashrc (no extension to strip), got: {:?}", imports);
+        assert!(imports.contains(&"init"), "missing init, got: {:?}", imports);
+        assert!(imports.contains(&"feature"),
+            "missing feature (inside function), got: {:?}", imports);
+        // Dynamic paths skipped.
+        assert!(!imports.iter().any(|i| i.contains('$') || i.contains('{')),
+            "dynamic paths should be skipped, got: {:?}", imports);
+        // All imports use <module> as source_name (mirrors JS require pattern).
+        let import_sources: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.source_name.as_str())
+            .collect();
+        assert!(import_sources.iter().all(|s| *s == "<module>"),
+            "all import sources should be <module>, got: {:?}", import_sources);
+        // `source ./conditional/feature.sh` inside bootstrap() must NOT also
+        // emit a CALLS edge for `source`.
+        let calls_to_source: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS && r.target_name == "source")
+            .map(|r| r.source_name.as_str())
+            .collect();
+        assert!(calls_to_source.is_empty(),
+            "`source` should not emit CALLS, got source_names: {:?}", calls_to_source);
+    }
+
+    #[test]
     fn test_extract_call_relations() {
         let code = r#"
 function handleLogin(req) {
@@ -2272,5 +2488,296 @@ impl McpServer {
             total_relations > 0,
             "expected at least one relation across all language samples — parser regression?"
         );
+    }
+
+    // --- Tier 2 inheritance smoke tests (Phase A audit) ---
+    // Expected-behavior tests: a failure here = a real bug to fix in Phase B.
+
+    #[test]
+    fn test_extract_kotlin_inheritance() {
+        // Kotlin: `class S : Base(), Cloneable` — Base is concrete (constructor
+        // call), Cloneable is interface. Both should produce INHERITS edges
+        // (Kotlin doesn't syntactically distinguish, the type system does).
+        let code = "class UserService : BaseService(), Cloneable {\n    fun foo() {}\n}\n";
+        let relations = extract_relations(code, "kotlin").unwrap();
+        let inherits: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_INHERITS || r.relation == REL_IMPLEMENTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(inherits.contains(&"BaseService"),
+            "Kotlin: missing BaseService, got: {:?}", inherits);
+        assert!(inherits.contains(&"Cloneable"),
+            "Kotlin: missing Cloneable, got: {:?}", inherits);
+    }
+
+    #[test]
+    fn test_extract_swift_inheritance() {
+        // Swift: `class S: BaseService, Codable` — comma-separated conformance.
+        let code = "class UserService: BaseService, Codable, Hashable {\n    func foo() {}\n}\n";
+        let relations = extract_relations(code, "swift").unwrap();
+        let inherits: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_INHERITS || r.relation == REL_IMPLEMENTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(inherits.contains(&"BaseService"),
+            "Swift: missing BaseService, got: {:?}", inherits);
+        assert!(inherits.contains(&"Codable"),
+            "Swift: missing Codable, got: {:?}", inherits);
+        assert!(inherits.contains(&"Hashable"),
+            "Swift: missing Hashable, got: {:?}", inherits);
+    }
+
+    #[test]
+    fn test_extract_dart_inheritance() {
+        // Dart has 3 inheritance keywords: extends (single), implements (multi),
+        // with (mixin, multi). All conceptually contribute to type lineage.
+        let code = "class UserService extends BaseService implements Loggable, Cacheable {\n  void foo() {}\n}\n";
+        let relations = extract_relations(code, "dart").unwrap();
+        let lineage: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_INHERITS || r.relation == REL_IMPLEMENTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(lineage.contains(&"BaseService"),
+            "Dart: missing BaseService (extends), got: {:?}", lineage);
+        assert!(lineage.contains(&"Loggable"),
+            "Dart: missing Loggable (implements), got: {:?}", lineage);
+        assert!(lineage.contains(&"Cacheable"),
+            "Dart: missing Cacheable (implements), got: {:?}", lineage);
+    }
+
+    #[test]
+    fn test_extract_php_inheritance() {
+        // PHP: extends (single class) + implements (multiple interfaces).
+        let code = "<?php\nclass UserService extends BaseService implements Loggable, Cacheable {\n    public function foo() {}\n}\n";
+        let relations = extract_relations(code, "php").unwrap();
+        let inherits: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_INHERITS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        let implements: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPLEMENTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(inherits.contains(&"BaseService"),
+            "PHP: missing BaseService (extends), got INHERITS: {:?}", inherits);
+        assert!(implements.contains(&"Loggable"),
+            "PHP: missing Loggable (implements), got IMPLEMENTS: {:?}", implements);
+        assert!(implements.contains(&"Cacheable"),
+            "PHP: missing Cacheable (implements), got IMPLEMENTS: {:?}", implements);
+    }
+
+    #[test]
+    fn test_extract_ruby_inheritance() {
+        let code = "class UserService < BaseService\n  def foo\n  end\nend\n";
+        let relations = extract_relations(code, "ruby").unwrap();
+        let inherits: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_INHERITS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(inherits.contains(&"BaseService"),
+            "Ruby: missing BaseService, got: {:?}", inherits);
+    }
+
+    // --- Tier 2 calls + imports smoke tests (Phase C audit) ---
+
+    #[test]
+    fn test_extract_kotlin_calls() {
+        let code = "fun process() {\n    fetch()\n    store()\n}\n";
+        let relations = extract_relations(code, "kotlin").unwrap();
+        let calls: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(calls.contains(&"fetch"),
+            "Kotlin: missing fetch call, got: {:?}", calls);
+        assert!(calls.contains(&"store"),
+            "Kotlin: missing store call, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_kotlin_imports() {
+        let code = "import com.example.UserService\nimport kotlinx.coroutines.flow.Flow\n\nfun process() {}\n";
+        let relations = extract_relations(code, "kotlin").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(!imports.is_empty(),
+            "Kotlin: expected at least one IMPORTS edge, got 0 (relations: {:?})",
+            relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
+        assert!(imports.iter().any(|i| i == &"UserService" || i.contains("UserService")),
+            "Kotlin: missing UserService import, got: {:?}", imports);
+    }
+
+    #[test]
+    fn test_extract_swift_calls() {
+        let code = "func process() {\n    fetch()\n    store()\n}\n";
+        let relations = extract_relations(code, "swift").unwrap();
+        let calls: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(calls.contains(&"fetch"),
+            "Swift: missing fetch call, got: {:?}", calls);
+        assert!(calls.contains(&"store"),
+            "Swift: missing store call, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_swift_imports() {
+        let code = "import Foundation\nimport UIKit\n\nfunc process() {}\n";
+        let relations = extract_relations(code, "swift").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(imports.contains(&"Foundation"),
+            "Swift: missing Foundation, got: {:?}", imports);
+        assert!(imports.contains(&"UIKit"),
+            "Swift: missing UIKit, got: {:?}", imports);
+    }
+
+    #[test]
+    fn test_extract_dart_calls() {
+        let code = "void process() {\n  fetch();\n  store();\n}\n";
+        let relations = extract_relations(code, "dart").unwrap();
+        let calls: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(calls.contains(&"fetch"),
+            "Dart: missing fetch call, got: {:?}", calls);
+        assert!(calls.contains(&"store"),
+            "Dart: missing store call, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_dart_imports() {
+        let code = "import 'package:flutter/material.dart';\nimport 'dart:async';\n\nvoid process() {}\n";
+        let relations = extract_relations(code, "dart").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(!imports.is_empty(),
+            "Dart: expected at least one IMPORTS edge, got 0 (relations: {:?})",
+            relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
+        assert!(imports.iter().any(|i| i.contains("material") || i.contains("flutter")),
+            "Dart: missing material/flutter import, got: {:?}", imports);
+        assert!(imports.iter().any(|i| i.contains("async") || i.contains("dart:async")),
+            "Dart: missing async import, got: {:?}", imports);
+    }
+
+    #[test]
+    fn test_extract_php_calls() {
+        let code = "<?php\nfunction process() {\n    fetch();\n    store();\n}\n";
+        let relations = extract_relations(code, "php").unwrap();
+        let calls: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(calls.contains(&"fetch"),
+            "PHP: missing fetch call, got: {:?}", calls);
+        assert!(calls.contains(&"store"),
+            "PHP: missing store call, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_php_imports() {
+        let code = "<?php\nuse App\\Services\\UserService;\nuse App\\Models\\Order;\n\nfunction process() {}\n";
+        let relations = extract_relations(code, "php").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(!imports.is_empty(),
+            "PHP: expected at least one IMPORTS edge, got 0 (relations: {:?})",
+            relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
+        assert!(imports.iter().any(|i| i.contains("UserService")),
+            "PHP: missing UserService, got: {:?}", imports);
+        assert!(imports.iter().any(|i| i.contains("Order")),
+            "PHP: missing Order, got: {:?}", imports);
+    }
+
+    #[test]
+    fn test_extract_ruby_calls() {
+        // Bare names (`fetch`, `store`) in Ruby are statically ambiguous
+        // (local var read vs. method call) — tree-sitter-ruby parses them
+        // as `identifier`, not `call`. Use parens to force the call shape.
+        let code = "def process\n  fetch()\n  store()\nend\n";
+        let relations = extract_relations(code, "ruby").unwrap();
+        let calls: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(calls.contains(&"fetch"),
+            "Ruby: missing fetch call, got: {:?}", calls);
+        assert!(calls.contains(&"store"),
+            "Ruby: missing store call, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_ruby_imports() {
+        let code = "require 'json'\nrequire_relative 'helper'\n\ndef process\nend\n";
+        let relations = extract_relations(code, "ruby").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(imports.contains(&"json"),
+            "Ruby: missing json (require), got: {:?}", imports);
+        assert!(imports.contains(&"helper"),
+            "Ruby: missing helper (require_relative), got: {:?}", imports);
+    }
+
+    #[test]
+    fn test_extract_csharp_calls() {
+        let code = "class App {\n    void Process() {\n        Fetch();\n        Store();\n    }\n}\n";
+        let relations = extract_relations(code, "csharp").unwrap();
+        let calls: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(calls.contains(&"Fetch"),
+            "C#: missing Fetch call, got: {:?}", calls);
+        assert!(calls.contains(&"Store"),
+            "C#: missing Store call, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_extract_csharp_imports() {
+        let code = "using System;\nusing System.Collections.Generic;\n\nclass App {}\n";
+        let relations = extract_relations(code, "csharp").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(!imports.is_empty(),
+            "C#: expected at least one IMPORTS edge, got 0 (relations: {:?})",
+            relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
+        assert!(imports.iter().any(|i| i == &"System" || i.contains("System")),
+            "C#: missing System import, got: {:?}", imports);
+    }
+
+    #[test]
+    fn test_extract_csharp_inheritance() {
+        // C#: `class S : Base, IInterface` — current code uses IFoo prefix
+        // heuristic to split into INHERITS (Base) vs IMPLEMENTS (IInterface).
+        let code = "class UserService : BaseService, IDisposable, ICloneable {\n    public void Foo() {}\n}\n";
+        let relations = extract_relations(code, "csharp").unwrap();
+        let inherits: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_INHERITS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        let implements: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPLEMENTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(inherits.contains(&"BaseService"),
+            "C#: missing BaseService (INHERITS), got: {:?}", inherits);
+        assert!(implements.contains(&"IDisposable"),
+            "C#: missing IDisposable (IMPLEMENTS), got: {:?}", implements);
+        assert!(implements.contains(&"ICloneable"),
+            "C#: missing ICloneable (IMPLEMENTS), got: {:?}", implements);
     }
 }
