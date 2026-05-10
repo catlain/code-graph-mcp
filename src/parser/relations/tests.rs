@@ -1292,3 +1292,23 @@ fn test_rust_callee_self_recv_within_impl() {
     );
 }
 
+#[test]
+fn test_rust_callee_self_type_within_impl() {
+    let code = r#"
+        struct Db;
+        impl Db {
+            fn make() -> Self { Self::default() }
+        }
+        impl Default for Db { fn default() -> Self { Db } }
+    "#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "default" && r.source_name.contains("make"))
+        .expect("missing call to default from make");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"stype","v":"Db"}"#),
+        "Self::method() inside impl Db emits SelfType with type name"
+    );
+}
+

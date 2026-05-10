@@ -140,6 +140,14 @@ fn extract_rust_scoped(
     }
     let name = all.pop()?;
     let mut path: Vec<String> = all;
+
+    // `Self::method()` → SelfType (payload filled by mod.rs from current_rust_impl).
+    // Detected before the lowercase-reserved strip because `Self` is uppercase
+    // and would otherwise pass through as a Path qualifier with v="Self".
+    if path.first().is_some_and(|s| s == "Self") {
+        return Some((name, CalleeQualifier::SelfType(String::new())));
+    }
+
     let skip = path.iter()
         .take_while(|s| matches!(s.as_str(), "crate" | "super" | "self"))
         .count();
