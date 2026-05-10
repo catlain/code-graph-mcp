@@ -1237,3 +1237,38 @@ fn test_rust_callee_obj_method_receiver_qualifier() {
     );
 }
 
+#[test]
+fn test_rust_callee_builder_chain_qualifier() {
+    let code = r#"fn caller() {
+        OpenOptions::new().create(true).open("/tmp/x");
+    }"#;
+    let relations = extract_relations(code, "rust").unwrap();
+
+    // OpenOptions::new() → Path
+    let new_call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "new")
+        .expect("missing call to new");
+    assert_eq!(
+        new_call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"OpenOptions"}"#),
+    );
+
+    // .create(true) — receiver is call_expression → Chain
+    let create_call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "create")
+        .expect("missing call to create");
+    assert_eq!(
+        create_call.metadata.as_deref(),
+        Some(r#"{"q":"chain"}"#),
+    );
+
+    // .open(...) — receiver is also call_expression → Chain
+    let open_call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "open")
+        .expect("missing call to open");
+    assert_eq!(
+        open_call.metadata.as_deref(),
+        Some(r#"{"q":"chain"}"#),
+    );
+}
+
