@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.25.0 — PreToolUse:Bash hint hook (raw-grep → cg CLI nudge)
+
+### Added
+- `claude-plugin/scripts/pre-grep-guide.js`: new PreToolUse:Bash hook that
+  detects raw `grep`/`rg`/`ag` invocations on the indexed source tree
+  (`src/`, `tests/`, `lib/`, `scripts/`, `claude-plugin/`, `tools/`, `pkg/`,
+  `cmd/`, `internal/`, `app/`, `components/`, `server/`, `client/`,
+  `crates/`, `packages/`) and emits a 6-line hint pointing at
+  `code-graph-mcp grep / ast-search / callgraph / show`. Fires only on
+  bare grep at command HEAD (pipe-greps like `cargo test | grep FAILED`
+  are output filters and skipped). Per-command-hash cooldown 60s prevents
+  repeat noise. Registered in `claude-plugin/hooks/hooks.json` with
+  3s timeout.
+
+### Motivation
+- 15-day session telemetry (78 sessions / 13.5K assistant turns) showed
+  429 raw `grep -rn` calls on source trees vs 437 `code-graph-mcp`
+  invocations — ~1:1 overall but with severe variance (3 work days at
+  10:0 or worse against `code-graph-mcp`, today's 05-11 at 39:10).
+  Pre-training bias gives `grep -rn pattern src/` an enormous default
+  weight; tool descriptions alone can route correctly (routing_bench
+  Opus 4.7 P@1=95.5% in tool-only mode) but don't surface the indexed
+  alternative when Claude isn't already deciding between tools. This
+  hook closes the loop at the Bash entry point — same shape as the
+  existing PreToolUse:Edit (`pre-edit-guide.js`) impact-summary hook.
+
+### Verification
+- `node --test claude-plugin/scripts/pre-grep-guide.test.js`: 35/35 pass.
+  Covers fire cases (grep/rg/ag on src + tests + lib + claude-plugin,
+  alternation patterns, env-prefixed, head/tail pipes downstream),
+  skip cases (pipe-grep output filters, code-graph-mcp self-invocation,
+  config-only targets like Cargo.toml/.gitignore/CHANGELOG.md, non-search
+  tools like ls/cat/git/find), and 5 regression cases lifted verbatim
+  from 2026-05-11 session telemetry.
+- `node --test claude-plugin/scripts/lifecycle.test.js`: 12/12 pass —
+  hooks.json schema change accepted by lifecycle's hook-identity matcher.
+- E2E sanity: piping `{"tool_input":{"command":"grep -rn ... src/storage/"}}`
+  through `pre-grep-guide.js` emits the 6-line hint on first invocation,
+  silent on repeat (cooldown verified), silent on `cargo test | grep FAILED`
+  (pipe-grep correctly skipped).
+- Bench unaffected: routing_bench is tool-only mode (forced
+  `tool_choice=any`), Bash hook injection happens outside that path —
+  no P@1 regression possible.
+
+### Migration
+- Plugin SessionStart auto-updates the hook registration via
+  `${CLAUDE_PLUGIN_ROOT}` path indirection. Disable per-session with
+  `CODE_GRAPH_QUIET_HOOKS=1` (already gates the whole hook tier).
+  No `.code-graph/index.db` in CWD → hook exits silently regardless.
+
 ## v0.24.1 — Adoption tag specificity fix
 
 ### Fixed
