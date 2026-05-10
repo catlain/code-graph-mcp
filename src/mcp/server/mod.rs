@@ -1305,6 +1305,7 @@ impl McpServer {
             const NOISY: &str = concat!(
                 "Code Graph MCP \u{2014} project indexed. 7 tools cover structure / calls / refs / concept search; impact, similar, deps, dead, and route are folded into flags on get_ast_node, module_overview, and get_call_graph.\n",
                 "Repo-wide AST index (LSP only handles open files; we don't). Replaces multi-round Grep+Read for structural queries.\n",
+                "Triggers: \"who calls X?\" \u{2192} get_call_graph; \"impact of X?\" or before editing a fn \u{2192} get_ast_node include_impact=true; concept search without an exact symbol \u{2192} semantic_code_search.\n",
                 "Still Grep for exact strings/regex; still Read files you will edit.\n",
                 "CLI escape hatch: `code-graph-mcp <impact|similar|deps|dead-code|trace>`. Diagnostics: `code-graph-mcp health-check`.\n",
                 "Full decision table: MEMORY.md \u{2192} plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."

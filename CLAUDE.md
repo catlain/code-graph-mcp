@@ -61,7 +61,17 @@ cargo test --no-default-features   # Tests without embedding
 
 ## Code Graph Integration
 
-Code graph tools are available via MCP. The MCP server injects `instructions` at session start with decision rules for tool selection (e.g., "who calls X?" → `get_call_graph`). CLI commands (`code-graph-mcp <cmd>`) complement MCP tools for Bash workflows.
+Repo-wide AST + FTS + vector index. Prefer code-graph MCP over multi-round Grep/Read when intent matches one of these triggers (LSP only sees open files; code-graph sees the whole repo):
+
+| Intent | Tool | Replaces |
+|--------|------|----------|
+| "Who calls X?" / "X 调了什么？" | `get_call_graph symbol_name=X` | N rounds of `grep "X("` |
+| "改 X 影响什么？" / before editing a fn declaration | `get_ast_node symbol_name=X include_impact=true` | guess + read every caller |
+| "Y 模块/目录长啥样？" / unfamiliar dir | `module_overview path=Y/` | Glob + Read×N |
+| Concept search without exact symbol (e.g. "code that handles retries") | `semantic_code_search query="..."` | guesswork-driven Grep |
+| HTTP route → handler chain | `get_call_graph route_path="GET /api/x"` | manual route table + Read |
+
+Still use Grep for exact strings/regex (especially in non-code files: JSON, lockfiles, logs). Still use Read for files you're about to edit. CLI escape hatch: `code-graph-mcp <map|overview|show|callgraph|impact|refs|dead-code|trace|health-check>` — same data, Bash-friendly output. Full decision table: `MEMORY.md → plugin_code_graph_mcp.md`.
 
 ## Autonomy
 

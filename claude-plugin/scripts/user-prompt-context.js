@@ -33,23 +33,30 @@ function markCooldown(type) {
   } catch { /* ok */ }
 }
 
-// v0.21 — flipped to opt-in default. Routing-bench backend P@1=100% (v0.20.0)
-// proves Sonnet 4.5 picks tools correctly without push injection; per-prompt
-// CLI exec was costing 200-500 tokens/turn across N turns to repeat what the
-// agent would have called itself. Mirrors session-init.js computeQuietHooks
-// priority chain so a single env knob covers both hooks.
+// Default ON. The v0.21 opt-in flip relied on routing-bench P@1=100% to argue
+// "Sonnet 4.5 picks tools without push injection." That bench measures *triage
+// accuracy once the agent has decided to query a tool*; it does not measure
+// the prior question — *whether the agent reaches for a tool at all*.
+// pre-grep-guide.js sees the real-world counter-evidence: a 15-day baseline of
+// 429 raw `grep` vs 191 functional CLI calls on the same indexed source tree
+// — a 13× pre-training bias toward grep. Push injection on the relevant turns
+// is the corrective; cooldowns (impact 30s / overview 5min / callgraph 60s /
+// search 60s) already cap per-type frequency. SessionStart `project_map` stays
+// default OFF (lifecycle.js / session-init.js) — that one is a static dump
+// duplicated by MEMORY.md; this hook is reactive and trigger-shaped, so the
+// two defaults diverge intentionally.
 //
 // Priority (high → low):
-//   1. CODE_GRAPH_QUIET_HOOKS=0 → forced noisy (legacy back-compat)
-//   2. CODE_GRAPH_QUIET_HOOKS=1 → forced quiet (legacy back-compat)
-//   3. CODE_GRAPH_VERBOSE_HOOKS=1 → opt-in noisy (new, recommended)
-//   4. default → quiet
+//   1. CODE_GRAPH_QUIET_HOOKS=1 → forced quiet (escape hatch)
+//   2. CODE_GRAPH_QUIET_HOOKS=0 → forced noisy (legacy back-compat, redundant with default)
+//   3. CODE_GRAPH_VERBOSE_HOOKS=1 → noisy (legacy back-compat, redundant with default)
+//   4. default → noisy
 function computeQuietHooks(env = process.env) {
   const envQuiet = env.CODE_GRAPH_QUIET_HOOKS;
-  if (envQuiet === '0') return false;
   if (envQuiet === '1') return true;
+  if (envQuiet === '0') return false;
   if (env.CODE_GRAPH_VERBOSE_HOOKS === '1') return false;
-  return true;
+  return false;
 }
 
 // --- Pure logic (exported for testing) ---

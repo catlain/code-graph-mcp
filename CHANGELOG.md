@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.26.0 — UserPromptSubmit context push default ON + trigger hints
+
+### Changed
+- `claude-plugin/scripts/user-prompt-context.js`: `computeQuietHooks` default
+  flipped back to **noisy** (push ON). The v0.21 opt-in flip cited routing-bench
+  P@1=100% as evidence the agent already picks tools correctly without push,
+  but that bench measures *triage accuracy once the agent has decided to query
+  a tool* — not the prior question of whether the agent reaches for a tool at
+  all. The real counter-evidence is in `pre-grep-guide.js`'s 15-day baseline:
+  **429 raw `grep` vs 191 functional CLI calls on the same indexed source tree
+  (~13× pre-training bias toward grep)**. Push is the corrective. Per-type
+  cooldowns (impact 30s / overview 5min / callgraph 60s / search 60s) cap
+  frequency; the 8-char message floor + `shouldSkip` filter keep confirmation
+  chatter silent. Escape hatch: `CODE_GRAPH_QUIET_HOOKS=1`.
+- `claude-plugin/scripts/pre-edit-guide.js`: caller threshold lowered from
+  `directCallers < 2` to `< 1`. Editing any function with one or more callers
+  now surfaces the one-line impact summary; the per-symbol 2-minute cooldown
+  is unchanged so the noise floor stays the same.
+- SessionStart `project_map` injection (`session-init.js`) **stays default
+  OFF** — that hook is a static dump duplicated by `MEMORY.md`'s decision
+  table; this hook is a reactive trigger reminder. The two defaults are
+  intentionally asymmetric.
+
+### Added
+- `src/mcp/server/mod.rs` MCP `instructions` field gains one line of explicit
+  scenario triggers: `"who calls X?" → get_call_graph; "impact of X?" or
+  before editing a fn → get_ast_node include_impact=true; concept search
+  without an exact symbol → semantic_code_search`. Compile-time
+  `assert!(NOISY.len() <= 1500)` budget guard unchanged (now 772 / 1500 bytes).
+- Project `CLAUDE.md` "Code Graph Integration" section replaced with a 5-row
+  trigger table (who calls / impact / module overview / concept search / HTTP
+  route) — `CLAUDE.md` is loaded every session, higher priority than the
+  invited-memory path in `MEMORY.md`.
+- `claude-plugin/templates/plugin_code_graph_mcp.md` clarifies the asymmetric
+  hook defaults and lists `CODE_GRAPH_QUIET_HOOKS=1` as the context-push
+  escape hatch alongside the existing `VERBOSE_HOOKS` / `QUIET_HOOKS=0` flags.
+
+### Rationale anchor
+- mem #8234 documents that hook content has **bounded leverage** when the
+  current bench corpus is saturated (Sonnet 4.5 hits P@1=100%); bench is the
+  right oracle for tool-description boundary disambiguation, not for
+  server-prelude / hook-content tuning. This release therefore lands without
+  a fresh routing-bench cycle — the changes are all hook-content surface.
+
+### Verification
+- `cargo check`: clean (compile-time `assert!(len <= 1500)` on
+  `NOISY` instructions string holds; final length ~772 bytes).
+- `node --test claude-plugin/scripts/user-prompt-context.test.js`:
+  77/77 pass — six `computeQuietHooks` priority-chain cases rewritten for
+  the default-noisy invariant; one e2e check kept on the `=1` escape hatch.
+- No change to `routing_bench.rs` corpus; intentionally skipped per mem #8234.
+
+### Migration
+- Existing users on default env will start seeing `[code-graph:impact|
+  overview|callgraph|search]` push lines on intent-matching prompts. Set
+  `CODE_GRAPH_QUIET_HOOKS=1` in `~/.claude/settings.json` env to opt out.
+- Adopted projects: the `plugin_code_graph_mcp.md` template auto-refreshes on
+  next SessionStart (unless `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` is set).
+- No data-migration, no schema change, no MCP tool API change.
+
 ## v0.25.1 — findBinary disk cache version-check
 
 ### Fixed

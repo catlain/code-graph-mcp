@@ -118,13 +118,18 @@ try {
   process.exit(0);
 }
 
-// --- Only inject if high-impact (2+ production callers) ---
+// --- Inject when the symbol has any caller (1+) ---
+// Earlier gate was 2+ direct callers; reality is that editing a function with
+// even one production caller benefits from a one-line impact summary, and the
+// per-symbol 2-minute cooldown caps frequency. The 2+ floor was a remnant of
+// the v0.21 "agent picks tools without push" assumption — same bias mem #8234
+// records as bounded leverage at the bench level.
 const directCallers = jsonResult.direct_callers || 0;
 const totalCallers = jsonResult.total_callers || 0;
 const affectedFiles = jsonResult.affected_files || 0;
 const risk = jsonResult.risk || 'low';
 
-if (directCallers < 2) process.exit(0);
+if (directCallers < 1) process.exit(0);
 
 // Mark cooldown
 try { fs.writeFileSync(cooldownFile, ''); } catch { /* ok */ }

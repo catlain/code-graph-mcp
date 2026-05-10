@@ -15,12 +15,16 @@ type: reference
 > 的最新决策表（本文件 SHA 与 template 差异时覆盖）。手动编辑会被覆盖——
 > 要锁定自己的版本，设 `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`（不影响首次 adopt）。
 >
-> **v0.17.0 起**：SessionStart `project_map` 注入 **默认 OFF**（不再随 adoption
-> 切换）。本文件 + 7 个工具描述已经覆盖路由所需的全部决策信息，每次会话再
-> dump ≈2.3 KB 的项目地图是冗余的常驻上下文成本。
-> 显式启用：`CODE_GRAPH_VERBOSE_HOOKS=1` —— Bash 调 `code-graph-mcp map --compact`
-> 也是等价的按需替代。
-> 向后兼容：`CODE_GRAPH_QUIET_HOOKS=0` 强制 noisy / `=1` 强制 quiet（优先级最高）。
+> **Hook 默认值（两个 hook，默认不同 —— 故意的）**：
+> - **SessionStart `project_map` 注入：默认 OFF**（v0.17.0 起）。本文件 + 7 个
+>   工具描述已经覆盖路由所需决策信息，每次会话再 dump ≈2.3 KB 项目地图是冗余的
+>   常驻上下文。显式启用：`CODE_GRAPH_VERBOSE_HOOKS=1`；或按需 `code-graph-mcp map --compact`。
+> - **UserPromptSubmit context push：默认 ON**。基于用户消息 intent 推 impact /
+>   overview / callgraph / search 结果（per-type cooldown 30s–5min）。routing-bench
+>   P@1=100% 测的是分诊准确率（已决定查工具时选哪个），不等于触发率（是否
+>   决定查工具）—— 真实 baseline 是 raw-grep ≈13× 偏向于内置 Grep。Push 是
+>   pre-training bias 的矫正。Escape hatch：`CODE_GRAPH_QUIET_HOOKS=1`。
+> - 优先级：`CODE_GRAPH_QUIET_HOOKS=1` (escape) > 其他 env > 默认。
 >
 > **v0.18.4 起**：原"进阶 5"（impact / similar / deps / dead-code / trace）已折叠
 > 进核心 7 的 flag —— Claude Code 现在能直接通过 MCP 调用，不必落到 CLI:
@@ -122,4 +126,5 @@ code-graph-mcp health-check              # 索引健康
 - `CODE_GRAPH_NO_AUTO_ADOPT=1`（`~/.claude/settings.json` env） — 阻止未来自动 adopt，不影响已 adopted 状态。
 - `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`（v0.11.0+） — 锁定本文件不随插件升级刷新；允许手动编辑长久保留。
 - `CODE_GRAPH_VERBOSE_HOOKS=1`（v0.17.0+） — opt in 到 SessionStart `project_map` 注入（默认 OFF）。
-- `CODE_GRAPH_QUIET_HOOKS=0` — 强制恢复 `project_map` 注入；优先级高于 VERBOSE_HOOKS（向后兼容路径）。
+- `CODE_GRAPH_QUIET_HOOKS=1` — UserPromptSubmit context push 的 escape hatch（默认 ON）；同时强制 SessionStart `project_map` quiet。
+- `CODE_GRAPH_QUIET_HOOKS=0` — 强制恢复 SessionStart `project_map` 注入（向后兼容路径）。

@@ -511,62 +511,48 @@ test('skills: only expected skills exist', () => {
   assert.deepEqual(files, ['explore.md', 'index.md']);
 });
 
-test('CODE_GRAPH_QUIET_HOOKS=1 short-circuits silently on stdout, stderr, exit 0', () => {
+// ── computeQuietHooks priority chain (default-noisy flip) ────────
+
+test('computeQuietHooks: default (no env) is NOISY', () => {
+  // Default flipped back to push-on. The v0.21 opt-in default relied on
+  // routing-bench P@1=100% but that measures triage accuracy, not whether
+  // the agent reaches for a tool at all. pre-grep-guide.js sees 13× raw-grep
+  // bias on the same source tree — push is the corrective.
+  assert.equal(computeQuietHooks({}), false);
+});
+
+test('computeQuietHooks: CODE_GRAPH_QUIET_HOOKS=1 forces quiet (escape hatch)', () => {
+  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '1' }), true);
+});
+
+test('computeQuietHooks: CODE_GRAPH_QUIET_HOOKS=0 stays noisy (back-compat, same as default)', () => {
+  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '0' }), false);
+});
+
+test('computeQuietHooks: CODE_GRAPH_VERBOSE_HOOKS=1 stays noisy (back-compat, same as default)', () => {
+  assert.equal(computeQuietHooks({ CODE_GRAPH_VERBOSE_HOOKS: '1' }), false);
+});
+
+test('computeQuietHooks: QUIET_HOOKS=1 wins over VERBOSE_HOOKS=1 (priority chain)', () => {
+  // Priority: CODE_GRAPH_QUIET_HOOKS=1 (escape) > QUIET_HOOKS=0 / VERBOSE_HOOKS=1 > default.
+  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '1', CODE_GRAPH_VERBOSE_HOOKS: '1' }), true);
+  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '0', CODE_GRAPH_VERBOSE_HOOKS: '0' }), false);
+});
+
+test('CODE_GRAPH_QUIET_HOOKS=1 short-circuits silently on stdout, stderr, exit 0 (escape hatch verified end-to-end)', () => {
+  // End-to-end: the escape hatch must produce zero stdout/stderr noise
+  // (any leak would land in Claude's display). Was the only e2e check before
+  // the default-noisy flip — kept under the new default to guarantee that
+  // setting the env still fully silences the hook.
   const { spawnSync } = require('node:child_process');
   const script = path.join(__dirname, 'user-prompt-context.js');
   const proc = spawnSync(process.execPath, [script], {
-    input: JSON.stringify({ message: 'impact analysis for fn_that_would_trigger_search' }),
+    input: JSON.stringify({ message: 'impact of refactoring parse_code function' }),
     env: { ...process.env, CODE_GRAPH_QUIET_HOOKS: '1' },
     encoding: 'utf8',
     timeout: 2000,
   });
-  // Quiet mode must be fully silent — any stderr leaks into Claude's display.
-  assert.equal(proc.stdout, '', 'stdout must be empty');
-  assert.equal(proc.stderr, '', 'stderr must be empty');
-  assert.equal(proc.status, 0, 'must exit 0');
-});
-
-// ── computeQuietHooks priority chain (v0.21 opt-in flip) ────────
-
-test('computeQuietHooks: default (no env) is QUIET', () => {
-  // v0.21: flipped from opt-out to opt-in. Routing-bench P@1=100% earned
-  // the right to stop pushing context the agent would have requested.
-  assert.equal(computeQuietHooks({}), true);
-});
-
-test('computeQuietHooks: CODE_GRAPH_VERBOSE_HOOKS=1 enables push (opt-in)', () => {
-  assert.equal(computeQuietHooks({ CODE_GRAPH_VERBOSE_HOOKS: '1' }), false);
-});
-
-test('computeQuietHooks: legacy CODE_GRAPH_QUIET_HOOKS=0 forces noisy (back-compat)', () => {
-  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '0' }), false);
-});
-
-test('computeQuietHooks: legacy CODE_GRAPH_QUIET_HOOKS=1 forces quiet (back-compat)', () => {
-  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '1' }), true);
-});
-
-test('computeQuietHooks: legacy QUIET_HOOKS=0 wins over VERBOSE_HOOKS=1 (priority chain)', () => {
-  // Priority order: CODE_GRAPH_QUIET_HOOKS=0/1 > CODE_GRAPH_VERBOSE_HOOKS > default.
-  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '0', CODE_GRAPH_VERBOSE_HOOKS: '0' }), false);
-  assert.equal(computeQuietHooks({ CODE_GRAPH_QUIET_HOOKS: '1', CODE_GRAPH_VERBOSE_HOOKS: '1' }), true);
-});
-
-test('default env (no flags) short-circuits silently — opt-in flip', () => {
-  // End-to-end check: with the opt-in flip, a default-env spawn produces
-  // no stdout/stderr even on a message that previously would have injected.
-  const { spawnSync } = require('node:child_process');
-  const script = path.join(__dirname, 'user-prompt-context.js');
-  const cleanEnv = { ...process.env };
-  delete cleanEnv.CODE_GRAPH_QUIET_HOOKS;
-  delete cleanEnv.CODE_GRAPH_VERBOSE_HOOKS;
-  const proc = spawnSync(process.execPath, [script], {
-    input: JSON.stringify({ message: 'impact of refactoring parse_code function' }),
-    env: cleanEnv,
-    encoding: 'utf8',
-    timeout: 2000,
-  });
-  assert.equal(proc.stdout, '', 'default must be silent on stdout');
-  assert.equal(proc.stderr, '', 'default must be silent on stderr');
-  assert.equal(proc.status, 0, 'default must exit 0');
+  assert.equal(proc.stdout, '', 'quiet must be silent on stdout');
+  assert.equal(proc.stderr, '', 'quiet must be silent on stderr');
+  assert.equal(proc.status, 0, 'quiet must exit 0');
 });
