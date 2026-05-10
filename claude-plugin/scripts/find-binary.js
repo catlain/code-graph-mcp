@@ -88,12 +88,32 @@ function isNativeBinary(candidate) {
 }
 
 /**
+ * Decide whether a cached binary path is fresh enough to skip the full
+ * discovery walk. Matches the auto-update cache logic at ~:185-188 —
+ * cache wins only when its binary's version >= pkg version. Without this
+ * check, a stale cache entry (e.g. dev checkout's `bin/code-graph-mcp`
+ * recorded once, then never refreshed) shadows newer auto-update or
+ * platform-pkg binaries forever (see mem #8454).
+ *
+ * Permissive on unknown values: missing pkg version or unreadable binary
+ * version → trust cache (don't refuse the only path we know about).
+ */
+function isCachedBinaryFresh(cachedPath, pkgVersion) {
+  if (!isNativeBinary(cachedPath)) return false;
+  if (!pkgVersion) return true;
+  const cacheVer = readBinaryVersion(cachedPath);
+  if (!cacheVer) return true;
+  return compareVersions(cacheVer, pkgVersion) >= 0;
+}
+
+/**
  * Locate the code-graph-mcp binary using multiple strategies.
  * Results are cached to disk so repeated calls (e.g. per-hook) are fast.
  *
  * Priority:
- *   cache (if valid) → dev-mode (target/release) → auto-update cache
- *   → platform npm pkg → bundled (bin/) → cargo install → PATH → npx cache
+ *   cache (if valid + version >= pkg) → dev-mode (target/release) →
+ *   auto-update cache → platform npm pkg → bundled (bin/) →
+ *   cargo install → PATH → npx cache
  *
  * Returns the absolute path or null if not found.
  */
@@ -101,7 +121,7 @@ function findBinary() {
   // Try disk cache first (avoids spawning `which` on hot paths)
   try {
     const cached = fs.readFileSync(CACHE_FILE, 'utf8').trim();
-    if (isNativeBinary(cached)) return cached;
+    if (isCachedBinaryFresh(cached, getPackageVersion())) return cached;
     if (cached) clearCache();
   } catch { /* no cache or stale */ }
 
@@ -242,7 +262,7 @@ function clearCache() {
 module.exports = {
   findBinary, findBinaryUncached, clearCache,
   globalNodeModulesCandidates, findPlatformBinary,
-  getPackageVersion, compareVersions,
+  getPackageVersion, compareVersions, isCachedBinaryFresh,
   CACHE_FILE, BINARY_NAME, PLATFORM_PKG,
 };
 

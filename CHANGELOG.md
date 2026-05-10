@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.25.1 — findBinary disk cache version-check
+
+### Fixed
+- `claude-plugin/scripts/find-binary.js`: disk cache (`~/.cache/code-graph/binary-path`)
+  now validates the cached binary's `--version` against the package
+  version before returning it. Previously the cache short-circuit at
+  `findBinary()` entry only checked `isNativeBinary(cached)` (file
+  exists + right basename) — once a stale path got written, it
+  shadowed every newer binary on the system **forever**. Symptom on
+  this dev machine: cache pinned `bin/code-graph-mcp` v0.5.28 (the
+  un-tracked `scripts/copy-binary.js` artifact from March 17) while
+  `~/.cargo/bin/code-graph-mcp` was the freshly installed v0.25.0,
+  causing `incremental-index.test.js` to fail mid-pre-commit hook with
+  the older binary's pre-v0.16.9 hard-bail behavior.
+
+### How the bug bites end users
+- Asymmetric version-check coverage. Auto-update cache at
+  `find-binary.js:184-188` was already version-gated (mem #8187 fixed
+  three install-chain bugs but landed only on the `~/.cache/.../bin/`
+  branch). Disk cache `binary-path` — the entry-level fast-path that
+  runs on **every** hook tick — had no equivalent gate. After
+  `npm install -g` of an updated platform pkg, or any path drift in
+  the platform-pkg layout, the disk cache would keep returning the
+  pre-update binary until a user manually `rm`-ed the cache file.
+- New `isCachedBinaryFresh(cachedPath, pkgVersion)` helper. Permissive
+  on unknown values (missing pkg version, unreadable binary `--version`
+  output) → trust the cache (don't refuse the only path we know
+  about). Strict only when both versions parse and cached < pkg.
+
+### Verification
+- `node --test find-binary.test.js`: 19/19 pass — 11 existing +
+  8 new covering THE BUG case (cached `0.5.28` vs pkg `0.25.0` →
+  invalidate), equal versions, newer cache, missing pkg version
+  permissive, unreadable binary permissive, non-existent path,
+  null/undefined input, basename mismatch.
+- `node --test lifecycle.test.js`: 12/12 — schema regression-clean.
+- `cargo +1.95.0 clippy --no-default-features --all-targets -D warnings`: 0.
+
+### Migration
+- No user action needed. First findBinary call after upgrade detects
+  stale cache (older than 0.25.1 cached binary) → invalidates →
+  falls through to the rest of the discovery chain (target/release →
+  auto-update cache → platform pkg → bundled → cargo install → PATH).
+- For users on the dev branch with manually-recorded cache paths:
+  `rm ~/.cache/code-graph/binary-path` triggers the same fresh walk.
+
 ## v0.25.0 — PreToolUse:Bash hint hook (raw-grep → cg CLI nudge)
 
 ### Added

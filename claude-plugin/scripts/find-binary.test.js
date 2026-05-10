@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 
 const { globalNodeModulesCandidates, findPlatformBinary, BINARY_NAME,
-        compareVersions, getPackageVersion } = require('./find-binary');
+        compareVersions, getPackageVersion, isCachedBinaryFresh } = require('./find-binary');
 
 function mkDir(t, prefix) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -144,4 +144,78 @@ test('compareVersions: tolerates non-numeric / short input', () => {
 test('getPackageVersion reads root package.json', () => {
   const v = getPackageVersion();
   assert.match(v, /^\d+\.\d+\.\d+$/, `expected semver-ish, got: ${v}`);
+});
+
+// ─── isCachedBinaryFresh: disk cache version-check (mem #8454) ────────────
+//
+// Builds a fake binary that responds to `--version` with a controllable
+// string. process.execPath (node itself) won't do — we need a binary
+// whose --version line we control. Smallest approach: shell wrapper.
+
+function buildFakeBinary(t, versionLine) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cgmcp-fake-bin-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const binPath = path.join(dir, BINARY_NAME);
+  // readBinaryVersion parses "code-graph-mcp X.Y.Z" via the binary's first
+  // stdout line on `--version`. Shell wrapper is simpler than compiling.
+  const script = process.platform === 'win32'
+    ? `@echo off\r\necho ${versionLine}\r\n`
+    : `#!/bin/sh\necho '${versionLine}'\n`;
+  fs.writeFileSync(binPath, script);
+  if (process.platform !== 'win32') fs.chmodSync(binPath, 0o755);
+  return binPath;
+}
+
+test('isCachedBinaryFresh: cache binary version >= pkg → fresh', (t) => {
+  const bin = buildFakeBinary(t, 'code-graph-mcp 9.9.9');
+  assert.equal(isCachedBinaryFresh(bin, '0.25.0'), true);
+});
+
+test('isCachedBinaryFresh: cache binary version equals pkg → fresh', (t) => {
+  const bin = buildFakeBinary(t, 'code-graph-mcp 0.25.0');
+  assert.equal(isCachedBinaryFresh(bin, '0.25.0'), true);
+});
+
+test('isCachedBinaryFresh: cache binary version < pkg → stale (THE BUG)', (t) => {
+  // Reproduces mem #8454: cache pointed at bin/code-graph-mcp v0.5.28
+  // while pkg was v0.25.0 → cache was returned silently with no
+  // version-check, shadowing the installed 0.25.0 platform binary.
+  // After this fix, returns false → caller clears cache + falls through.
+  const bin = buildFakeBinary(t, 'code-graph-mcp 0.5.28');
+  assert.equal(isCachedBinaryFresh(bin, '0.25.0'), false);
+});
+
+test('isCachedBinaryFresh: missing pkg version → permissive (trust cache)', (t) => {
+  // Caller couldn't read package.json; refusing the cache would leave us
+  // with nothing. Better to trust the one path we have.
+  const bin = buildFakeBinary(t, 'code-graph-mcp 0.5.28');
+  assert.equal(isCachedBinaryFresh(bin, null), true);
+  assert.equal(isCachedBinaryFresh(bin, ''), true);
+});
+
+test('isCachedBinaryFresh: unreadable cache binary version → permissive', (t) => {
+  // Old binary that doesn't support `--version`, or output we can't
+  // parse. Same permissive path as missing pkg version.
+  const bin = buildFakeBinary(t, 'whatever garbage no semver here');
+  assert.equal(isCachedBinaryFresh(bin, '0.25.0'), true);
+});
+
+test('isCachedBinaryFresh: cache path does not exist → not fresh', () => {
+  assert.equal(isCachedBinaryFresh('/nonexistent/path/code-graph-mcp', '0.25.0'), false);
+});
+
+test('isCachedBinaryFresh: empty/null cache path → not fresh', () => {
+  assert.equal(isCachedBinaryFresh('', '0.25.0'), false);
+  assert.equal(isCachedBinaryFresh(null, '0.25.0'), false);
+  assert.equal(isCachedBinaryFresh(undefined, '0.25.0'), false);
+});
+
+test('isCachedBinaryFresh: file basename mismatch → not fresh', (t) => {
+  // realpathSync.basename check inside isNativeBinary — wrong name = not ours.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cgmcp-wrongname-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const wrongName = path.join(dir, 'other-tool');
+  fs.writeFileSync(wrongName, '#!/bin/sh\necho wrong\n');
+  if (process.platform !== 'win32') fs.chmodSync(wrongName, 0o755);
+  assert.equal(isCachedBinaryFresh(wrongName, '0.25.0'), false);
 });
