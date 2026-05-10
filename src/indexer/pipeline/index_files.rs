@@ -446,6 +446,24 @@ pub(super) fn index_files(
                     }
                 }
 
+                // Bare-name call qualifier (Rust): inspect metadata to
+                // skip / restrict candidate set before the existing fallback
+                // chain. See spec
+                // docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md.
+                if rel.relation == REL_CALLS {
+                    use super::resolve::{parse_callee_metadata, CalleeMeta};
+                    if matches!(
+                        parse_callee_metadata(rel.metadata.as_deref()),
+                        Some(CalleeMeta::Chain) | Some(CalleeMeta::Receiver(_))
+                    ) {
+                        // Receiver type not statically inferable; same-language
+                        // unique match is overwhelmingly false. Drop the edge
+                        // entirely (do not buffer in pending — re-scan won't help).
+                        continue;
+                    }
+                    // Path / SelfRecv / SelfType handled in T14-T16.
+                }
+
                 // Default resolution: global name-based lookup with language-aware layering.
                 // Tier order: same-file → same-language → (calls: drop) / (other: global).
                 // Dropping calls without a same-language match prevents Rust `hasher.update()`
