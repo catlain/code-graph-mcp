@@ -1846,7 +1846,11 @@ pub fn cmd_map(project_root: &Path, args: &[String]) -> Result<()> {
 pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
     let raw_path = get_positional(args, 0)
         .ok_or_else(|| anyhow::anyhow!("Usage: code-graph-mcp overview <path> [--json] [--compact]"))?;
+    // Normalize: strip leading "./" and treat bare "." as empty prefix (match all).
+    // Mirrors MCP `tool_module_overview` so `cd <proj>; code-graph-mcp overview .`
+    // returns the whole project the same way `module_overview path="."` does.
     let path_prefix = raw_path.strip_prefix("./").unwrap_or(raw_path);
+    let path_prefix = if path_prefix == "." { "" } else { path_prefix };
 
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
@@ -1862,8 +1866,16 @@ pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
         .collect();
 
     if exports.is_empty() {
-        if json_mode { println!("[]"); }
-        anyhow::bail!("[code-graph] No symbols found under: {}", path_prefix);
+        // JSON empty-result contract (feedback_cli_json_empty_contract):
+        // stdout must always be valid JSON. Use a clean eprintln + exit 1
+        // instead of `anyhow::bail!` so the JSON-mode stderr doesn't carry
+        // the anyhow `Error:` prefix that confuses log consumers.
+        if json_mode {
+            println!("[]");
+            eprintln!("[code-graph] No symbols found under: {}", raw_path);
+            std::process::exit(1);
+        }
+        anyhow::bail!("[code-graph] No symbols found under: {}", raw_path);
     }
 
     let mut stdout = std::io::stdout().lock();

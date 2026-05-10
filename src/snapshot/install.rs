@@ -32,9 +32,11 @@ pub fn resolve_snapshot_source(root: &Path) -> Option<String> {
 }
 
 fn resolve_from_github(root: &Path) -> Option<String> {
+    // Silence stderr — non-git roots would otherwise leak `fatal: not a git repository`.
     let remote = std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
         .current_dir(root)
+        .stderr(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success())?;
@@ -275,9 +277,12 @@ fn validate(db_path: &Path, root: &Path) -> Result<()> {
     // Warn (not fail) if snapshot commit is not in local history
     if let Some(commit) = super::meta::read_meta(conn, super::meta::META_SNAPSHOT_SOURCE_COMMIT)? {
         if !commit.is_empty() {
+            // Silence stderr — `cat-file -e` prints "fatal: ..." when commit missing,
+            // which is the expected case we want to detect (forks/rebases).
             let exists = std::process::Command::new("git")
                 .args(["cat-file", "-e", &commit])
                 .current_dir(root)
+                .stderr(std::process::Stdio::null())
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);

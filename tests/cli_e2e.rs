@@ -400,6 +400,34 @@ fn test_cli_overview_nonexistent_path() {
     assert!(stderr.contains("No symbols found"));
 }
 
+// Regression: `.` must normalize to "project root" — same as MCP module_overview.
+// Previously CLI only stripped `./`, so `.` produced LIKE pattern `.%` matching nothing.
+#[test]
+fn test_cli_overview_dot_means_project_root() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["overview", "."]);
+    assert_eq!(code, 0, "overview . should succeed; got stdout={stdout:?}");
+    assert!(stdout.contains("validateToken"),
+        "overview . should list symbols across the project; got: {stdout:?}");
+}
+
+// Regression: empty `--json` overview must keep stdout clean (`[]`) and avoid the
+// anyhow `Error:` stderr prefix. Exit code stays 1 because the requested path
+// matched nothing — mirrors `show --json` / `trace --json` empty contracts.
+// Previously `anyhow::bail!` after `println!("[]")` smeared `Error: ...` on stderr,
+// breaking log consumers (feedback_cli_json_empty_contract.md).
+#[test]
+fn test_cli_overview_json_empty_no_anyhow_prefix() {
+    let project = setup_indexed_project();
+    let (stdout, stderr, code) = run_cli(&project, &["overview", "nonexistent/", "--json"]);
+    assert_eq!(code, 1, "JSON empty overview exit code; stderr={stderr:?}");
+    assert_eq!(stdout.trim(), "[]", "stdout must be exactly `[]`; got {stdout:?}");
+    assert!(!stderr.contains("Error:"),
+        "JSON mode must not emit anyhow `Error:` prefix on stderr; got {stderr:?}");
+    assert!(stderr.contains("No symbols found"),
+        "stderr must still surface the human-readable reason; got {stderr:?}");
+}
+
 // ============================================================
 // deps
 // ============================================================

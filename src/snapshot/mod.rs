@@ -48,9 +48,13 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
         }
 
         // Best-effort git commit hash; empty string if not a git repo.
+        // Silence stderr so non-repo callers (snapshot CLI on a non-git dir,
+        // unit tests creating fixtures without git init) don't see git's
+        // `fatal: not a git repository` line leak through.
         let source_commit = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(root)
+            .stderr(std::process::Stdio::null())
             .output()
             .ok()
             .filter(|o| o.status.success())

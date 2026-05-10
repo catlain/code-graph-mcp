@@ -172,6 +172,12 @@ fn walk_for_relations(
 
     let active_scope = scope_name.as_deref().or(current_scope);
 
+    // Call-expression dispatch — adding a new language with a non-standard
+    // call node kind MUST add its own arm below. Tree-sitter grammars don't
+    // agree on a single name: JS/TS/Rust/Go/Java/C/C++/Kotlin/Swift/Dart use
+    // `call_expression` (the default arm), Python/Ruby use `call`, PHP splits
+    // into three node kinds, C# uses `invocation_expression`, Bash uses
+    // `command`. Missing arms = silently-dropped edges, not compile errors.
     match kind {
         // Call expressions
         "call_expression" => {
@@ -278,6 +284,25 @@ fn walk_for_relations(
                             source_language: String::new(),
                         });
                     }
+                }
+            }
+        }
+
+        // Python: tree-sitter-python uses `call` (not `call_expression`) for every
+        // function/method invocation. Without this branch all Python call edges
+        // are silently dropped — README documents Python as Full tier, and
+        // module_overview / impact_analysis / find_dead_code all rely on this
+        // edge. Routes and `from X import Y` already extracted via other arms.
+        "call" if config.name == "python" => {
+            if let Some(scope) = active_scope {
+                if let Some(callee) = helpers::extract_callee_name(&node, source) {
+                    results.push(ParsedRelation {
+                        source_name: scope.to_string(),
+                        target_name: callee,
+                        relation: REL_CALLS.into(),
+                        metadata: None,
+                        source_language: String::new(),
+                    });
                 }
             }
         }

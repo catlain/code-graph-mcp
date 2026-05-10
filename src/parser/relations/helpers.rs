@@ -12,10 +12,14 @@ pub(super) fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Opt
 
     match function.kind() {
         "identifier" | "simple_identifier" => Some(node_text(&function, source).to_string()),
-        "member_expression" | "field_expression" => {
+        "member_expression" | "field_expression" | "attribute" => {
             // e.g., obj.method — extract "method" or "obj.method"
+            // Python tree-sitter uses node kind `attribute` with field `attribute`
+            // for the method name; JS/TS use `member_expression` with `property`;
+            // Go uses `field_expression` with `field`.
             if let Some(prop) = function.child_by_field_name("property")
-                .or_else(|| function.child_by_field_name("field")) {
+                .or_else(|| function.child_by_field_name("field"))
+                .or_else(|| function.child_by_field_name("attribute")) {
                 Some(node_text(&prop, source).to_string())
             } else {
                 Some(node_text(&function, source).to_string())

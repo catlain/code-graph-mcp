@@ -94,6 +94,16 @@ pub fn find_dead_code(
            -- This catches references the parser doesn't track as edges:
            --   1. Struct instantiation, type usage
            --   2. Function pointers/callbacks (e.g., `query_map(params, map_fn)`)
+           -- Truncation guard: `truncate_code_content` caps each node's stored
+           -- body at `CODE_GRAPH_MAX_CODE_LEN` (default 4KB). When a function
+           -- declared as 50 lines stores only ~5 lines of content, the instr
+           -- fallback can't see references in the tail, producing false-positive
+           -- dead code. Treat any same-file function whose declared span exceeds
+           -- the stored content's newline count by >5 lines as a possibly-
+           -- truncated host: the name might be in the dropped tail, so don't
+           -- flag it. (Threshold absorbs trailing `...` sentinel + line-ending
+           -- variations; Python `def stub(): ...` stays line-balanced and is
+           -- not affected.)
            AND (
                length(n.name) < 3
                OR NOT EXISTS (
@@ -113,6 +123,18 @@ pub fn find_dead_code(
                          OR instr(n2.code_content, n.name || '.') > 0
                          OR instr(n2.code_content, n.name || '{{') > 0
                          OR instr(n2.code_content, n.name || '}}') > 0
+                         OR (
+                             -- Truncation co-signal: must have BOTH the
+                             -- `truncate_code_content` `...` sentinel AND a
+                             -- significant gap between declared span and
+                             -- stored newline count. Either alone produces
+                             -- false positives (Python `def stub(): ...`,
+                             -- or compact fixtures with short content).
+                             substr(n2.code_content, -3) = '...'
+                             AND (n2.end_line - n2.start_line + 1)
+                                 - (length(n2.code_content) - length(replace(n2.code_content, char(10), '')))
+                                 > 5
+                         )
                      )
                )
            )
@@ -355,5 +377,67 @@ mod tests {
         let big_names: Vec<&str> = results_big.iter().map(|r| r.name.as_str()).collect();
         assert!(big_names.contains(&"orphan_fn"), "orphan_fn (20 lines) should pass min_lines=18");
         assert!(!big_names.contains(&"exported_unused"), "exported_unused (15 lines) should fail min_lines=18");
+    }
+
+    /// Regression: when a function's `code_content` is truncated by
+    /// `truncate_code_content` (limit `CODE_GRAPH_MAX_CODE_LEN`, default 4 KB),
+    /// the instr fallback in `find_dead_code` cannot see references in the
+    /// truncated tail. Without a guard this turns long-function callbacks /
+    /// function-pointer args into false-positive dead code (see autonomous
+    /// iteration round 4 repro: env `CODE_GRAPH_MAX_CODE_LEN=100` on a Rust
+    /// project containing `apply_cb(target_callback)` past byte 100 of the
+    /// caller).
+    ///
+    /// Fix: treat any same-file function whose stored content has many fewer
+    /// newlines than its declared line span as "possibly truncated" — give
+    /// names mentioned anywhere in that file the benefit of the doubt. The
+    /// signal is robust against Python `def stub(): ...` (no line-span gap).
+    #[test]
+    fn test_find_dead_code_skips_when_caller_content_truncated() {
+        use crate::domain::REL_EXPORTS;
+
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        let fid = upsert_file(conn, &FileRecord {
+            path: "src/lib.rs".into(), blake3_hash: "h1".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+
+        // target_callback: only referenced from long_caller's tail (lost to truncation).
+        let target_id = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "target_callback".into(),
+            qualified_name: None, start_line: 1, end_line: 1,
+            code_content: "pub fn target_callback(x: i32) -> i32 { x * 2 }".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // long_caller: declared as 50 lines but code_content stores only the first
+        // few (mimics `truncate_code_content` cutting at MAX_CODE_LEN). Reference
+        // to `target_callback` is in the cut-off tail.
+        insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "long_caller".into(),
+            qualified_name: None, start_line: 5, end_line: 55, // 51 declared lines
+            code_content: "pub fn long_caller() {\n    let a = 1;\n    let b = 2;...".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // Exports edge so target_callback shows up as exported-unused if dead.
+        let module_id = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "module".into(), name: "<module>".into(),
+            qualified_name: None, start_line: 0, end_line: 0,
+            code_content: "".into(), signature: None,
+            doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        insert_edge(conn, module_id, target_id, REL_EXPORTS, None).unwrap();
+
+        let results = find_dead_code(conn, None, None, false, 1, 100).unwrap();
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(!names.contains(&"target_callback"),
+            "target_callback must NOT be reported dead — long_caller's truncated body \
+             may reference it in the tail; got: {:?}", names);
     }
 }

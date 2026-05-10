@@ -421,6 +421,37 @@ def list_items():
     assert!(routes[0].target_name == "list_items", "target should be list_items");
 }
 
+/// Regression: Python `call` nodes (tree-sitter uses `call`, not `call_expression`)
+/// must produce REL_CALLS edges. Previously dropped because the extractor only
+/// handled `"call_expression"` and `"call" if config.name == "ruby"`, leaving
+/// Python in the default-no-match path. README documents Python as "Full" tier
+/// (calls + imports + inheritance + routes + test markers) — without this,
+/// every Python project shows caller_count=0 and false-positive dead code.
+#[test]
+fn test_extract_python_bare_call() {
+    let code = "def caller():\n    return used_fn()\n";
+    let relations = extract_relations(code, "python").unwrap();
+    let calls: Vec<(&str, &str)> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+        .collect();
+    assert!(calls.iter().any(|(s, t)| *s == "caller" && *t == "used_fn"),
+        "Python bare call `used_fn()` inside `caller` should emit REL_CALLS edge; got: {:?}", calls);
+}
+
+#[test]
+fn test_extract_python_method_call() {
+    // obj.method() — Python `attribute` node inside `call.function`.
+    let code = "def caller(obj):\n    return obj.method()\n";
+    let relations = extract_relations(code, "python").unwrap();
+    let calls: Vec<(&str, &str)> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+        .collect();
+    assert!(calls.iter().any(|(s, t)| *s == "caller" && *t == "method"),
+        "Python method call `obj.method()` inside `caller` should emit REL_CALLS edge with target=method; got: {:?}", calls);
+}
+
 #[test]
 fn test_extract_rust_impl_trait() {
     let source = r#"

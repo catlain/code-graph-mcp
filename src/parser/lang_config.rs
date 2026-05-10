@@ -1,6 +1,17 @@
 /// Per-language configuration for AST parsing and relation extraction.
 /// Centralizes language-specific flags that were previously scattered as
 /// inline `if language == "X"` guards in treesitter.rs and relations.rs.
+///
+/// Note on call-expression node kinds: there is no `call_node_kind` field
+/// here because the call-dispatch in `relations/mod.rs` cannot be driven
+/// by a single string. Different languages have call-shaped nodes whose
+/// children need genuinely different handling (Ruby `call` doubles as
+/// `require`; PHP splits into `function_call_expression` /
+/// `member_call_expression` / `scoped_call_expression`; Python's `call`
+/// uses an `attribute` child for method names; etc). Adding a new
+/// language with a non-standard call node kind requires a dedicated
+/// match arm in `relations/mod.rs::extract_relations_from_tree`, not a
+/// config tweak. See the per-language arms there for the pattern.
 pub struct LanguageConfig {
     /// Language name (e.g., "rust", "typescript")
     pub name: &'static str,
@@ -12,8 +23,6 @@ pub struct LanguageConfig {
     pub method_via_sibling: bool,
     /// Whether function_body nodes contain method definitions (Dart)
     pub function_body_has_methods: bool,
-    /// AST node kind for call expressions (e.g., "call" for Ruby vs "call_expression" for most)
-    pub call_node_kind: &'static str,
     /// Whether class context should be propagated for scope qualification
     pub has_class_context: bool,
     /// Interface naming convention detection (C# IFoo pattern)
@@ -29,7 +38,6 @@ impl LanguageConfig {
                 method_signature_kind: None,
                 method_via_sibling: false,
                 function_body_has_methods: false,
-                call_node_kind: "call_expression",
                 has_class_context: false,
                 interface_by_prefix: false,
             },
@@ -39,7 +47,6 @@ impl LanguageConfig {
                 method_signature_kind: Some("method_signature"),
                 method_via_sibling: true,
                 function_body_has_methods: true,
-                call_node_kind: "call_expression",
                 has_class_context: true,
                 interface_by_prefix: false,
             },
@@ -49,7 +56,6 @@ impl LanguageConfig {
                 method_signature_kind: None,
                 method_via_sibling: false,
                 function_body_has_methods: false,
-                call_node_kind: "call",
                 has_class_context: true,
                 interface_by_prefix: false,
             },
@@ -59,7 +65,6 @@ impl LanguageConfig {
                 method_signature_kind: None,
                 method_via_sibling: false,
                 function_body_has_methods: false,
-                call_node_kind: "invocation_expression",
                 has_class_context: true,
                 interface_by_prefix: true,
             },
@@ -69,7 +74,6 @@ impl LanguageConfig {
                 method_signature_kind: None,
                 method_via_sibling: false,
                 function_body_has_methods: false,
-                call_node_kind: "command",
                 has_class_context: false,
                 interface_by_prefix: false,
             },
@@ -100,7 +104,6 @@ impl LanguageConfig {
                     method_signature_kind: None,
                     method_via_sibling: false,
                     function_body_has_methods: false,
-                    call_node_kind: "call_expression",
                     has_class_context: true,
                     interface_by_prefix: false,
                 }
@@ -121,7 +124,6 @@ mod tests {
         assert!(config.method_signature_kind.is_none());
         assert!(!config.method_via_sibling);
         assert!(!config.function_body_has_methods);
-        assert_eq!(config.call_node_kind, "call_expression");
         assert!(!config.has_class_context);
         assert!(!config.interface_by_prefix);
     }
@@ -134,7 +136,6 @@ mod tests {
         assert_eq!(config.method_signature_kind, Some("method_signature"));
         assert!(config.method_via_sibling);
         assert!(config.function_body_has_methods);
-        assert_eq!(config.call_node_kind, "call_expression");
         assert!(config.has_class_context);
         assert!(!config.interface_by_prefix);
     }
@@ -147,7 +148,6 @@ mod tests {
         assert!(config.method_signature_kind.is_none());
         assert!(!config.method_via_sibling);
         assert!(!config.function_body_has_methods);
-        assert_eq!(config.call_node_kind, "call");
         assert!(config.has_class_context);
         assert!(!config.interface_by_prefix);
     }
@@ -160,7 +160,6 @@ mod tests {
         assert!(config.method_signature_kind.is_none());
         assert!(!config.method_via_sibling);
         assert!(!config.function_body_has_methods);
-        assert_eq!(config.call_node_kind, "invocation_expression");
         assert!(config.has_class_context);
         assert!(config.interface_by_prefix);
     }
@@ -173,7 +172,6 @@ mod tests {
         assert!(config.method_signature_kind.is_none());
         assert!(!config.method_via_sibling);
         assert!(!config.function_body_has_methods);
-        assert_eq!(config.call_node_kind, "command");
         assert!(!config.has_class_context);
         assert!(!config.interface_by_prefix);
     }
@@ -186,7 +184,6 @@ mod tests {
         assert!(config.method_signature_kind.is_none());
         assert!(!config.method_via_sibling);
         assert!(!config.function_body_has_methods);
-        assert_eq!(config.call_node_kind, "call_expression");
         assert!(config.has_class_context);
         assert!(!config.interface_by_prefix);
     }
@@ -196,6 +193,5 @@ mod tests {
         let config = LanguageConfig::for_language("haskell");
         assert_eq!(config.name, "unknown");
         assert!(!config.has_test_attributes);
-        assert_eq!(config.call_node_kind, "call_expression");
     }
 }

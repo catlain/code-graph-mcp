@@ -1,5 +1,73 @@
 # Changelog
 
+## v0.27.0 — Python call relations + dead-code truncation guard
+
+### Fixed
+- **Python call-edge extraction (P0)**: `src/parser/relations/mod.rs` only
+  matched the `call_expression` arm plus a Ruby-guarded `call` arm;
+  tree-sitter-python emits `call` nodes that fell through to a no-op, so
+  every `.py` file produced **0 call edges** despite README and `CLAUDE.md`
+  documenting Python as Full tier. Knock-on effects: `module_overview`
+  showed `caller_count=0` for every Python symbol, `find_dead_code`
+  over-reported orphans, and `impact_analysis` / `get_call_graph` /
+  `find_references` returned wrong results for any Python query. New
+  `"call" if config.name == "python"` arm, plus `helpers::extract_callee_name`
+  now treats Python `attribute` (field name `attribute`, not `property` /
+  `field`) the same as JS `member_expression`. Reindexing this repo:
+  **0 → 2969 total edges**; `scripts/analyze-search-queries.py` now
+  produces non-zero caller counts.
+- `cmd_overview` JSON empty contract (`src/cli.rs`): `overview . --json`
+  returned `[]` on stdout but exited 1 with `Error: [code-graph] No symbols
+  found under: .` smeared on stderr by `anyhow::bail!`, breaking log
+  consumers piping stdout to `jq`. Now `.` normalizes to project root
+  (mirroring MCP `tool_module_overview`); JSON-mode empty path emits a
+  clean `eprintln!` + `exit(1)` so stderr stays free of the anyhow `Error:`
+  prefix.
+- `find_dead_code` truncation guard (`src/storage/queries/dead_code.rs`):
+  when `CODE_GRAPH_MAX_CODE_LEN` caps a long function's stored body,
+  references in the truncated tail were invisible to the SQL `instr`
+  fallback, falsely flagging callback targets as dead. New OR clause
+  detects truncated hosts via **two co-signals** — trailing `...` sentinel
+  **and** declared-span > stored-newline-count by 5+ lines — and gives
+  same-file names benefit of the doubt. Single signal alone is rejected
+  (Python `def stub(): ...` has the sentinel without a span gap; compact
+  test fixtures have a gap without the sentinel). Default 4 KB limit means
+  real-world activation is rare.
+- `snapshot::{mod,install}.rs`: three best-effort `git` invocations
+  (`rev-parse HEAD` / `remote get-url origin` / `cat-file -e`) now redirect
+  stderr to `Stdio::null()`. Previously `fatal: not a git repository`
+  leaked into `cargo test` output and `snapshot create` runs on non-git
+  roots.
+
+### Removed
+- `LanguageConfig.call_node_kind` field — defined but never read. The call
+  dispatcher in `relations/mod.rs` uses hardcoded literal match arms because
+  per-language call shapes diverge too far for one string to drive them
+  (Ruby's `call` doubles as `require`; PHP splits into three kinds; C# uses
+  `invocation_expression`; Bash uses `command`; Python's `call` carries an
+  `attribute` field for method names). Keeping the field misled contributors
+  into thinking new languages could be added by editing config alone — that
+  was the Python regression's root cause. Field + assertions removed; the
+  dispatcher entry now carries a comment enumerating every language's
+  call-node kind so the trap is visible at the dispatch site.
+
+### Regression coverage
+- `src/parser/relations/tests.rs::test_extract_python_bare_call`,
+  `::test_extract_python_method_call` — Python `call` arm + `attribute`
+  callee.
+- `src/storage/queries/dead_code.rs::tests::test_find_dead_code_skips_when_caller_content_truncated`
+  — truncation guard.
+- `tests/cli_e2e.rs::test_cli_overview_dot_means_project_root`,
+  `::test_cli_overview_json_empty_no_anyhow_prefix` — overview path
+  normalization + JSON empty-stderr cleanliness.
+
+### Rationale anchor
+Autonomous iteration loop (4 rounds): 1 P0 + 4 P1 + 1 P2 surfaced, all
+fixed. Each change stays inside internal surface — no Δ-contract on MCP
+tool schemas, CLI flags published to npm users, or SQLite schema.
+Pre-push parity: `cargo +1.95.0 clippy --no-default-features --all-targets -- -D warnings`
+clean on both targets; 467 tests pass.
+
 ## v0.26.0 — UserPromptSubmit context push default ON + trigger hints
 
 ### Changed
