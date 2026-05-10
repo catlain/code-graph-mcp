@@ -16,6 +16,45 @@ use crate::storage::queries::{
 };
 use crate::domain::REL_CALLS;
 
+/// Decoded form of `edges.metadata` for REL_CALLS rows. See
+/// `docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md`
+/// §"Wire protocol" for the JSON shapes this parses.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CalleeMeta {
+    Path(Vec<String>),
+    SelfType(String),
+    SelfRecv(String),
+    Receiver(String),
+    Chain,
+}
+
+/// Parse a `{"q":"...", "v":"..."}` JSON metadata blob. Returns None for
+/// metadata produced by other relations (routes, python imports), absent
+/// metadata, or unrecognized `q` values.
+#[allow(dead_code)]
+pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
+    let raw = s?;
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let q = v.get("q")?.as_str()?;
+    match q {
+        "chain" => Some(CalleeMeta::Chain),
+        "path" => {
+            let payload = v.get("v")?.as_str()?;
+            let segments: Vec<String> = payload.split("::").map(String::from).collect();
+            if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
+                None
+            } else {
+                Some(CalleeMeta::Path(segments))
+            }
+        }
+        "self" => v.get("v")?.as_str().map(|t| CalleeMeta::SelfRecv(t.to_string())),
+        "stype" => v.get("v")?.as_str().map(|t| CalleeMeta::SelfType(t.to_string())),
+        "recv" => v.get("v")?.as_str().map(|r| CalleeMeta::Receiver(r.to_string())),
+        _ => None,
+    }
+}
+
 /// Disambiguate N same-language cross-file candidates for a single call/import
 /// target. Returns a subset. A single-element result is the authoritative
 /// winner; ties fall back to the full input so the caller does not
@@ -201,4 +240,57 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
     }
 
     Ok(edges_added)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_metadata_bare_returns_none() {
+        assert!(parse_callee_metadata(None).is_none());
+    }
+
+    #[test]
+    fn parse_metadata_path() {
+        let m = parse_callee_metadata(Some(r#"{"q":"path","v":"snapshot"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::Path(ref segs) if segs == &["snapshot"]));
+    }
+
+    #[test]
+    fn parse_metadata_path_multi_segment() {
+        let m = parse_callee_metadata(Some(r#"{"q":"path","v":"a::b::c"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::Path(ref segs) if segs == &["a", "b", "c"]));
+    }
+
+    #[test]
+    fn parse_metadata_self_recv() {
+        let m = parse_callee_metadata(Some(r#"{"q":"self","v":"Db"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::SelfRecv(ref t) if t == "Db"));
+    }
+
+    #[test]
+    fn parse_metadata_self_type() {
+        let m = parse_callee_metadata(Some(r#"{"q":"stype","v":"Db"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::SelfType(ref t) if t == "Db"));
+    }
+
+    #[test]
+    fn parse_metadata_recv() {
+        let m = parse_callee_metadata(Some(r#"{"q":"recv","v":"path"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::Receiver(ref r) if r == "path"));
+    }
+
+    #[test]
+    fn parse_metadata_chain() {
+        let m = parse_callee_metadata(Some(r#"{"q":"chain"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::Chain));
+    }
+
+    #[test]
+    fn parse_metadata_routes_or_python_imports_returns_none() {
+        // Other relations also use metadata; resolver should skip non-call shapes.
+        assert!(parse_callee_metadata(Some(r#"{"method":"GET","path":"/api"}"#)).is_none());
+        assert!(parse_callee_metadata(Some(r#"{"python_module":"foo","is_module_import":false}"#)).is_none());
+    }
 }
