@@ -89,7 +89,8 @@ fn snapshot_install_rejects_newer_schema() {
     // Manually overwrite snapshot_schema_version to a number larger than our build
     let db = Database::open(&raw).unwrap();
     db.conn().execute(
-        "UPDATE meta SET value = '999' WHERE key = 'snapshot_schema_version'", []
+        "UPDATE meta SET value = ?1 WHERE key = ?2",
+        rusqlite::params!["999", code_graph_mcp::snapshot::meta::META_SNAPSHOT_SCHEMA_VERSION],
     ).unwrap();
     drop(db);
 
