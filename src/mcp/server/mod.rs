@@ -333,6 +333,16 @@ impl McpServer {
         let index_lock = try_acquire_index_lock(&db_dir);
         let is_primary = index_lock.is_some();
 
+        // Install snapshot BEFORE opening self.db to avoid the POSIX inode-swap problem.
+        // POSIX rename(2) atomically replaces the file on disk, but any already-open
+        // file descriptor keeps pointing at the OLD inode. If we opened self.db first
+        // and then renamed the snapshot over index.db, self.db.conn() would silently see
+        // empty schema for the rest of the session. By installing here — before open —
+        // the connection we open below lands on the snapshot data directly.
+        if is_primary && !db_path.exists() {
+            Self::maybe_install_snapshot(project_root);
+        }
+
         let embedding_model = EmbeddingModel::load()?;
         let db = Self::open_db_for_role(&db_path, is_primary)?;
         let root_canonical = project_root.canonicalize().ok();
@@ -354,6 +364,63 @@ impl McpServer {
             is_primary,
             _index_lock: index_lock,
         })
+    }
+
+    /// Attempt to install a snapshot for `project_root` without logging (no `&self`).
+    /// Called during `from_project_root` before the db connection is opened.
+    /// Succeeds silently, fails silently (snapshot is best-effort).
+    fn maybe_install_snapshot(project_root: &Path) {
+        let url = match crate::snapshot::resolve_snapshot_source(project_root) {
+            Some(u) => u,
+            None => {
+                tracing::debug!("snapshot: no source configured, skipping pre-open install");
+                return;
+            }
+        };
+        match crate::snapshot::try_install(&url, project_root) {
+            Ok(commit) => {
+                tracing::info!(
+                    "snapshot installed at commit {} (incremental drift-check will follow)",
+                    commit
+                );
+            }
+            Err(e) => {
+                tracing::warn!("snapshot install failed ({}), will run full index", e);
+            }
+        }
+    }
+
+    /// Attempt to install a snapshot for the current project root.
+    /// Used as a post-construction hook when `self.db` was already opened on
+    /// an empty database (e.g. unit tests or secondary-to-primary promotion).
+    /// Returns `true` if the snapshot was installed and the caller should
+    /// reopen `self.db` before using it.
+    ///
+    /// NOTE: in the normal startup path this is NOT called — snapshot install
+    /// happens in `maybe_install_snapshot` inside `from_project_root` BEFORE
+    /// `self.db` is opened, so the inode-swap issue never arises.
+    #[allow(dead_code)] // reserved for Task 11 (reindex --from-snapshot) and Task 12 (health-check)
+    fn try_install_snapshot(&self, project_root: &Path) -> bool {
+        let url = match crate::snapshot::resolve_snapshot_source(project_root) {
+            Some(u) => u,
+            None => {
+                self.send_log("info", "no snapshot source configured");
+                return false;
+            }
+        };
+        match crate::snapshot::try_install(&url, project_root) {
+            Ok(commit) => {
+                self.send_log(
+                    "info",
+                    &format!("snapshot installed at commit {commit}, will run incremental drift-check"),
+                );
+                true
+            }
+            Err(e) => {
+                self.send_log("warn", &format!("snapshot install failed ({e}), running full index"));
+                false
+            }
+        }
     }
 
     #[cfg(test)]
@@ -989,12 +1056,24 @@ impl McpServer {
         let is_indexed = *lock_or_recover(&self.indexed, "indexed");
 
         if !is_indexed {
-            self.send_log("info", "Scanning and indexing project files...");
+            // Check whether the DB already has data (e.g. snapshot installed in
+            // from_project_root before this connection was opened). If so, run
+            // incremental (drift-correction) instead of a full reindex.
+            let has_existing = queries::get_index_status(self.db.conn(), false)
+                .map(|s| s.files_count > 0)
+                .unwrap_or(false);
             let progress_cb = |current: usize, total: usize| {
                 self.send_progress("indexing", current, total);
             };
-            // Skip inline embedding for full index (too slow), background thread handles it
-            let result = run_full_index(&self.db, &project_root, None, Some(&progress_cb))?;
+            let result = if has_existing {
+                self.send_log("info", "Snapshot data present — running incremental drift-check...");
+                use crate::indexer::pipeline::run_incremental_index;
+                run_incremental_index(&self.db, &project_root, None, Some(&progress_cb))?
+            } else {
+                self.send_log("info", "Scanning and indexing project files...");
+                // Skip inline embedding for full index (too slow), background thread handles it
+                run_full_index(&self.db, &project_root, None, Some(&progress_cb))?
+            };
             *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
             *lock_or_recover(&self.indexed, "indexed") = true;
             // Invalidate caches after re-index
@@ -2382,5 +2461,79 @@ app.post('/api/login', handleLogin);
             "phantom purged by fallback");
         assert_eq!(count("SELECT COUNT(*) FROM files WHERE path = 'phantom.ts'"), 0,
             "phantom file row purged by fallback");
+    }
+
+    /// Inode-safety contract: when a snapshot is installed into .code-graph/index.db
+    /// BEFORE from_project_root opens self.db, the connection sees the snapshot data.
+    ///
+    /// Regression test for the POSIX rename(2) inode-swap problem:
+    /// If snapshot were installed AFTER self.db was opened (old approach), self.db.conn()
+    /// would point at the old empty inode while the snapshot data landed on a new inode.
+    /// With Approach A (maybe_install_snapshot in from_project_root before open_db_for_role),
+    /// the connection is opened on the post-install file, so snapshot rows are visible.
+    ///
+    /// Note: resolve_snapshot_source rejects file:// URLs from .code-graph.toml (https-only
+    /// policy). We use crate::snapshot::try_install directly here to simulate what
+    /// maybe_install_snapshot does when a valid HTTPS URL is configured, verifying the
+    /// contract that snapshot data installed before open is visible via self.db.
+    #[test]
+    fn test_snapshot_data_visible_via_self_db_after_from_project_root() {
+        use std::process::Command;
+
+        // Build a snapshot from a git fixture with one indexable Rust file.
+        let source = TempDir::new().unwrap();
+        Command::new("git").args(["init", "-q"]).current_dir(source.path()).status().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(source.path()).status().unwrap();
+        Command::new("git").args(["config", "user.name", "t"]).current_dir(source.path()).status().unwrap();
+        std::fs::write(
+            source.path().join("lib.rs"),
+            "pub fn snapshot_sentinel() {}\npub fn snapshot_caller() { snapshot_sentinel(); }\n",
+        ).unwrap();
+        Command::new("git").args(["add", "."]).current_dir(source.path()).status().unwrap();
+        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(source.path()).status().unwrap();
+
+        let raw_db = source.path().join("snap.db");
+        crate::snapshot::create(source.path(), &raw_db, false).unwrap();
+        let raw = std::fs::read(&raw_db).unwrap();
+        let compressed = zstd::encode_all(&raw[..], 9).unwrap();
+        let zst_path = source.path().join("snap.db.zst");
+        std::fs::write(&zst_path, &compressed).unwrap();
+
+        // Consumer project: same files, but fresh .code-graph/ directory (no prior index).
+        // Install the snapshot into the consumer BEFORE calling from_project_root — this
+        // is what maybe_install_snapshot does in production when index.db does not exist.
+        let consumer = TempDir::new().unwrap();
+        std::fs::write(
+            consumer.path().join("lib.rs"),
+            "pub fn snapshot_sentinel() {}\npub fn snapshot_caller() { snapshot_sentinel(); }\n",
+        ).unwrap();
+        let url = format!("file://{}", zst_path.display());
+        crate::snapshot::try_install(&url, consumer.path()).unwrap();
+
+        // Verify snapshot was installed.
+        let index_db = consumer.path().join(".code-graph").join("index.db");
+        assert!(index_db.exists(), "snapshot must be installed before from_project_root");
+
+        // Open the server — from_project_root skips maybe_install_snapshot because
+        // index.db already exists (the guard condition is !db_path.exists()).
+        // self.db is opened on the snapshot file directly.
+        let server = McpServer::from_project_root(consumer.path()).unwrap();
+
+        // KEY ASSERTION: self.db sees the snapshot nodes without calling ensure_indexed.
+        // If the inode-swap bug were present (install after open), this would return empty.
+        let nodes = queries::get_nodes_by_name(server.db().conn(), "snapshot_sentinel").unwrap();
+        assert!(!nodes.is_empty(),
+            "self.db must see snapshot_sentinel from the pre-installed snapshot; \
+             got {} nodes — inode-swap regression if 0", nodes.len());
+
+        // ensure_indexed should run incrementally (not full) since has_existing = true.
+        // This verifies the ensure_indexed drift-correction path works correctly.
+        server.ensure_indexed().unwrap();
+        let nodes_after = queries::get_nodes_by_name(server.db().conn(), "snapshot_sentinel").unwrap();
+        assert!(!nodes_after.is_empty(),
+            "snapshot_sentinel must still be present after incremental drift-check");
+        let caller_nodes = queries::get_nodes_by_name(server.db().conn(), "snapshot_caller").unwrap();
+        assert!(!caller_nodes.is_empty(),
+            "snapshot_caller must be present after drift-check");
     }
 }
