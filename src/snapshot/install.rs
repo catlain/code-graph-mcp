@@ -104,12 +104,17 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
     let cg_dir = root.join(crate::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&cg_dir)?;
 
-    let zst_partial = cg_dir.join(".snapshot.db.zst.partial");
-    let db_partial = cg_dir.join(".snapshot.db.partial");
-
-    // Clean up any stale partials from a previous crashed install
-    let _ = std::fs::remove_file(&zst_partial);
-    let _ = std::fs::remove_file(&db_partial);
+    // Use a per-invocation unique suffix so concurrent installers don't clobber
+    // each other's in-progress partials.  The final atomic rename serialises who
+    // wins; the loser's rename simply replaces what the winner wrote (both files
+    // are valid, so the last rename wins cleanly).
+    static INSTALL_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let seq = INSTALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id() as u64;
+    let id: u64 = pid.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(seq);
+    let zst_partial = cg_dir.join(format!(".snapshot-{id:016x}.db.zst.partial"));
+    let db_partial  = cg_dir.join(format!(".snapshot-{id:016x}.db.partial"));
 
     let install_inner = || -> Result<String> {
         download(url, &zst_partial)?;
@@ -143,10 +148,14 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
         }
         Err(e) => {
             let _ = std::fs::remove_file(&zst_partial);
+            // Only remove db_partial (ours) and final_db if we were the one that
+            // renamed db_partial into place (db_partial is gone) but meta-write
+            // then failed.  If db_partial still exists this thread never reached
+            // the rename step, so final_db belongs to a concurrent winner.
+            let db_partial_gone = !db_partial.exists();
             let _ = std::fs::remove_file(&db_partial);
-            // If we got past rename but meta-write failed, remove the final db too
             let final_db = cg_dir.join("index.db");
-            if final_db.exists() {
+            if db_partial_gone && final_db.exists() {
                 let _ = std::fs::remove_file(&final_db);
             }
             Err(e)

@@ -58,6 +58,105 @@ fn snapshot_round_trip_node_counts_match() {
 }
 
 #[test]
+fn snapshot_install_falls_back_on_corrupt_archive() {
+    let target = init_git_repo_with_src();
+    let bad = TempDir::new().unwrap();
+    let bad_path = bad.path().join("bad.db.zst");
+    std::fs::write(&bad_path, b"\x00\x00\x00 not zstd").unwrap();
+    let url = format!("file://{}", bad_path.display());
+
+    let err = snapshot::try_install(&url, target.path()).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("zstd")
+            || err.to_string().to_lowercase().contains("decode"),
+        "got: {err}");
+
+    let cg_dir = target.path().join(".code-graph");
+    if cg_dir.exists() {
+        for entry in std::fs::read_dir(&cg_dir).unwrap().flatten() {
+            let s = entry.file_name().to_string_lossy().into_owned();
+            assert!(s != "index.db" && !s.ends_with(".partial"),
+                "leftover after failure: {s}");
+        }
+    }
+}
+
+#[test]
+fn snapshot_install_rejects_newer_schema() {
+    let src = init_git_repo_with_src();
+    let raw = src.path().join("snapshot.db");
+    snapshot::create(src.path(), &raw, false).unwrap();
+
+    // Manually overwrite snapshot_schema_version to a number larger than our build
+    let db = Database::open(&raw).unwrap();
+    db.conn().execute(
+        "UPDATE meta SET value = '999' WHERE key = 'snapshot_schema_version'", []
+    ).unwrap();
+    drop(db);
+
+    let bytes = std::fs::read(&raw).unwrap();
+    let zst = src.path().join("snapshot.db.zst");
+    std::fs::write(&zst, zstd::encode_all(&bytes[..], 9).unwrap()).unwrap();
+
+    let target = init_git_repo_with_src();
+    let url = format!("file://{}", zst.display());
+    let err = snapshot::try_install(&url, target.path()).unwrap_err();
+    assert!(err.to_string().contains("newer") || err.to_string().contains("999"),
+        "got: {err}");
+}
+
+#[test]
+fn snapshot_install_rejects_oversized_uncompressed() {
+    // Create a file whose decompressed size exceeds 100MB.
+    // Use a zero-filled buffer — zstd compresses it to a tiny .zst,
+    // so the actual compressed file is small and the test runs fast.
+    let big = vec![0u8; 110 * 1024 * 1024];
+    let src = TempDir::new().unwrap();
+    let zst = src.path().join("big.db.zst");
+    std::fs::write(&zst, zstd::encode_all(&big[..], 1).unwrap()).unwrap();
+
+    let target = init_git_repo_with_src();
+    let url = format!("file://{}", zst.display());
+    let err = snapshot::try_install(&url, target.path()).unwrap_err();
+    let chain = format!("{err:#}");
+    assert!(chain.contains("cap") || chain.contains("100"),
+        "got: {chain}");
+}
+
+#[test]
+fn snapshot_install_concurrent_serialized_via_filesystem() {
+    // Two threads racing to install the same snapshot. Verifiable contract:
+    // at least one creates the final index.db and no partials remain.
+    use std::sync::Arc;
+    use std::thread;
+
+    let src = init_git_repo_with_src();
+    let zst = build_snapshot_zst(&src);
+    let target = Arc::new(init_git_repo_with_src());
+    let url = format!("file://{}", zst.display());
+
+    let (t1, t2) = {
+        let url_a = url.clone();
+        let url_b = url.clone();
+        let r_a = Arc::clone(&target);
+        let r_b = Arc::clone(&target);
+        (
+            thread::spawn(move || snapshot::try_install(&url_a, r_a.path())),
+            thread::spawn(move || snapshot::try_install(&url_b, r_b.path())),
+        )
+    };
+    let r1 = t1.join().unwrap();
+    let r2 = t2.join().unwrap();
+    assert!(r1.is_ok() || r2.is_ok(), "at least one install should succeed");
+    let installed = target.path().join(".code-graph").join("index.db");
+    assert!(installed.exists());
+
+    for entry in std::fs::read_dir(target.path().join(".code-graph")).unwrap().flatten() {
+        let s = entry.file_name().to_string_lossy().into_owned();
+        assert!(!s.ends_with(".partial"), "leftover partial: {s}");
+    }
+}
+
+#[test]
 fn snapshot_then_incremental_picks_up_drift() {
     use code_graph_mcp::indexer::pipeline::run_incremental_index;
 
