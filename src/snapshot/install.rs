@@ -62,15 +62,7 @@ fn fetch_latest_snapshot_asset_url(owner: &str, repo: &str) -> Option<String> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    let pid_for_kill = child.id();
-    let watchdog = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        // Best-effort kill; the wait below will then return.
-        unsafe { libc::kill(pid_for_kill as i32, libc::SIGTERM); }
-    });
-    let output = child.wait_with_output().ok().filter(|o| o.status.success())?;
-    // Detach the watchdog — it'll noop after we've exited because pid is dead.
-    drop(watchdog);
+    let output = wait_with_watchdog(child, std::time::Duration::from_secs(5))?;
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     let assets = json.get("assets")?.as_array()?;
     let mut matches: Vec<&str> = assets
@@ -92,6 +84,46 @@ fn fetch_latest_snapshot_asset_url(owner: &str, repo: &str) -> Option<String> {
 use anyhow::Context;
 
 const MAX_DECOMPRESSED_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
+
+/// Wait up to `cap` for the child to exit; SIGTERM it on Unix if it doesn't,
+/// then collect output. Cancellation-aware so the happy path doesn't leak a
+/// 5s sleeping thread that could SIGTERM a recycled PID.
+fn wait_with_watchdog(
+    child: std::process::Child,
+    cap: std::time::Duration,
+) -> Option<std::process::Output> {
+    #[cfg(unix)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let pid = child.id() as i32;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_w = Arc::clone(&cancel);
+        let watchdog = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed() < cap {
+                if cancel_w.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // Cap exceeded: send SIGTERM. Pid is still alive because cancel
+            // is set immediately after wait_with_output returns.
+            unsafe { libc::kill(pid, libc::SIGTERM); }
+        });
+        let result = child.wait_with_output().ok().filter(|o| o.status.success());
+        cancel.store(true, Ordering::Relaxed);
+        let _ = watchdog.join();
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        // No watchdog on non-Unix: rely on `gh.exe`'s own timeout behavior.
+        let _ = cap;
+        child.wait_with_output().ok().filter(|o| o.status.success())
+    }
+}
 
 pub fn try_install(url: &str, root: &Path) -> Result<String> {
     use crate::storage::db::Database;
@@ -147,17 +179,13 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
             Ok(commit)
         }
         Err(e) => {
+            // Best-effort: remove our own partials. We do NOT delete final_db
+            // here even if this thread renamed it — a concurrent thread could
+            // have rename-replaced it with its own valid snapshot since, and
+            // deleting would destroy the only good copy. A snapshot DB without
+            // source_url/fetched_at meta is still a usable index.
             let _ = std::fs::remove_file(&zst_partial);
-            // Only remove db_partial (ours) and final_db if we were the one that
-            // renamed db_partial into place (db_partial is gone) but meta-write
-            // then failed.  If db_partial still exists this thread never reached
-            // the rename step, so final_db belongs to a concurrent winner.
-            let db_partial_gone = !db_partial.exists();
             let _ = std::fs::remove_file(&db_partial);
-            let final_db = cg_dir.join("index.db");
-            if db_partial_gone && final_db.exists() {
-                let _ = std::fs::remove_file(&final_db);
-            }
             Err(e)
         }
     }
