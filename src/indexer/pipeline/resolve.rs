@@ -242,6 +242,62 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
     Ok(edges_added)
 }
 
+/// Filter a candidate set down to those matching the Path qualifier:
+///   (1) file path contains "/seg1/seg2/" OR starts with "seg1/seg2/", OR
+///   (2) qualified_name contains the segment chain joined by `.` as a
+///       contiguous segment (anchored on `.` or boundary).
+///
+/// Storage uses `.` separator for qualified_name (treesitter.rs:582), NOT `::`.
+/// Returns the filtered subset; empty result is a meaningful signal
+/// (no project candidate matches → caller should drop the edge).
+#[allow(dead_code)] // consumed by index_files.rs Phase 2 dispatch
+pub(super) fn path_filter_candidates(
+    segments: &[String],
+    candidates: &[i64],
+    node_id_to_path: &std::collections::HashMap<i64, String>,
+    db: &crate::storage::db::Database,
+) -> anyhow::Result<Vec<i64>> {
+    if candidates.is_empty() || segments.is_empty() {
+        return Ok(candidates.to_vec());
+    }
+    let path_chain = segments.join("/");
+    let qn_chain = segments.join(".");
+
+    let placeholders: String = std::iter::repeat_n("?", candidates.len()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, COALESCE(qualified_name, '') FROM nodes WHERE id IN ({})",
+        placeholders
+    );
+    let mut stmt = db.conn().prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = candidates.iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut id_to_qn: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    for r in rows {
+        let (id, qn) = r?;
+        id_to_qn.insert(id, qn);
+    }
+
+    let kept: Vec<i64> = candidates.iter().copied().filter(|id| {
+        let path = node_id_to_path.get(id).map(String::as_str).unwrap_or("");
+        let qn = id_to_qn.get(id).map(String::as_str).unwrap_or("");
+
+        let path_match = path.contains(&format!("/{}/", path_chain))
+            || path.starts_with(&format!("{}/", path_chain));
+
+        let qn_match = qn == qn_chain
+            || qn.starts_with(&format!("{}.", qn_chain))
+            || qn.contains(&format!(".{}.", qn_chain))
+            || qn.ends_with(&format!(".{}", qn_chain));
+
+        path_match || qn_match
+    }).collect();
+    Ok(kept)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

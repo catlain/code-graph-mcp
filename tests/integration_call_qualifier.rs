@@ -53,3 +53,30 @@ fn chain_builder_drops_intermediate_callers() {
         callers
     );
 }
+
+#[test]
+fn bare_name_qualifier_drops_phantom_callers_for_file_create() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // Project has snapshot::create.
+    write(root, "src/snapshot/mod.rs", "pub fn create() {}\n");
+    // Caller calls std::fs::File::create — Path qualifier with first segment
+    // "File" which is NOT a project module → drop.
+    write(root, "src/caller.rs", r#"
+        use std::fs::File;
+        pub fn caller() { let _ = File::create("/tmp/x"); }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let callers = callers_of(&db, "create");
+    assert!(
+        !callers.iter().any(|c| c.contains("caller")),
+        "snapshot::create must NOT have `caller` (caller called std::fs::File::create), got: {:?}",
+        callers
+    );
+}
