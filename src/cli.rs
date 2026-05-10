@@ -89,7 +89,7 @@ impl CliContext {
 // --- Argument helpers ---
 
 /// Flags that take a value argument (not boolean).
-const VALUE_FLAGS: &[&str] = &["--limit", "--type", "--returns", "--params", "--direction", "--depth", "--format", "--file", "--language", "--change-type", "--top-k", "--max-distance", "--node-type", "--node-id", "--context-lines", "--relation", "--min-lines"];
+const VALUE_FLAGS: &[&str] = &["--limit", "--type", "--returns", "--params", "--direction", "--depth", "--format", "--file", "--language", "--change-type", "--top-k", "--max-distance", "--node-type", "--node-id", "--context-lines", "--relation", "--min-lines", "--out", "--root"];
 
 fn get_positional(args: &[String], index: usize) -> Option<&str> {
     let mut pos = 0;
@@ -2996,6 +2996,41 @@ pub fn cmd_benchmark(project_root: &Path, args: &[String]) -> Result<()> {
         writeln!(stdout, "Avg tokens/node:     {:>8.1}", avg_tokens)?;
     }
 
+    Ok(())
+}
+
+/// `snapshot create --out <path> [--include-embeddings] [--root <dir>] [--quiet]`
+pub fn cmd_snapshot_create(project_root: &Path, args: &[String]) -> Result<()> {
+    let out = get_flag_value(args, "--out")
+        .ok_or_else(|| anyhow::anyhow!("--out <path> is required"))?
+        .to_string();
+    let include = has_flag(args, "--include-embeddings");
+    let quiet = has_flag(args, "--quiet");
+
+    let root = get_flag_value(args, "--root")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| project_root.to_path_buf());
+
+    crate::snapshot::create(&root, std::path::Path::new(&out), include)?;
+    if !quiet {
+        eprintln!("snapshot created: {}", out);
+    }
+    Ok(())
+}
+
+/// `snapshot inspect <file.db.zst>` — JSON output to stdout
+pub fn cmd_snapshot_inspect(args: &[String]) -> Result<()> {
+    // get_positional skips args[0] (binary) and args[1] (subcommand) internally;
+    // for `snapshot inspect <file>` the dispatch happens at args[1]="snapshot",
+    // args[2]="inspect", so <file> is the first positional after the subcommand
+    // pair — but get_positional's skip-2 treats args[1] as the single subcommand.
+    // We therefore pass args starting from "inspect" as the subcommand context by
+    // reading args[3] directly (binary=0, "snapshot"=1, "inspect"=2, file=3).
+    let file = args
+        .get(3)
+        .ok_or_else(|| anyhow::anyhow!("snapshot inspect <file.db.zst> required"))?;
+    let meta = crate::snapshot::inspect(std::path::Path::new(file))?;
+    println!("{}", serde_json::to_string_pretty(&meta)?);
     Ok(())
 }
 
