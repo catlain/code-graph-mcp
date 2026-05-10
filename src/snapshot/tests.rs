@@ -152,3 +152,44 @@ fn config_load_rejects_malformed_toml() {
         || err.to_string().to_lowercase().contains("invalid"),
         "got error message: {err}");
 }
+
+use crate::snapshot::install::resolve_snapshot_source;
+
+#[test]
+fn resolve_returns_none_when_no_git_no_toml() {
+    let dir = TempDir::new().unwrap();
+    assert_eq!(resolve_snapshot_source(dir.path()), None);
+}
+
+#[test]
+fn resolve_returns_url_from_toml_override() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(".code-graph.toml"),
+        "[snapshot]\nurl = \"https://example.com/x.db.zst\"\n",
+    ).unwrap();
+    assert_eq!(
+        resolve_snapshot_source(dir.path()),
+        Some("https://example.com/x.db.zst".to_string()),
+    );
+}
+
+#[test]
+fn resolve_returns_none_when_disabled() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(".code-graph.toml"),
+        "[snapshot]\ndisabled = true\n",
+    ).unwrap();
+    assert_eq!(resolve_snapshot_source(dir.path()), None);
+}
+
+#[test]
+fn resolve_rejects_http_url_from_toml() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(".code-graph.toml"),
+        "[snapshot]\nurl = \"http://example.com/x.db.zst\"\n",
+    ).unwrap();
+    assert_eq!(resolve_snapshot_source(dir.path()), None);
+}
