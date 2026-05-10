@@ -1150,3 +1150,19 @@ fn test_rust_callee_path_qualifier_strips_crate() {
         "metadata should encode Path qualifier with crate stripped"
     );
 }
+
+// T3: single-segment Type::method path
+#[test]
+fn test_rust_callee_type_method_call_path() {
+    let code = r#"fn caller() { File::create("/tmp/x"); }"#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "create")
+        .expect("missing call to create");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"File"}"#),
+        "single-segment Path with non-reserved name should be preserved"
+    );
+}
+
