@@ -1223,3 +1223,17 @@ fn test_rust_callee_chained_reserved_prefixes_stripped() {
     );
 }
 
+#[test]
+fn test_rust_callee_obj_method_receiver_qualifier() {
+    let code = "fn caller(p: &std::path::Path) { p.exists(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "exists")
+        .expect("missing call to exists");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"recv","v":"p"}"#),
+        "obj.method() where obj is a plain identifier emits Receiver qualifier"
+    );
+}
+

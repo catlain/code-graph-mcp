@@ -102,7 +102,7 @@ pub(crate) fn extract_callee(
             Some((node_text(&function, source).to_string(), CalleeQualifier::Bare))
         }
         "scoped_identifier" => extract_rust_scoped(&function, source),
-        // Other kinds added in later tasks (field_expression in T6/T7/T9).
+        "field_expression" => extract_rust_field(&function, source),
         _ => extract_callee_name(node, source).map(|n| (n, CalleeQualifier::Bare)),
     }
 }
@@ -149,6 +149,34 @@ fn extract_rust_scoped(
     } else {
         Some((name, CalleeQualifier::Path(path)))
     }
+}
+
+/// Handle Rust field_expression callee (`obj.method()`, `self.method()`,
+/// `chain().method()`). Returns name + qualifier shape:
+///   value=self / self_expression → SelfRecv (payload filled by caller via current_rust_impl in T9)
+///   value=identifier             → Receiver(<text>)
+///   value=call_expression        → Chain
+///   else                         → Bare (unknown shape, conservative)
+fn extract_rust_field(
+    function: &tree_sitter::Node,
+    source: &str,
+) -> Option<(String, CalleeQualifier)> {
+    let field = function.child_by_field_name("field")?;
+    let name = node_text(&field, source).to_string();
+    let value = function.child_by_field_name("value");
+    let qualifier = match value.as_ref().map(|v| v.kind()) {
+        Some("self") | Some("self_expression") => {
+            // SelfRecv with empty payload here; mod.rs call_expression arm
+            // overwrites payload from current_rust_impl context (T9).
+            CalleeQualifier::SelfRecv(String::new())
+        }
+        Some("identifier") => {
+            CalleeQualifier::Receiver(node_text(&value.unwrap(), source).to_string())
+        }
+        Some("call_expression") => CalleeQualifier::Chain,
+        _ => CalleeQualifier::Bare,
+    };
+    Some((name, qualifier))
 }
 
 pub(super) fn extract_string_from_subtree(node: &tree_sitter::Node, source: &str) -> Option<String> {
