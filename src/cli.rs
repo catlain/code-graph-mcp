@@ -3289,3 +3289,39 @@ mod tests {
         assert_eq!(s.files_indexed, 60);
     }
 }
+
+// --- reindex subcommand ---
+
+/// `reindex [--from-snapshot]` — wipe `.code-graph/` index files and re-fetch
+/// snapshot (or full-index if no snapshot available). Without `--from-snapshot`,
+/// behaves identically to `incremental-index`.
+///
+/// Equivalent to user-side `rm -rf .code-graph/index.db*` + restarting the
+/// MCP server, but with optional snapshot-bootstrap acceleration.
+pub fn cmd_reindex(project_root: &Path, args: &[String]) -> Result<()> {
+    let from_snapshot = has_flag(args, "--from-snapshot");
+    let cg_dir = project_root.join(crate::domain::CODE_GRAPH_DIR);
+
+    if from_snapshot && cg_dir.exists() {
+        // Remove just index.db + WAL files; leave usage.jsonl etc. intact.
+        for name in ["index.db", "index.db-wal", "index.db-shm"] {
+            let _ = std::fs::remove_file(cg_dir.join(name));
+        }
+    }
+
+    if from_snapshot {
+        if let Some(url) = crate::snapshot::resolve_snapshot_source(project_root) {
+            match crate::snapshot::try_install(&url, project_root) {
+                Ok(commit) => {
+                    eprintln!("Snapshot installed at commit {commit}");
+                    return cmd_incremental_index(project_root, false);
+                }
+                Err(e) => eprintln!("Snapshot install failed ({e}), falling back to full index"),
+            }
+        } else {
+            eprintln!("No snapshot source resolved, falling back to full index");
+        }
+    }
+
+    cmd_incremental_index(project_root, false)
+}

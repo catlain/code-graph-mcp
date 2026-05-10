@@ -49,6 +49,10 @@ fn main() -> Result<()> {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_rebuild_index(&project_root, &args)
         }
+        Some("reindex") => {
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            code_graph_mcp::cli::cmd_reindex(&project_root, &args)
+        }
         Some("health-check") => {
             // Support both --format json and --json for consistency with other commands
             let format = if args.iter().any(|a| a == "--json") {
@@ -188,6 +192,9 @@ fn print_help() {
     println!("    dead-code [path]    Find unused code (orphans and exported-unused symbols)");
     println!("    incremental-index   Run incremental index update");
     println!("    rebuild-index       Drop and rebuild the index from scratch (requires --confirm)");
+    println!("    reindex [--from-snapshot]");
+    println!("                        Reset index; with --from-snapshot, refetches the");
+    println!("                        published snapshot (else falls back to full index)");
     println!("    health-check        Query index status");
     println!("                        (Note: file watcher start/stop is MCP-only — see start_watch/stop_watch tools)");
     println!("    doctor              Diagnose and repair environment issues");
@@ -326,7 +333,7 @@ fn run_serve() -> Result<()> {
 const SUBCOMMANDS: &[&str] = &[
     "serve", "grep", "search", "ast-search", "callgraph", "impact",
     "show", "map", "overview", "deps", "trace", "similar", "refs",
-    "dead-code", "incremental-index", "rebuild-index", "health-check", "doctor",
+    "dead-code", "incremental-index", "rebuild-index", "reindex", "health-check", "doctor",
     "benchmark", "stats", "adopt", "unadopt", "snapshot",
     // MCP tool names accepted as aliases (see dispatch above). Listed here so
     // typo-suggester picks the closer alias for inputs like "project_mapp".
