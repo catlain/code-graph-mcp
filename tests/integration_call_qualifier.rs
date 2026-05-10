@@ -183,3 +183,31 @@ fn self_method_resolves_across_split_impl_blocks() {
         "Db::helper in db_b.rs should have Db::caller from db_a.rs, got: {:?}",
         helpers);
 }
+
+#[test]
+fn non_rust_callgraph_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // JS file with simple function call — must not be qualifier-filtered.
+    write(root, "src/util.js", r#"
+        function helper() {}
+        function caller() { helper(); }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let mut stmt = db.conn().prepare(
+        "SELECT COUNT(*) FROM edges e
+         JOIN nodes src ON src.id = e.source_id
+         JOIN nodes tgt ON tgt.id = e.target_id
+         WHERE e.relation = 'calls'
+           AND src.name = 'caller'
+           AND tgt.name = 'helper'"
+    ).unwrap();
+    let count: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1, "JS caller→helper edge must survive (no qualifier filtering for non-Rust)");
+}
