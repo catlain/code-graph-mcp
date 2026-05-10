@@ -298,6 +298,43 @@ pub(super) fn path_filter_candidates(
     Ok(kept)
 }
 
+/// Filter candidates to those whose `qualified_name` belongs to `impl_type`
+/// (i.e. is a method of the named type). Storage encodes this as `Type.method`
+/// with `.` separator (treesitter.rs qualified_name assignment).
+///
+/// Not file-restricted — Rust allows `impl Type {}` blocks to span multiple
+/// files (e.g. `impl Database` is split across 3+ files in this repo), so we
+/// match by `qualified_name LIKE 'Type.%'` across all files.
+#[allow(dead_code)] // consumed by index_files.rs Phase 2 dispatch
+pub(super) fn self_filter_candidates(
+    impl_type: &str,
+    candidates: &[i64],
+    db: &crate::storage::db::Database,
+) -> anyhow::Result<Vec<i64>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: String = std::iter::repeat_n("?", candidates.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id FROM nodes
+         WHERE id IN ({})
+           AND qualified_name LIKE ? || '.%'",
+        placeholders
+    );
+    let mut stmt = db.conn().prepare(&sql)?;
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = candidates
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    params.push(Box::new(impl_type.to_string()));
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
+    let kept: Vec<i64> = rows.filter_map(|r| r.ok()).collect();
+    Ok(kept)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

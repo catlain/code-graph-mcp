@@ -120,3 +120,37 @@ fn path_qualifier_picks_module_specific_candidate() {
     assert!(!bld.iter().any(|c| c.contains("caller")),
         "builder::create should NOT have caller (qualifier was snapshot), got: {:?}", bld);
 }
+
+#[test]
+fn self_method_within_impl_uses_correct_type() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    write(root, "src/db.rs", r#"
+        pub struct Db;
+        impl Db {
+            pub fn caller(&self) { self.helper(); }
+            pub fn helper(&self) {}
+        }
+    "#);
+    // Sibling type with same-named method — must NOT win.
+    write(root, "src/other.rs", r#"
+        pub struct Other;
+        impl Other {
+            pub fn helper(&self) {}
+        }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let db_helper = callers_of_in_file(&db, "helper", "src/db.rs");
+    let other_helper = callers_of_in_file(&db, "helper", "src/other.rs");
+
+    assert!(db_helper.iter().any(|c| c.contains("caller")),
+        "Db::helper should have Db::caller, got: {:?}", db_helper);
+    assert!(!other_helper.iter().any(|c| c.contains("caller")),
+        "Other::helper should NOT have Db::caller, got: {:?}", other_helper);
+}
