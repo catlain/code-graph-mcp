@@ -760,7 +760,14 @@ fn walk_for_relations(
     // become "Database.conn" if folded into current_class).
     let child_rust_impl: Option<String> = if language == "rust" && kind == "impl_item" {
         node.child_by_field_name("type")
-            .map(|t| node_text(&t, source).to_string())
+            .map(|t| {
+                let full = node_text(&t, source);
+                // Strip path prefix: `impl crate::db_a::Db` → "Db". Mirrors
+                // treesitter.rs's parent_class strip so SelfRecv payloads
+                // match qualified_name (which uses just the rightmost type
+                // segment).
+                full.rsplit("::").next().unwrap_or(full).to_string()
+            })
     } else {
         None
     };

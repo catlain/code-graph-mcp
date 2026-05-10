@@ -154,3 +154,32 @@ fn self_method_within_impl_uses_correct_type() {
     assert!(!other_helper.iter().any(|c| c.contains("caller")),
         "Other::helper should NOT have Db::caller, got: {:?}", other_helper);
 }
+
+#[test]
+fn self_method_resolves_across_split_impl_blocks() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // Db's caller is in db_a.rs; Db's helper is in db_b.rs (impl block split).
+    write(root, "src/db_a.rs", r#"
+        pub struct Db;
+        impl Db {
+            pub fn caller(&self) { self.helper(); }
+        }
+    "#);
+    write(root, "src/db_b.rs", r#"
+        impl crate::db_a::Db {
+            pub fn helper(&self) {}
+        }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let helpers = callers_of_in_file(&db, "helper", "src/db_b.rs");
+    assert!(helpers.iter().any(|c| c.contains("caller")),
+        "Db::helper in db_b.rs should have Db::caller from db_a.rs, got: {:?}",
+        helpers);
+}
