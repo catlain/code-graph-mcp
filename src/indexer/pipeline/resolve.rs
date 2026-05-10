@@ -16,6 +16,43 @@ use crate::storage::queries::{
 };
 use crate::domain::REL_CALLS;
 
+/// Decoded form of `edges.metadata` for REL_CALLS rows. See
+/// `docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md`
+/// §"Wire protocol" for the JSON shapes this parses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CalleeMeta {
+    Path(Vec<String>),
+    SelfType(String),
+    SelfRecv(String),
+    Receiver(String),
+    Chain,
+}
+
+/// Parse a `{"q":"...", "v":"..."}` JSON metadata blob. Returns None for
+/// metadata produced by other relations (routes, python imports), absent
+/// metadata, or unrecognized `q` values.
+pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
+    let raw = s?;
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let q = v.get("q")?.as_str()?;
+    match q {
+        "chain" => Some(CalleeMeta::Chain),
+        "path" => {
+            let payload = v.get("v")?.as_str()?;
+            let segments: Vec<String> = payload.split("::").map(String::from).collect();
+            if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
+                None
+            } else {
+                Some(CalleeMeta::Path(segments))
+            }
+        }
+        "self" => v.get("v")?.as_str().map(|t| CalleeMeta::SelfRecv(t.to_string())),
+        "stype" => v.get("v")?.as_str().map(|t| CalleeMeta::SelfType(t.to_string())),
+        "recv" => v.get("v")?.as_str().map(|r| CalleeMeta::Receiver(r.to_string())),
+        _ => None,
+    }
+}
+
 /// Disambiguate N same-language cross-file candidates for a single call/import
 /// target. Returns a subset. A single-element result is the authoritative
 /// winner; ties fall back to the full input so the caller does not
@@ -201,4 +238,148 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
     }
 
     Ok(edges_added)
+}
+
+/// Filter a candidate set down to those matching the Path qualifier:
+///   (1) file path contains "/seg1/seg2/" OR starts with "seg1/seg2/", OR
+///   (2) qualified_name contains the segment chain joined by `.` as a
+///       contiguous segment (anchored on `.` or boundary).
+///
+/// Storage uses `.` separator for qualified_name (treesitter.rs:582), NOT `::`.
+/// Returns the filtered subset; empty result is a meaningful signal
+/// (no project candidate matches → caller should drop the edge).
+pub(super) fn path_filter_candidates(
+    segments: &[String],
+    candidates: &[i64],
+    node_id_to_path: &std::collections::HashMap<i64, String>,
+    db: &crate::storage::db::Database,
+) -> anyhow::Result<Vec<i64>> {
+    if candidates.is_empty() || segments.is_empty() {
+        return Ok(candidates.to_vec());
+    }
+    let path_chain = segments.join("/");
+    let qn_chain = segments.join(".");
+
+    let placeholders: String = std::iter::repeat_n("?", candidates.len()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, COALESCE(qualified_name, '') FROM nodes WHERE id IN ({})",
+        placeholders
+    );
+    let mut stmt = db.conn().prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = candidates.iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut id_to_qn: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    for r in rows {
+        let (id, qn) = r?;
+        id_to_qn.insert(id, qn);
+    }
+
+    let kept: Vec<i64> = candidates.iter().copied().filter(|id| {
+        let path = node_id_to_path.get(id).map(String::as_str).unwrap_or("");
+        let qn = id_to_qn.get(id).map(String::as_str).unwrap_or("");
+
+        let path_match = path.contains(&format!("/{}/", path_chain))
+            || path.starts_with(&format!("{}/", path_chain));
+
+        let qn_match = qn == qn_chain
+            || qn.starts_with(&format!("{}.", qn_chain))
+            || qn.contains(&format!(".{}.", qn_chain))
+            || qn.ends_with(&format!(".{}", qn_chain));
+
+        path_match || qn_match
+    }).collect();
+    Ok(kept)
+}
+
+/// Filter candidates to those whose `qualified_name` belongs to `impl_type`
+/// (i.e. is a method of the named type). Storage encodes this as `Type.method`
+/// with `.` separator (treesitter.rs qualified_name assignment).
+///
+/// Not file-restricted — Rust allows `impl Type {}` blocks to span multiple
+/// files (e.g. `impl Database` is split across 3+ files in this repo), so we
+/// match by `qualified_name LIKE 'Type.%'` across all files.
+pub(super) fn self_filter_candidates(
+    impl_type: &str,
+    candidates: &[i64],
+    db: &crate::storage::db::Database,
+) -> anyhow::Result<Vec<i64>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: String = std::iter::repeat_n("?", candidates.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id FROM nodes
+         WHERE id IN ({})
+           AND qualified_name LIKE ? || '.%'",
+        placeholders
+    );
+    let mut stmt = db.conn().prepare(&sql)?;
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = candidates
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    params.push(Box::new(impl_type.to_string()));
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
+    let kept: Vec<i64> = rows.filter_map(|r| r.ok()).collect();
+    Ok(kept)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_metadata_bare_returns_none() {
+        assert!(parse_callee_metadata(None).is_none());
+    }
+
+    #[test]
+    fn parse_metadata_path() {
+        let m = parse_callee_metadata(Some(r#"{"q":"path","v":"snapshot"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::Path(ref segs) if segs == &["snapshot"]));
+    }
+
+    #[test]
+    fn parse_metadata_path_multi_segment() {
+        let m = parse_callee_metadata(Some(r#"{"q":"path","v":"a::b::c"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::Path(ref segs) if segs == &["a", "b", "c"]));
+    }
+
+    #[test]
+    fn parse_metadata_self_recv() {
+        let m = parse_callee_metadata(Some(r#"{"q":"self","v":"Db"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::SelfRecv(ref t) if t == "Db"));
+    }
+
+    #[test]
+    fn parse_metadata_self_type() {
+        let m = parse_callee_metadata(Some(r#"{"q":"stype","v":"Db"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::SelfType(ref t) if t == "Db"));
+    }
+
+    #[test]
+    fn parse_metadata_recv() {
+        let m = parse_callee_metadata(Some(r#"{"q":"recv","v":"path"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::Receiver(ref r) if r == "path"));
+    }
+
+    #[test]
+    fn parse_metadata_chain() {
+        let m = parse_callee_metadata(Some(r#"{"q":"chain"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::Chain));
+    }
+
+    #[test]
+    fn parse_metadata_routes_or_python_imports_returns_none() {
+        // Other relations also use metadata; resolver should skip non-call shapes.
+        assert!(parse_callee_metadata(Some(r#"{"method":"GET","path":"/api"}"#)).is_none());
+        assert!(parse_callee_metadata(Some(r#"{"python_module":"foo","is_module_import":false}"#)).is_none());
+    }
 }

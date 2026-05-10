@@ -33,10 +33,28 @@ mod routes;
 mod rust;
 mod dart;
 
+/// Serialize a CalleeQualifier into the wire-format JSON for `edges.metadata`.
+/// Bare → None (matches non-Rust callers and old DB rows).
+/// See spec §"Wire protocol" for the q/v key shapes.
+fn serialize_callee_qualifier(q: &helpers::CalleeQualifier) -> Option<String> {
+    use helpers::CalleeQualifier::*;
+    match q {
+        Bare => None,
+        Path(segments) => {
+            let v = segments.join("::");
+            Some(format!(r#"{{"q":"path","v":"{}"}}"#, v))
+        }
+        SelfType(t) => Some(format!(r#"{{"q":"stype","v":"{}"}}"#, t)),
+        SelfRecv(t) => Some(format!(r#"{{"q":"self","v":"{}"}}"#, t)),
+        Receiver(r) => Some(format!(r#"{{"q":"recv","v":"{}"}}"#, r)),
+        Chain => Some(r#"{"q":"chain"}"#.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
-use helpers::{extract_callee_name, extract_string_from_subtree, MAX_SUBTREE_DEPTH};
+use helpers::{extract_callee, extract_string_from_subtree, MAX_SUBTREE_DEPTH};
 use imports::{extract_import_names, extract_python_import_names, extract_python_from_import_names};
 use inherits::{extract_superclasses, extract_implements};
 use exports::extract_export_names;
@@ -65,7 +83,7 @@ pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelat
 pub fn extract_relations_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedRelation> {
     let mut relations = Vec::new();
     let config = LanguageConfig::for_language(language);
-    walk_for_relations(tree.root_node(), source, language, &config, None, None, &mut relations, 0);
+    walk_for_relations(tree.root_node(), source, language, &config, None, None, None, &mut relations, 0);
     // Stamp source_language on every relation. walk_for_relations constructs
     // ParsedRelation with source_language: String::new(), and we fill it in
     // here so every call site inside walk doesn't need to propagate language.
@@ -83,6 +101,7 @@ fn walk_for_relations(
     config: &LanguageConfig,
     current_scope: Option<&str>,
     current_class: Option<&str>,
+    current_rust_impl: Option<&str>,
     results: &mut Vec<ParsedRelation>,
     depth: usize,
 ) {
@@ -210,12 +229,32 @@ fn walk_for_relations(
                 None => None,
             };
             if let Some(scope) = call_scope {
-                if let Some(callee) = extract_callee_name(&node, source) {
+                if let Some((callee, mut qualifier)) = extract_callee(&node, source, language, current_rust_impl) {
+                    // Fill SelfRecv/SelfType payload from current impl context.
+                    // The helper emits these with empty payload because it
+                    // doesn't know the enclosing impl's type; we know it here.
+                    let needs_payload = matches!(&qualifier,
+                        helpers::CalleeQualifier::SelfRecv(t) | helpers::CalleeQualifier::SelfType(t) if t.is_empty()
+                    );
+                    if needs_payload {
+                        match &mut qualifier {
+                            helpers::CalleeQualifier::SelfRecv(t) | helpers::CalleeQualifier::SelfType(t) => {
+                                if let Some(impl_type) = current_rust_impl {
+                                    *t = impl_type.to_string();
+                                } else {
+                                    // self/Self called outside an impl block — drop qualifier (Bare).
+                                    qualifier = helpers::CalleeQualifier::Bare;
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    let metadata = serialize_callee_qualifier(&qualifier);
                     results.push(ParsedRelation {
                         source_name: scope,
                         target_name: callee,
                         relation: REL_CALLS.into(),
-                        metadata: None,
+                        metadata,
                         source_language: String::new(),
                     });
                 }
@@ -713,10 +752,31 @@ fn walk_for_relations(
     };
     let effective_class = child_class.as_deref().or(current_class);
 
+    // Compute child_rust_impl: when entering a Rust impl_item, capture the
+    // type name so nested call_expression arms can fill SelfRecv/SelfType
+    // payloads. NOT folded into current_class because that would change
+    // scope_name building and break source_id matching downstream
+    // (relations source_name="conn" matches pf.node_names "conn"; would
+    // become "Database.conn" if folded into current_class).
+    let child_rust_impl: Option<String> = if language == "rust" && kind == "impl_item" {
+        node.child_by_field_name("type")
+            .map(|t| {
+                let full = node_text(&t, source);
+                // Strip path prefix: `impl crate::db_a::Db` → "Db". Mirrors
+                // treesitter.rs's parent_class strip so SelfRecv payloads
+                // match qualified_name (which uses just the rightmost type
+                // segment).
+                full.rsplit("::").next().unwrap_or(full).to_string()
+            })
+    } else {
+        None
+    };
+    let effective_rust_impl = child_rust_impl.as_deref().or(current_rust_impl);
+
     // Recurse into children
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            walk_for_relations(child, source, language, config, active_scope, effective_class, results, depth + 1);
+            walk_for_relations(child, source, language, config, active_scope, effective_class, effective_rust_impl, results, depth + 1);
         }
     }
 }

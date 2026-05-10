@@ -446,6 +446,87 @@ pub(super) fn index_files(
                     }
                 }
 
+                // Bare-name call qualifier (Rust): inspect metadata to
+                // skip / restrict candidate set before the existing fallback
+                // chain. See spec
+                // docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md.
+                if rel.relation == REL_CALLS {
+                    use super::resolve::{parse_callee_metadata, path_filter_candidates, self_filter_candidates, CalleeMeta};
+                    match parse_callee_metadata(rel.metadata.as_deref()) {
+                        Some(CalleeMeta::Chain) | Some(CalleeMeta::Receiver(_)) => {
+                            // Receiver type not statically inferable; same-language
+                            // unique match is overwhelmingly false. Drop the edge
+                            // entirely (do not buffer in pending — re-scan won't help).
+                            continue;
+                        }
+                        Some(CalleeMeta::SelfRecv(impl_type)) | Some(CalleeMeta::SelfType(impl_type)) => {
+                            let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
+                            let same_lang: Vec<i64> = all
+                                .iter()
+                                .filter(|id| matches!(
+                                    node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                                    Some(l) if l == pf.language.as_str()
+                                ))
+                                .copied()
+                                .collect();
+                            let filtered = self_filter_candidates(&impl_type, &same_lang, db)?;
+                            if filtered.is_empty() {
+                                // No method on this impl type found in the project.
+                                // Drop without buffering — qualifier is fixed and a
+                                // re-scan will yield the same answer.
+                                continue;
+                            }
+                            for &src_id in &source_ids {
+                                for &tgt_id in &filtered {
+                                    if src_id != tgt_id
+                                        && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())?
+                                    {
+                                        total_edges_created += 1;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        Some(CalleeMeta::Path(segments)) => {
+                            let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
+                            let same_lang: Vec<i64> = all.iter()
+                                .filter(|id| matches!(
+                                    node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                                    Some(l) if l == pf.language.as_str()
+                                ))
+                                .filter(|id| !local_ids.contains(id))
+                                .copied()
+                                .collect();
+                            let filtered = path_filter_candidates(
+                                &segments,
+                                &same_lang,
+                                &node_id_to_path,
+                                db,
+                            )?;
+                            if filtered.is_empty() {
+                                // No project candidate matches the Path qualifier.
+                                // External crate (or unmatched module) — drop without buffering.
+                                continue;
+                            }
+                            let final_targets = if filtered.len() > 1 {
+                                refine_ambiguous_targets(&filtered, &pf.rel_path, &node_id_to_path)
+                            } else {
+                                filtered
+                            };
+                            for &src_id in &source_ids {
+                                for &tgt_id in &final_targets {
+                                    if src_id != tgt_id
+                                        && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                        total_edges_created += 1;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        _ => {} // None (Bare) or unrecognized q → falls through to default chain below.
+                    }
+                }
+
                 // Default resolution: global name-based lookup with language-aware layering.
                 // Tier order: same-file → same-language → (calls: drop) / (other: global).
                 // Dropping calls without a same-language match prevents Rust `hasher.update()`

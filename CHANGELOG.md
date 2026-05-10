@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.24.0 — Bare-name call qualifier (Rust)
+
+### Fixed
+- callgraph: Rust qualified calls (`Type::method`, `crate::path::fn`,
+  `self.method`, `Self::method`, builder chains like `OpenOptions::new().create()`)
+  no longer route to unrelated project functions sharing the rightmost name.
+  Eliminates phantom callers in `impact_analysis` and `find_dead_code` for
+  short-named functions (`new`/`create`/`open`/`from`).
+- parser: `impl crate::path::Type { ... }` impl-block type now strips the
+  leading path so qualified_name and SelfRecv payloads match (was producing
+  `crate::path::Type.method` qualified_names that broke same-type LIKE
+  matching).
+
+### Migration
+- Existing `.code-graph/` databases keep working (qualifier-aware resolution
+  is a no-op when `edges.metadata IS NULL`). Run `code-graph-mcp index --rebuild`
+  to populate qualifier metadata on existing Rust files; incremental indexing
+  picks it up automatically as files change.
+
+### Verification
+- `impact run_full_index`: 36 → 33 transitive callers; the 3 documented
+  phantoms (decompress_with_cap, try_acquire_index_lock, from_project_root)
+  no longer appear.
+- routing_bench P@1: 22/22 (no regression).
+- 558 tests pass with default + `--no-default-features`. Clippy clean with
+  `--all-features`.
+
 ## v0.23.1 — snapshot UX + FTS garbage-query guard
 
 Follow-up enhancements to v0.23.0 snapshot work plus an unrelated

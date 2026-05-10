@@ -424,7 +424,14 @@ fn extract_nodes(
         }
         "impl_item" => {
             if let Some(type_node) = node.child_by_field_name("type") {
-                let impl_name = node_text(&type_node, source);
+                let impl_name_full = node_text(&type_node, source);
+                // Strip path prefix so `impl crate::db_a::Db` is captured as
+                // "Db" (matching what callers use as `Self`/`self` payload).
+                // Mirrors the strip in relations/mod.rs walk_for_relations
+                // for impl_item — keeps qualified_name consistent across the
+                // two parser walks (treesitter.rs builds nodes; relations/mod.rs
+                // builds edges).
+                let impl_name = impl_name_full.rsplit("::").next().unwrap_or(impl_name_full);
                 extract_children(node, source, language, config, Some(impl_name), results, depth, node_is_test);
                 return;
             }

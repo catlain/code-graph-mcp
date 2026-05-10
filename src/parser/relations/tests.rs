@@ -1136,3 +1136,191 @@ fn test_extract_csharp_inheritance() {
     assert!(implements.contains(&"ICloneable"),
         "C#: missing ICloneable (IMPLEMENTS), got: {:?}", implements);
 }
+
+#[test]
+fn test_rust_callee_path_qualifier_strips_crate() {
+    let code = "fn caller() { crate::snapshot::create(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "create")
+        .expect("missing call to create");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"snapshot"}"#),
+        "metadata should encode Path qualifier with crate stripped"
+    );
+}
+
+// T3: single-segment Type::method path
+#[test]
+fn test_rust_callee_type_method_call_path() {
+    let code = r#"fn caller() { File::create("/tmp/x"); }"#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "create")
+        .expect("missing call to create");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"File"}"#),
+        "single-segment Path with non-reserved name should be preserved"
+    );
+}
+
+// T4: reserved-only path collapses to bare
+#[test]
+fn test_rust_callee_crate_only_path_collapses_to_bare() {
+    let code = "fn caller() { crate::foo(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "foo")
+        .expect("missing call to foo");
+    assert_eq!(
+        call.metadata, None,
+        "crate::foo() qualifier collapses to Bare after stripping reserved prefix"
+    );
+}
+
+// T5: super:: strip, multi-segment, chained reserved prefixes
+#[test]
+fn test_rust_callee_super_prefix_stripped() {
+    // super:: must be stripped per reserved-prefix rule.
+    let code = "fn caller() { super::sibling::foo(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "foo")
+        .expect("missing call to foo");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"sibling"}"#),
+    );
+}
+
+#[test]
+fn test_rust_callee_multi_segment_path_preserved() {
+    let code = "fn caller() { crate::a::b::c::deep(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "deep")
+        .expect("missing call to deep");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"a::b::c"}"#),
+    );
+}
+
+#[test]
+fn test_rust_callee_chained_reserved_prefixes_stripped() {
+    // Multiple consecutive reserved prefixes: ensure drain(..skip) consumes
+    // ALL leading reserved segments, not just the first.
+    let code = "fn caller() { super::super::foo(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "foo")
+        .expect("missing call to foo");
+    assert_eq!(
+        call.metadata, None,
+        "two consecutive `super::` segments + bare name → fully stripped → Bare"
+    );
+}
+
+#[test]
+fn test_rust_callee_obj_method_receiver_qualifier() {
+    let code = "fn caller(p: &std::path::Path) { p.exists(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "exists")
+        .expect("missing call to exists");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"recv","v":"p"}"#),
+        "obj.method() where obj is a plain identifier emits Receiver qualifier"
+    );
+}
+
+#[test]
+fn test_rust_callee_builder_chain_qualifier() {
+    let code = r#"fn caller() {
+        OpenOptions::new().create(true).open("/tmp/x");
+    }"#;
+    let relations = extract_relations(code, "rust").unwrap();
+
+    // OpenOptions::new() → Path
+    let new_call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "new")
+        .expect("missing call to new");
+    assert_eq!(
+        new_call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"OpenOptions"}"#),
+    );
+
+    // .create(true) — receiver is call_expression → Chain
+    let create_call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "create")
+        .expect("missing call to create");
+    assert_eq!(
+        create_call.metadata.as_deref(),
+        Some(r#"{"q":"chain"}"#),
+    );
+
+    // .open(...) — receiver is also call_expression → Chain
+    let open_call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "open")
+        .expect("missing call to open");
+    assert_eq!(
+        open_call.metadata.as_deref(),
+        Some(r#"{"q":"chain"}"#),
+    );
+}
+
+#[test]
+fn test_rust_callee_self_recv_within_impl() {
+    let code = r#"
+        struct Db;
+        impl Db {
+            fn caller(&self) { self.helper(); }
+            fn helper(&self) {}
+        }
+    "#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "helper")
+        .expect("missing call to helper");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"self","v":"Db"}"#),
+        "self.method() inside impl Db emits SelfRecv with type name"
+    );
+}
+
+#[test]
+fn test_rust_callee_self_type_within_impl() {
+    let code = r#"
+        struct Db;
+        impl Db {
+            fn make() -> Self { Self::default() }
+        }
+        impl Default for Db { fn default() -> Self { Db } }
+    "#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "default" && r.source_name.contains("make"))
+        .expect("missing call to default from make");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"stype","v":"Db"}"#),
+        "Self::method() inside impl Db emits SelfType with type name"
+    );
+}
+
+#[test]
+fn test_non_rust_callee_metadata_unchanged() {
+    let code = "function caller() { foo.bar(); baz(); }";
+    let relations = extract_relations(code, "javascript").unwrap();
+    for r in relations.iter().filter(|r| r.relation == REL_CALLS) {
+        assert_eq!(
+            r.metadata, None,
+            "non-Rust REL_CALLS relations must keep metadata=None (regression guard for {})",
+            r.target_name
+        );
+    }
+}
