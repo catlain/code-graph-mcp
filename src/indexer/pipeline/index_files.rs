@@ -523,7 +523,7 @@ pub(super) fn index_files(
                             }
                             continue;
                         }
-                        _ => {} // SelfRecv / SelfType / Bare handled below or in T16.
+                        _ => {} // None (Bare) or unrecognized q → falls through to default chain below.
                     }
                 }
 

@@ -57,7 +57,6 @@ pub(super) fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Opt
 /// disambiguation in the edge resolver. See
 /// `docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // variants used in subsequent tasks (T2–T18)
 pub(crate) enum CalleeQualifier {
     /// `foo()` — no qualifier (also: any non-Rust language)
     Bare,

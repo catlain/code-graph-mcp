@@ -19,7 +19,6 @@ use crate::domain::REL_CALLS;
 /// Decoded form of `edges.metadata` for REL_CALLS rows. See
 /// `docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md`
 /// §"Wire protocol" for the JSON shapes this parses.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CalleeMeta {
     Path(Vec<String>),
@@ -32,7 +31,6 @@ pub(super) enum CalleeMeta {
 /// Parse a `{"q":"...", "v":"..."}` JSON metadata blob. Returns None for
 /// metadata produced by other relations (routes, python imports), absent
 /// metadata, or unrecognized `q` values.
-#[allow(dead_code)]
 pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
     let raw = s?;
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
@@ -250,7 +248,6 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
 /// Storage uses `.` separator for qualified_name (treesitter.rs:582), NOT `::`.
 /// Returns the filtered subset; empty result is a meaningful signal
 /// (no project candidate matches → caller should drop the edge).
-#[allow(dead_code)] // consumed by index_files.rs Phase 2 dispatch
 pub(super) fn path_filter_candidates(
     segments: &[String],
     candidates: &[i64],
@@ -305,7 +302,6 @@ pub(super) fn path_filter_candidates(
 /// Not file-restricted — Rust allows `impl Type {}` blocks to span multiple
 /// files (e.g. `impl Database` is split across 3+ files in this repo), so we
 /// match by `qualified_name LIKE 'Type.%'` across all files.
-#[allow(dead_code)] // consumed by index_files.rs Phase 2 dispatch
 pub(super) fn self_filter_candidates(
     impl_type: &str,
     candidates: &[i64],
