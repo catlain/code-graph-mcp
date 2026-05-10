@@ -18,7 +18,14 @@ pub fn resolve_snapshot_source(root: &Path) -> Option<String> {
         if url.starts_with("https://") {
             return Some(url);
         }
-        tracing::warn!("snapshot url in .code-graph.toml is not https, skipping: {url}");
+        // tracing::warn! is not visible in CLI/MCP startup paths (no subscriber),
+        // so users would otherwise just see "No snapshot source resolved" and
+        // have no idea their TOML override was rejected. Print to stderr too.
+        let msg = format!(
+            "warning: .code-graph.toml [snapshot] url must start with https:// (got '{url}'), ignoring"
+        );
+        tracing::warn!("{msg}");
+        eprintln!("{msg}");
         return None;
     }
     resolve_from_github(root)

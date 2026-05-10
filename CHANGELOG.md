@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.23.1 — snapshot UX + FTS garbage-query guard
+
+Follow-up enhancements to v0.23.0 snapshot work plus an unrelated
+search-quality fix.
+
+`snapshot create --out <path>` now auto-zstd-compresses when `<path>`
+ends in `.db.zst` (level 9, matching the producer workflow template).
+Raw `.db` output unchanged — the existing two-step `--out foo.db &&
+zstd -9 foo.db` flow still works.
+
+`snapshot inspect <file>` now accepts both `.db` and `.db.zst` (format
+detected from magic bytes, not extension), so first-time users who run
+`snapshot create --out foo.db && snapshot inspect foo.db` get sensible
+output instead of zstd's cryptic "Unknown frame descriptor". Garbage or
+wrong-format files now produce: "X is not a code-graph snapshot —
+expected zstd-compressed (.db.zst) or raw SQLite (.db)". `snapshot
+inspect <typo>` also surfaces the file path in the error chain instead
+of bare "No such file or directory (os error 2)".
+
+Non-https `[snapshot] url` in `.code-graph.toml` now writes to stderr in
+addition to `tracing::warn!`, so users see the rejection on CLI startup
+paths that don't install a tracing subscriber.
+
+`fts5_search` no longer OR-fallbacks when the user's single-word query
+has zero AND-mode hits AND the original token doesn't appear anywhere
+in the FTS index. This was returning noise via camelCase token splits —
+a query like `ZzzzNoMatchXyzzz` matched any code containing the literal
+`--no-default-features` (split on `-`) or the Rust `match` keyword.
+Acronyms like `RRF` are unaffected: the original token *is* indexed, so
+OR-fallback runs as before for legitimate recall expansion. Multi-word
+queries are unchanged.
+
 ## v0.23.0 — shared graph snapshot
 
 Team-shared graph artifact via GitHub Releases. New CLI subcommands

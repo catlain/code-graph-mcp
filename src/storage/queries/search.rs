@@ -93,6 +93,44 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
             let (nodes, bm25_scores): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
             return Ok(FtsResult { nodes, bm25_scores, or_fallback: false });
         }
+
+        // Garbage-query guard: when the user typed a single word, AND found
+        // nothing, AND that word doesn't appear as a token anywhere in the
+        // index, OR-fallback would just match camelCase fragments — Rust's
+        // `match` keyword, `--no-default-features`, etc. — turning a typo or
+        // bogus identifier into noise. Acronym queries like "RRF" still get
+        // OR-fallback because RRF *is* in the index (so OR widens a known-good
+        // search). Multi-word queries always get OR-fallback (user explicitly
+        // listed terms; widening is the documented recall behavior).
+        if pairs.is_empty() {
+            let original_word_count = query
+                .split_whitespace()
+                .filter(|w| !FTS_STOP_WORDS.contains(&w.to_lowercase().as_str()))
+                .count();
+            if original_word_count <= 1 {
+                let sanitized_original: String = query
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if sanitized_original.len() >= 2 {
+                    let probe_sql = format!(
+                        "SELECT 1 FROM nodes_fts fts JOIN nodes n ON n.id = fts.rowid \
+                         WHERE nodes_fts MATCH ?1{} LIMIT 1",
+                        test_filter
+                    );
+                    let mut probe = conn.prepare(&probe_sql)?;
+                    let exists: bool =
+                        probe.exists(rusqlite::params![sanitized_original])?;
+                    if !exists {
+                        return Ok(FtsResult {
+                            nodes: vec![],
+                            bm25_scores: vec![],
+                            or_fallback: false,
+                        });
+                    }
+                }
+            }
+        }
         // Fallback: OR gives broader recall
     }
 
@@ -344,6 +382,91 @@ mod tests {
         assert!(!fts.or_fallback, "4 AND results >= threshold 3, should NOT fall back to OR");
         // All 4 handler nodes match both terms
         assert_eq!(fts.nodes.len(), 4);
+    }
+
+    #[test]
+    fn test_fts5_single_word_garbage_does_not_or_fallback() {
+        // Regression: split_identifier("ZzzzNoMatchXyzzz") yields tokens
+        // ["Match", "No", "Xyzzz", "Zzzz", "ZzzzNoMatchXyzzz"]. Real code often
+        // contains "match" or "no" as standalone tokens (e.g. Rust `match`
+        // keyword, `--no-default-features` flag). Without guarding, the OR
+        // fallback turns a clearly-non-existent identifier into a wall of
+        // unrelated hits — actively misleading the user.
+        let (db, _tmp) = test_db();
+        let fid = upsert_file(db.conn(), &FileRecord {
+            path: "t.rs".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        // A real node whose name_tokens include the bare word "Match" — would
+        // be reached by OR fallback if the guard were missing.
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "tryMatchSomething".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "fn tryMatchSomething() {}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: Some("try Match Something tryMatchSomething".into()),
+            return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        // And another with the bare token "No" in code_content.
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "buildScript".into(),
+            qualified_name: None, start_line: 10, end_line: 14,
+            code_content: "fn buildScript() { run(\"--no-default-features\"); }".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: Some("build Script buildScript".into()),
+            return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let result = fts5_search(db.conn(), "ZzzzNoMatchXyzzz", 20).unwrap();
+        assert!(
+            result.nodes.is_empty(),
+            "single-word garbage query must not OR-fallback to camelCase noise; got {:?}",
+            result.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_fts5_single_word_real_identifier_still_matches() {
+        // Verify the garbage-query guard doesn't suppress real single-word
+        // matches whose camelCase parts happen to AND-fail.
+        let (db, _tmp) = test_db();
+        let fid = upsert_file(db.conn(), &FileRecord {
+            path: "t.rs".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "validateToken".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "fn validateToken() {}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: Some("validate Token validateToken".into()),
+            return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let result = fts5_search(db.conn(), "validateToken", 10).unwrap();
+        assert!(!result.nodes.is_empty(), "real identifier must still match");
+        assert_eq!(result.nodes[0].name, "validateToken");
+    }
+
+    #[test]
+    fn test_fts5_multiword_garbage_still_or_fallbacks() {
+        // OR fallback for multi-word queries is unchanged — the user explicitly
+        // listed terms, and OR-widening is the documented recall behavior.
+        let (db, _tmp) = test_db();
+        let fid = upsert_file(db.conn(), &FileRecord {
+            path: "t.rs".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "doMatchOnly".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "fn doMatchOnly() {}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: Some("do Match Only doMatchOnly".into()),
+            return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // Multi-word with one-real-one-fake — AND fails, OR finds the Match-only node.
+        let result = fts5_search(db.conn(), "Match XyzNotReal", 10).unwrap();
+        assert!(!result.nodes.is_empty(), "multi-word query keeps OR-fallback");
+        assert!(result.or_fallback, "expected or_fallback flag to be true");
     }
 
     #[test]

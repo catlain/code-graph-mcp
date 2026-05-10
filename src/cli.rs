@@ -3055,7 +3055,8 @@ pub fn cmd_snapshot_create(project_root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `snapshot inspect <file.db.zst>` — JSON output to stdout
+/// `snapshot inspect <file>` — JSON output to stdout. Accepts `.db` or `.db.zst`
+/// (format detected from magic bytes, not extension).
 pub fn cmd_snapshot_inspect(args: &[String]) -> Result<()> {
     // get_positional skips args[0] (binary) and args[1] (subcommand) internally;
     // for `snapshot inspect <file>` the dispatch happens at args[1]="snapshot",
@@ -3065,7 +3066,7 @@ pub fn cmd_snapshot_inspect(args: &[String]) -> Result<()> {
     // reading args[3] directly (binary=0, "snapshot"=1, "inspect"=2, file=3).
     let file = args
         .get(3)
-        .ok_or_else(|| anyhow::anyhow!("snapshot inspect <file.db.zst> required"))?;
+        .ok_or_else(|| anyhow::anyhow!("snapshot inspect <file> required (.db or .db.zst)"))?;
     let meta = crate::snapshot::inspect(std::path::Path::new(file))?;
     println!("{}", serde_json::to_string_pretty(&meta)?);
     Ok(())

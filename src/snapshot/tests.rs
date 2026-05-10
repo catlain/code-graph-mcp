@@ -270,3 +270,65 @@ fn resolve_rejects_http_url_from_toml() {
     ).unwrap();
     assert_eq!(resolve_snapshot_source(dir.path()), None);
 }
+
+#[test]
+fn inspect_accepts_raw_db_when_no_zstd_magic() {
+    // First-time users often run `snapshot create --out foo.db` then
+    // `snapshot inspect foo.db` (forgot the zstd step). Cryptic
+    // "Unknown frame descriptor" used to greet them; now it just works.
+    let fixture = init_git_fixture();
+    let raw_db = fixture.path().join("snapshot.db");
+    crate::snapshot::create(fixture.path(), &raw_db, false).unwrap();
+    assert!(raw_db.exists());
+
+    let meta = crate::snapshot::inspect(&raw_db).unwrap();
+    assert_eq!(meta.tool_version, env!("CARGO_PKG_VERSION"));
+    assert!(meta.schema_version > 0);
+    assert!(meta.created_at > 0);
+    assert!(!meta.includes_vec);
+}
+
+#[test]
+fn inspect_rejects_garbage_with_clear_error() {
+    let dir = TempDir::new().unwrap();
+    let bad = dir.path().join("garbage.db.zst");
+    std::fs::write(&bad, b"definitely not zstd or sqlite").unwrap();
+    let err = crate::snapshot::inspect(&bad).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not a code-graph snapshot")
+            && msg.contains(".db.zst")
+            && msg.contains(".db"),
+        "expected helpful error, got: {msg}"
+    );
+}
+
+#[test]
+fn create_auto_compresses_when_out_endswith_db_zst() {
+    // Help text promises `--out foo.db.zst` produces a shareable .db.zst.
+    // Verify we actually zstd-encode rather than silently writing raw SQLite.
+    let fixture = init_git_fixture();
+    let zst_out = fixture.path().join("snap.db.zst");
+    crate::snapshot::create(fixture.path(), &zst_out, false).unwrap();
+
+    // First 4 bytes must be the zstd magic.
+    let head: Vec<u8> = std::fs::read(&zst_out).unwrap().into_iter().take(4).collect();
+    assert_eq!(head, vec![0x28, 0xB5, 0x2F, 0xFD], "expected zstd magic, got {head:?}");
+
+    // Round-trip through inspect on the .db.zst itself.
+    let meta = crate::snapshot::inspect(&zst_out).unwrap();
+    assert_eq!(meta.tool_version, env!("CARGO_PKG_VERSION"));
+    assert!(meta.schema_version > 0);
+}
+
+#[test]
+fn create_writes_raw_db_when_out_endswith_db() {
+    // Producer workflow uses `--out snapshot.db` then a separate `zstd -9`
+    // step — this path must remain raw to keep that contract.
+    let fixture = init_git_fixture();
+    let db_out = fixture.path().join("snap.db");
+    crate::snapshot::create(fixture.path(), &db_out, false).unwrap();
+
+    let head: Vec<u8> = std::fs::read(&db_out).unwrap().into_iter().take(16).collect();
+    assert_eq!(&head[..], b"SQLite format 3\0", "expected raw SQLite header");
+}

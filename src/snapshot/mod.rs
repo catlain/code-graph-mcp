@@ -16,8 +16,11 @@ use std::path::Path;
 
 /// Build a snapshot at `out` by running a full index in a temp dir, dropping
 /// the vec table, vacuuming, writing meta keys, then VACUUM INTO the output
-/// path.  The caller is responsible for compression (the workflow template
-/// uses `zstd -9`).
+/// path.
+///
+/// When `out` ends in `.db.zst`, the result is zstd-compressed (level 9, to
+/// match the producer workflow template). For any other extension the raw
+/// SQLite file is written, and the caller is responsible for compression.
 pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
     use crate::indexer::pipeline::run_full_index;
     use crate::storage::db::Database;
@@ -78,27 +81,60 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
         conn.execute_batch("PRAGMA journal_mode = DELETE;")?;
     } // `db` (and its Connection) dropped here — file fully flushed.
 
-    // VACUUM INTO writes a compacted copy to `out`; destination must not exist.
+    // VACUUM INTO writes a compacted copy; destination must not exist.
+    let compress_output = out.to_string_lossy().ends_with(".db.zst");
+    let vacuum_target: std::path::PathBuf = if compress_output {
+        tmp.path().join("compacted.db")
+    } else {
+        out.to_path_buf()
+    };
+
     let conn = rusqlite::Connection::open(&staging_db)?;
-    let out_str = out.to_string_lossy().replace('\'', "''");
-    conn.execute_batch(&format!("VACUUM INTO '{out_str}';"))
-        .with_context(|| format!("VACUUM INTO '{}'", out.display()))?;
+    let target_str = vacuum_target.to_string_lossy().replace('\'', "''");
+    conn.execute_batch(&format!("VACUUM INTO '{target_str}';"))
+        .with_context(|| format!("VACUUM INTO '{}'", vacuum_target.display()))?;
+
+    if compress_output {
+        let raw = std::fs::read(&vacuum_target).context("read compacted db")?;
+        let compressed = zstd::encode_all(&raw[..], 9).context("zstd encode snapshot")?;
+        std::fs::write(out, compressed).context("write compressed snapshot")?;
+    }
 
     Ok(())
 }
 
-/// Open a `.db.zst` file, decompress to a temp file, read meta, and return.
+/// Open a snapshot file and read its meta. Accepts both zstd-compressed
+/// (`.db.zst`, what producers/consumers exchange) and raw SQLite (`.db`,
+/// the direct output of [`create`] before zstd compression). The format is
+/// detected from the file's magic bytes, not the extension.
 pub fn inspect(file: &Path) -> Result<SnapshotMeta> {
     use crate::storage::db::Database;
 
-    let file_size_bytes = std::fs::metadata(file)?.len();
+    // First-call site for the user's path. Without context the user-facing
+    // error is just "No such file or directory (os error 2)" with no path —
+    // typo at the CLI gives a useless error.
+    let file_size_bytes = std::fs::metadata(file)
+        .with_context(|| format!("stat snapshot file '{}'", file.display()))?
+        .len();
 
-    // Decompress to a temp file so we can open with rusqlite
+    let raw_bytes = std::fs::read(file)
+        .with_context(|| format!("read snapshot file '{}'", file.display()))?;
+
+    // zstd magic = 0x28 0xB5 0x2F 0xFD; SQLite = "SQLite format 3\0".
+    let db_bytes = if raw_bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        zstd::decode_all(&raw_bytes[..]).context("zstd decode")?
+    } else if raw_bytes.starts_with(b"SQLite format 3\0") {
+        raw_bytes
+    } else {
+        anyhow::bail!(
+            "{} is not a code-graph snapshot — expected zstd-compressed (.db.zst) or raw SQLite (.db)",
+            file.display()
+        );
+    };
+
     let tmp = tempfile::tempdir().context("inspect tempdir")?;
     let decompressed = tmp.path().join("snapshot.db");
-    let compressed = std::fs::read(file).context("read snapshot file")?;
-    let raw = zstd::decode_all(&compressed[..]).context("zstd decode")?;
-    std::fs::write(&decompressed, &raw).context("write decompressed snapshot")?;
+    std::fs::write(&decompressed, &db_bytes).context("write snapshot for inspect")?;
 
     let db = Database::open(&decompressed)?;
     let conn = db.conn();

@@ -148,7 +148,8 @@ fn main() -> Result<()> {
                 _ => {
                     eprintln!("Usage:");
                     eprintln!("  snapshot create --out <path> [--include-embeddings] [--root <dir>] [--quiet]");
-                    eprintln!("  snapshot inspect <file.db.zst>");
+                    eprintln!("                  (auto-zstd when --out ends in .db.zst)");
+                    eprintln!("  snapshot inspect <file>          (accepts .db or .db.zst)");
                     std::process::exit(2);
                 }
             }
@@ -204,9 +205,10 @@ fn print_help() {
     println!("    adopt               Install plugin_code_graph_mcp.md memory + MEMORY.md sentinel");
     println!("    unadopt             Remove the memory file + sentinel block");
     println!("    snapshot create --out <path> [--include-embeddings] [--root <dir>] [--quiet]");
-    println!("                        Build a portable graph snapshot (.db.zst) for sharing");
-    println!("    snapshot inspect <file.db.zst>");
-    println!("                        Print snapshot metadata as JSON\n");
+    println!("                        Build a portable graph snapshot. Auto zstd-compresses");
+    println!("                        when --out ends in .db.zst; otherwise writes raw .db");
+    println!("    snapshot inspect <file>");
+    println!("                        Print snapshot metadata as JSON (accepts .db or .db.zst)\n");
     println!("OPTIONS:");
     println!("    --json              JSON output (available on all commands)");
     println!("    --compact           Compact output (search, callgraph, map, overview, deps, refs)");
