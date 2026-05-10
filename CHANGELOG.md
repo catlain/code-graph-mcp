@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.22.2 — index.db sub-header size guard
+
+Defensive hardening for `Database::open` recovery. The existing
+`is_corruption_error` retry branch covers files that error on open, but a
+main DB file shorter than the SQLite header (100 bytes) can land in
+SQLite-version-dependent territory — sometimes treated as fresh, sometimes
+silently combined with stale `.wal/.shm` residue from a prior crashed
+indexing pass.
+
+The new `sub_header_size_guard` runs at the top of `open_impl` and wipes
+the entire main+wal+shm triple whenever the main file exists but is < 100
+bytes, so every recovery path starts from the same blank state.
+
+### Why now
+
+Round 2 of the v0.22.x dogfood loop surfaced `health-check` exit codes that
+varied across repeated runs against an interrupted indexing state. The
+existing recovery branch was deterministic-by-luck — relying on a
+particular SQLite version's tolerance for sub-header files. The guard
+makes recovery deterministic-by-design.
+
+### Tests
+
+Four new unit tests in `src/storage/db.rs::tests` document the safety
+contract: 0-byte main alone, 0-byte main + stale wal/shm, partial-write
+under header size, and the regression guard for valid databases. Full
+suite: 303 lib + 198 integration = 501 passed, 0 failed.
+
+### Also in this release
+
+- `fix(cli): preserve user --depth in callgraph requested_max_depth`
+  (`73cd954`) — CLI no longer clamps `--depth` before passing to the engine;
+  the engine's own `CALL_GRAPH_MAX_DEPTH` cap and the `requested_max_depth`
+  / `effective_max_depth` envelope fields surface truncation truthfully.
+
 ## v0.22.1 — dogfood loop fixes (test/prod boundary + truncation bias)
 
 Five bug fixes from a 5-round structured dogfood pass. All fixes converge on

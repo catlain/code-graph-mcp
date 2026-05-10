@@ -74,6 +74,17 @@ impl Database {
     }
 
     fn open_impl(path: &Path, enable_vec: bool) -> Result<Self> {
+        // Proactive sub-header size guard: any pre-existing main file smaller
+        // than the 100-byte SQLite database header cannot be a valid database.
+        // Without this, post-crash residue (0-byte main + stale .wal/.shm,
+        // partial-write truncated mid-page) lands in SQLite-version-dependent
+        // territory — sometimes Connection::open silently treats the file as
+        // fresh, sometimes wal frames are replayed against the empty main,
+        // sometimes is_corruption_error fires. The guard collapses every
+        // sub-header state to one canonical recovery path: wipe the whole
+        // triple (main + wal + shm) so the retry starts blank.
+        Self::sub_header_size_guard(path);
+
         match Self::open_impl_inner(path, enable_vec) {
             Ok(db) => Ok(db),
             Err(e) if Self::is_corruption_error(&e) && path.exists() => {
@@ -92,6 +103,31 @@ impl Database {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Wipe an existing main DB file plus any sibling .wal/.shm if the main
+    /// file is shorter than the SQLite header (100 bytes). No-op when the
+    /// main file is absent (fresh install) or already a proper size.
+    fn sub_header_size_guard(path: &Path) {
+        // 100 bytes = SQLite database header per the on-disk format spec.
+        // https://www.sqlite.org/fileformat.html#magic_header_string
+        const SQLITE_HEADER_SIZE: u64 = 100;
+        let size = match std::fs::metadata(path) {
+            Ok(m) if m.is_file() => m.len(),
+            _ => return,
+        };
+        if size >= SQLITE_HEADER_SIZE {
+            return;
+        }
+        tracing::warn!(
+            "[db] index.db is {} bytes (< {} SQLite header); wiping main+wal+shm for clean recovery",
+            size, SQLITE_HEADER_SIZE
+        );
+        std::fs::remove_file(path).ok();
+        let wal_path = path.with_extension("db-wal");
+        let shm_path = path.with_extension("db-shm");
+        if wal_path.exists() { std::fs::remove_file(&wal_path).ok(); }
+        if shm_path.exists() { std::fs::remove_file(&shm_path).ok(); }
     }
 
     fn open_impl_inner(path: &Path, enable_vec: bool) -> Result<Self> {
@@ -709,6 +745,144 @@ mod tests {
         let bad_path = Path::new("/nonexistent_dir_xyz/impossible/index.db");
         let result = Database::open(bad_path);
         assert!(result.is_err(), "Non-corruption errors should still propagate");
+    }
+
+    // ============================================================
+    // Sub-header corrupt-state matrix (size guard).
+    //
+    // SQLite's on-disk format starts with a 100-byte database header. Any
+    // pre-existing file smaller than that cannot be a valid database. Without
+    // a proactive guard, post-crash residue (0-byte main + stale .wal/.shm,
+    // partial-write main, etc.) lands the open path in SQLite-version-
+    // dependent territory: sometimes Connection::open silently treats the
+    // file as fresh, sometimes the WAL frames are replayed against the empty
+    // main, sometimes an error surfaces and triggers the existing
+    // is_corruption_error recovery branch. This non-determinism produced the
+    // user-observed "first run exit=1, second run exit=0" flakiness.
+    //
+    // The size guard wipes main + wal + shm proactively whenever main exists
+    // but is < 100 bytes, so every recovery path starts from the same blank
+    // state and the resulting DB is always a fresh, well-formed schema.
+    // ============================================================
+
+    #[test]
+    fn test_zero_byte_main_with_stale_wal_shm_recovers_clean() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let wal_path = db_path.with_extension("db-wal");
+        let shm_path = db_path.with_extension("db-shm");
+
+        // Post-crash residue: main truncated to 0 bytes, but stale wal/shm
+        // bytes from a prior process remain. Without the size guard, SQLite
+        // may either ignore or partially apply the wal — non-deterministic.
+        std::fs::write(&db_path, b"").unwrap();
+        std::fs::write(&wal_path, b"STALE_WAL_SENTINEL_FROM_PRIOR_PROCESS").unwrap();
+        std::fs::write(&shm_path, b"STALE_SHM_SENTINEL").unwrap();
+
+        let db = Database::open(&db_path).unwrap();
+
+        // Fresh schema must be in place.
+        let tables: Vec<String> = db.conn()
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.contains(&"files".to_string()), "expected 'files' after recovery");
+        assert!(tables.contains(&"nodes".to_string()), "expected 'nodes' after recovery");
+
+        // Stale wal/shm bytes must NOT survive — otherwise the next open
+        // could replay them against the freshly-recreated main.
+        if wal_path.exists() {
+            let content = std::fs::read(&wal_path).unwrap();
+            assert!(
+                !content.starts_with(b"STALE_WAL_SENTINEL"),
+                "stale WAL sentinel must be wiped; first 40 bytes: {:?}",
+                &content[..content.len().min(40)]
+            );
+        }
+        if shm_path.exists() {
+            let content = std::fs::read(&shm_path).unwrap();
+            assert!(
+                !content.starts_with(b"STALE_SHM_SENTINEL"),
+                "stale SHM sentinel must be wiped"
+            );
+        }
+
+        // Main must now be a real DB (header + at least one page).
+        let main_size = std::fs::metadata(&db_path).unwrap().len();
+        assert!(
+            main_size >= 100,
+            "recovered main DB should be >= 100 bytes (SQLite header), got {}",
+            main_size
+        );
+    }
+
+    #[test]
+    fn test_zero_byte_main_alone_recovers_clean() {
+        // Even without stale wal/shm, a 0-byte main file is a corrupt-state
+        // signal (some prior write was interrupted before SQLite committed
+        // its header). The size guard normalises the recovery path so the
+        // resulting DB is always a fresh schema, never a 0-byte file that a
+        // later open would have to re-handle.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        std::fs::write(&db_path, b"").unwrap();
+
+        let db = Database::open(&db_path).unwrap();
+        let row_count: i64 = db.conn()
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(row_count, 0, "recovered DB must be empty (no carryover)");
+        let main_size = std::fs::metadata(&db_path).unwrap().len();
+        assert!(main_size >= 100, "main DB must be >= header size, got {}", main_size);
+    }
+
+    #[test]
+    fn test_partial_write_under_header_size_recovers() {
+        // 50 bytes is below the 100-byte SQLite header — structurally
+        // invalid regardless of the magic-string prefix. Without the size
+        // guard this either errors via is_corruption_error (newer SQLite)
+        // or silently lands in undefined territory (older SQLite).
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let mut partial = b"SQLite format 3\0".to_vec();
+        partial.extend_from_slice(&[0u8; 34]);
+        assert_eq!(partial.len(), 50);
+        std::fs::write(&db_path, partial).unwrap();
+
+        let db = Database::open(&db_path).unwrap();
+        let row_count: i64 = db.conn()
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(row_count, 0, "recovered DB must be empty");
+    }
+
+    #[test]
+    fn test_size_guard_preserves_valid_db() {
+        // Regression guard: the size threshold must not trigger on a real,
+        // populated database. Insert one row, close, reopen — data survives.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.conn().execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, indexed_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["preserved.rs", "deadbeef", 0i64, 0i64],
+            ).unwrap();
+        }
+
+        let pre_size = std::fs::metadata(&db_path).unwrap().len();
+        assert!(pre_size > 100, "valid DB after one insert must exceed header size");
+
+        let db = Database::open(&db_path).unwrap();
+        let path: String = db.conn()
+            .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(path, "preserved.rs", "valid DB must not be wiped on reopen");
     }
 
     #[test]
