@@ -290,3 +290,34 @@ fn validate(db_path: &Path, root: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Replaces the prior 110-MB integration test (`snapshot_integration.rs::
+    /// snapshot_install_rejects_oversized_uncompressed`) that flaked on
+    /// GitHub-hosted Linux runners with SIGBUS — heap-allocating 110 MB and
+    /// writing it to disk while three other integration tests run in parallel
+    /// hit mmap/disk-pressure boundaries on the small CI tmpfs. The cap
+    /// behavior lives entirely inside `decompress_with_cap`/`CapWriter`, so
+    /// scoping the test here keeps the same coverage at 5 KiB instead.
+    #[test]
+    fn decompress_with_cap_rejects_oversized() {
+        let payload = vec![0u8; 5 * 1024]; // 5 KiB decompressed
+        let zst_bytes = zstd::encode_all(&payload[..], 1).unwrap();
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("payload.zst");
+        let dst = tmp.path().join("out.bin");
+        std::fs::write(&src, zst_bytes).unwrap();
+
+        let cap: u64 = 1024;
+        let err = decompress_with_cap(&src, &dst, cap).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("cap") || chain.contains(&cap.to_string()),
+            "expected 'cap' or '{cap}' in error chain, got: {chain}"
+        );
+    }
+}

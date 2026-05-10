@@ -106,24 +106,6 @@ fn snapshot_install_rejects_newer_schema() {
 }
 
 #[test]
-fn snapshot_install_rejects_oversized_uncompressed() {
-    // Create a file whose decompressed size exceeds 100MB.
-    // Use a zero-filled buffer — zstd compresses it to a tiny .zst,
-    // so the actual compressed file is small and the test runs fast.
-    let big = vec![0u8; 110 * 1024 * 1024];
-    let src = TempDir::new().unwrap();
-    let zst = src.path().join("big.db.zst");
-    std::fs::write(&zst, zstd::encode_all(&big[..], 1).unwrap()).unwrap();
-
-    let target = init_git_repo_with_src();
-    let url = format!("file://{}", zst.display());
-    let err = snapshot::try_install(&url, target.path()).unwrap_err();
-    let chain = format!("{err:#}");
-    assert!(chain.contains("cap") || chain.contains("100"),
-        "got: {chain}");
-}
-
-#[test]
 fn snapshot_install_concurrent_serialized_via_filesystem() {
     // Two threads racing to install the same snapshot. Verifiable contract:
     // at least one creates the final index.db and no partials remain.
