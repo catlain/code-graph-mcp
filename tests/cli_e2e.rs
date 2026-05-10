@@ -753,6 +753,30 @@ fn test_cli_similar_digit_positional_suggests_node_id() {
 }
 
 #[test]
+fn test_cli_callgraph_requested_depth_preserved() {
+    // Regression: CLI used to pre-clamp `--depth` to (1, 20). Server caps to
+    // CALL_GRAPH_MAX_DEPTH=10 internally and exposes `requested_max_depth` so
+    // callers can see when truncation happened. Pre-clamping to 20 silently
+    // rewrote the user's request to 20 in the JSON, defeating the truth signal.
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["callgraph", "validateToken", "--depth", "99", "--json"],
+    );
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        v["requested_max_depth"].as_i64(),
+        Some(99),
+        "requested_max_depth must echo user's value (99), got {}",
+        v["requested_max_depth"]
+    );
+    let eff = v["effective_max_depth"].as_i64().unwrap();
+    assert!(eff <= 10, "effective should be capped at CALL_GRAPH_MAX_DEPTH=10, got {eff}");
+    assert!(eff < 99, "effective ({eff}) must be visibly less than requested (99)");
+}
+
+#[test]
 fn test_cli_callgraph_json_includes_parent_id() {
     // Regression: depth>1 callgraph used to render depth-N nodes flat-indented under
     // the last depth-(N-1) sibling. Tree rendering needs `parent_id` on each row.

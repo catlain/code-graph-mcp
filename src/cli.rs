@@ -1296,7 +1296,12 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
         ))?;
 
     let direction = get_flag_value(args, "--direction").unwrap_or("both");
-    let depth: i32 = parse_flag_or(args, "--depth", 3_i32).clamp(1, 20);
+    // Lower-bound only: pass user's requested depth to the engine so
+    // `requested_max_depth` in the JSON reflects the actual user input.
+    // The engine caps to CALL_GRAPH_MAX_DEPTH internally and reports the
+    // capped value separately as `effective_max_depth`. CLI pre-clamping
+    // would silently rewrite the request and defeat that truth-telling.
+    let depth: i32 = parse_flag_or(args, "--depth", 3_i32).max(1);
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
     let include_tests = has_flag(args, "--include-tests");
