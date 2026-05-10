@@ -1180,3 +1180,46 @@ fn test_rust_callee_crate_only_path_collapses_to_bare() {
     );
 }
 
+// T5: super:: strip, multi-segment, chained reserved prefixes
+#[test]
+fn test_rust_callee_super_prefix_stripped() {
+    // super:: must be stripped per reserved-prefix rule.
+    let code = "fn caller() { super::sibling::foo(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "foo")
+        .expect("missing call to foo");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"sibling"}"#),
+    );
+}
+
+#[test]
+fn test_rust_callee_multi_segment_path_preserved() {
+    let code = "fn caller() { crate::a::b::c::deep(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "deep")
+        .expect("missing call to deep");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"a::b::c"}"#),
+    );
+}
+
+#[test]
+fn test_rust_callee_chained_reserved_prefixes_stripped() {
+    // Multiple consecutive reserved prefixes: ensure drain(..skip) consumes
+    // ALL leading reserved segments, not just the first.
+    let code = "fn caller() { super::super::foo(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "foo")
+        .expect("missing call to foo");
+    assert_eq!(
+        call.metadata, None,
+        "two consecutive `super::` segments + bare name → fully stripped → Bare"
+    );
+}
+
