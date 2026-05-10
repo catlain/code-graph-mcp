@@ -59,6 +59,7 @@ tree-sitter-dart-orchard = "0.3.2"
 tree-sitter-md = "0.3"
 tree-sitter-bash = "0.23.3"
 tree-sitter-json = "0.24.8"
+tempfile = "3"
 
 [build-dependencies]
 cc = "1"

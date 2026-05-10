@@ -35,3 +35,56 @@ fn write_meta_overwrites_existing_value() {
     let got = read_meta(&conn, META_SNAPSHOT_TOOL_VERSION).unwrap();
     assert_eq!(got, Some("0.22.2".to_string()));
 }
+
+use crate::snapshot::meta::{
+    read_meta as snap_read_meta, META_SNAPSHOT_CREATED_AT, META_SNAPSHOT_INCLUDES_VEC,
+    META_SNAPSHOT_SCHEMA_VERSION, META_SNAPSHOT_SOURCE_COMMIT,
+};
+use crate::storage::db::Database;
+use std::process::Command;
+use tempfile::TempDir;
+
+fn init_git_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    Command::new("git").args(["init", "-q"]).current_dir(p).status().unwrap();
+    Command::new("git").args(["config", "user.email", "t@t"]).current_dir(p).status().unwrap();
+    Command::new("git").args(["config", "user.name", "t"]).current_dir(p).status().unwrap();
+    std::fs::create_dir_all(p.join("src")).unwrap();
+    std::fs::write(p.join("src/lib.rs"), "pub fn hello() {}\npub fn world() { hello(); }\n").unwrap();
+    Command::new("git").args(["add", "."]).current_dir(p).status().unwrap();
+    Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(p).status().unwrap();
+    dir
+}
+
+#[test]
+fn create_writes_meta_and_drops_vec_table() {
+    let fixture = init_git_fixture();
+    let out = fixture.path().join("snapshot.db");
+    crate::snapshot::create(fixture.path(), &out, false).unwrap();
+
+    assert!(out.exists(), "snapshot db should exist at {}", out.display());
+
+    let db = Database::open(&out).unwrap();
+    let conn = db.conn();
+
+    // node_vectors must NOT exist when include_vec is false
+    let has_vec: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_vectors'",
+        [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(has_vec, 0, "node_vectors should be dropped");
+
+    // Five producer-side meta keys present and non-empty
+    for key in [
+        META_SNAPSHOT_SOURCE_COMMIT,
+        META_SNAPSHOT_CREATED_AT,
+        META_SNAPSHOT_SCHEMA_VERSION,
+        META_SNAPSHOT_INCLUDES_VEC,
+    ] {
+        let v = snap_read_meta(conn, key).unwrap();
+        assert!(v.is_some() && !v.as_ref().unwrap().is_empty(), "meta {key} missing");
+    }
+    let inc = snap_read_meta(conn, META_SNAPSHOT_INCLUDES_VEC).unwrap().unwrap();
+    assert_eq!(inc, "false");
+}
