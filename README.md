@@ -314,6 +314,26 @@ Available when installed as a Claude Code plugin:
 | HTML | .html, .htm | structural parsing |
 | CSS | .css | structural parsing |
 
+## Team-shared graph snapshot
+
+Skip the full local index for team members and CI runners by publishing a
+~3-5MB graph snapshot with each GitHub release.
+
+**Setup (one-time):**
+1. Copy `node_modules/code-graph-mcp/templates/code-graph-snapshot.yml`
+   into your repo's `.github/workflows/`.
+2. Push a release tag. The workflow uploads
+   `code-graph-snapshot-<sha>.db.zst` as a release asset.
+
+**Verify:**
+
+```bash
+npx code-graph-mcp snapshot inspect ./code-graph-snapshot-<sha>.db.zst
+```
+
+After setup, fresh clones automatically fetch the latest snapshot the
+first time the MCP server starts. No client-side configuration needed.
+
 ## Storage
 
 Uses SQLite with:
