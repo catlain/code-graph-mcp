@@ -121,6 +121,7 @@ pub fn is_test_symbol(name: &str, file_path: &str) -> bool {
         || file_path.starts_with("tests/") || file_path.starts_with("test/")
         || file_path.starts_with("benches/") || file_path.starts_with("bench/")
         || file_path.contains("__tests__/")
+        || file_path.ends_with("/tests.rs")
         || file_path.ends_with("_test.go") || file_path.ends_with("_test.rs")
         || file_path.ends_with(".test.ts") || file_path.ends_with(".test.js")
         || file_path.ends_with(".test.tsx") || file_path.ends_with(".test.jsx")
@@ -158,7 +159,8 @@ pub const PROD_SOURCE_FILTER_AND: &str =
      AND src.name NOT LIKE 'test\\_%' ESCAPE '\\' \
      AND sf.path NOT LIKE 'tests/%' \
      AND sf.path NOT LIKE 'benches/%' \
-     AND sf.path NOT LIKE '%_test.%'";
+     AND sf.path NOT LIKE '%_test.%' \
+     AND sf.path NOT LIKE '%/tests.rs'";
 
 /// OR-joined inverse of [`PROD_SOURCE_FILTER_AND`] — matches test/bench sources.
 /// Used by SUM/CASE constructs that count test callers separately (e.g.
@@ -168,7 +170,8 @@ pub const TEST_SOURCE_FILTER_OR: &str =
      OR src.name LIKE 'test\\_%' ESCAPE '\\' \
      OR sf.path LIKE 'tests/%' \
      OR sf.path LIKE 'benches/%' \
-     OR sf.path LIKE '%_test.%'";
+     OR sf.path LIKE '%_test.%' \
+     OR sf.path LIKE '%/tests.rs'";
 
 // -- Dead-code ignore defaults --
 /// Path-prefix defaults for `find_dead_code` ignore_paths.
@@ -273,6 +276,23 @@ mod tests {
         // Production code in src/ is unaffected
         assert!(!is_test_symbol("fts5_search", "src/storage/queries/search.rs"));
         assert!(!is_test_symbol("conn", "src/storage/db.rs"));
+    }
+
+    /// Rust convention: `mod tests;` resolves to `<module>/tests.rs`. Functions
+    /// inside (including #[test]-free helpers like `open_with_meta_table`) must
+    /// classify as test callers — otherwise `find_references` / `called_by`
+    /// silently treats them as production. Symptom: `get_ast_node(snapshot::create,
+    /// include_references)` listed 6 src/snapshot/tests.rs entries as prod callers
+    /// while `impact.test_callers_filtered` (SQL-side, AST-flag-driven) counted
+    /// them as tests — the two heuristics disagreed.
+    #[test]
+    fn test_is_test_symbol_classifies_rust_module_tests_rs() {
+        assert!(is_test_symbol("create_writes_meta", "src/snapshot/tests.rs"));
+        assert!(is_test_symbol("open_with_meta_table", "src/snapshot/tests.rs"));
+        assert!(is_test_symbol("anything", "src/indexer/pipeline/tests.rs"));
+        // Guard against false positives: substring must be the final segment.
+        assert!(!is_test_symbol("fts5_search", "src/contests.rs"));
+        assert!(!is_test_symbol("normal_fn", "src/tests_helpers.rs"));
     }
 
     #[test]
