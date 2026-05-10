@@ -72,7 +72,6 @@ codegen-units = 1
 panic = "abort"
 
 [dev-dependencies]
-tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 # Used only by tests/routing_bench.rs (ignored by default; gated on ANTHROPIC_API_KEY).
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
