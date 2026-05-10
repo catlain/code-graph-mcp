@@ -127,6 +127,49 @@ pub fn is_test_symbol(name: &str, file_path: &str) -> bool {
         || file_path.ends_with(".spec.ts") || file_path.ends_with(".spec.js")
 }
 
+// -- SQL counterparts of is_test_symbol --
+//
+// Reused by every SQL query that counts/orders by caller_count to keep the
+// classification aligned with `is_test_symbol`. Five sites must agree —
+// see feedback_test_classifier_dual_sources.md for the full inventory.
+//
+// Convention: callers MUST alias the source node as `src` and the source file
+// as `sf` and provide their own `JOIN` for the edges table. The helpers below
+// emit the JOIN on `src`/`sf` and the WHERE/CASE clause body separately.
+
+/// JOINs that attach the source node and source file to an `edges` row.
+/// `edges_alias` is the alias used in the outer FROM/JOIN for the edges table.
+/// Pair with [`PROD_SOURCE_FILTER_AND`] in the WHERE clause.
+pub fn prod_source_join_sql(edges_alias: &str) -> String {
+    format!(
+        "JOIN nodes src ON src.id = {e}.source_id \
+         JOIN files sf ON sf.id = src.file_id",
+        e = edges_alias,
+    )
+}
+
+/// AND-joined conditions that exclude test/bench source rows.
+/// Combines the AST-level `src.is_test=0` flag with name and path heuristics —
+/// kept in sync with `is_test_symbol`. Caller is expected to splice these
+/// inside a WHERE clause already started with another condition (no leading AND
+/// is added by callers — they prepend ` AND ` themselves) or inside a CASE WHEN.
+pub const PROD_SOURCE_FILTER_AND: &str =
+    "src.is_test = 0 \
+     AND src.name NOT LIKE 'test\\_%' ESCAPE '\\' \
+     AND sf.path NOT LIKE 'tests/%' \
+     AND sf.path NOT LIKE 'benches/%' \
+     AND sf.path NOT LIKE '%_test.%'";
+
+/// OR-joined inverse of [`PROD_SOURCE_FILTER_AND`] — matches test/bench sources.
+/// Used by SUM/CASE constructs that count test callers separately (e.g.
+/// project_map's hot_functions test_cnt CASE).
+pub const TEST_SOURCE_FILTER_OR: &str =
+    "src.is_test = 1 \
+     OR src.name LIKE 'test\\_%' ESCAPE '\\' \
+     OR sf.path LIKE 'tests/%' \
+     OR sf.path LIKE 'benches/%' \
+     OR sf.path LIKE '%_test.%'";
+
 // -- Dead-code ignore defaults --
 /// Path-prefix defaults for `find_dead_code` ignore_paths.
 ///

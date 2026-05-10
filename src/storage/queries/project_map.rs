@@ -236,26 +236,21 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
 
     // 5. Hot functions (C1: filter test code, split prod/test caller counts, C3: use REL_CALLS constant)
     // benches/ is classified as test/harness — see domain.rs::is_test_symbol.
+    // Source-side filter clauses come from domain helpers; target-side `n.*`/`f.*`
+    // filter is inline because aliases differ (n/f vs src/sf).
     let mut hot_functions = Vec::new();
     {
-        let sql = "SELECT n.name, n.type, f.path, \
-               COUNT(CASE WHEN src.is_test = 0 \
-                          AND src.name NOT LIKE 'test\\_%' ESCAPE '\\' \
-                          AND sf.path NOT LIKE 'tests/%' \
-                          AND sf.path NOT LIKE 'benches/%' \
-                          AND sf.path NOT LIKE '%_test.%' \
-                     THEN e.id END) as prod_cnt, \
-               COUNT(CASE WHEN src.is_test = 1 \
-                          OR src.name LIKE 'test\\_%' ESCAPE '\\' \
-                          OR sf.path LIKE 'tests/%' \
-                          OR sf.path LIKE 'benches/%' \
-                          OR sf.path LIKE '%_test.%' \
-                     THEN e.id END) as test_cnt \
+        let prod_join = crate::domain::prod_source_join_sql("e");
+        let prod_where = crate::domain::PROD_SOURCE_FILTER_AND;
+        let test_where = crate::domain::TEST_SOURCE_FILTER_OR;
+        let sql = format!(
+            "SELECT n.name, n.type, f.path, \
+               COUNT(CASE WHEN {prod_where} THEN e.id END) as prod_cnt, \
+               COUNT(CASE WHEN {test_where} THEN e.id END) as test_cnt \
              FROM nodes n \
              JOIN files f ON f.id = n.file_id \
              JOIN edges e ON e.target_id = n.id \
-             JOIN nodes src ON src.id = e.source_id \
-             JOIN files sf ON sf.id = src.file_id \
+             {prod_join} \
              WHERE e.relation = ?1 \
                AND n.type IN ('function', 'method') \
                AND n.name != '<module>' \
@@ -267,8 +262,9 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
              GROUP BY n.name, n.type, f.path \
              HAVING prod_cnt > 0 \
              ORDER BY prod_cnt DESC \
-             LIMIT 15";
-        let mut stmt = conn.prepare(sql)?;
+             LIMIT 15"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([REL_CALLS], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)? as usize, row.get::<_, i64>(4)? as usize))

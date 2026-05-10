@@ -1,0 +1,301 @@
+//! End-to-end MCP protocol tests via stdio JSON-RPC.
+//!
+//! These tests spawn `code-graph-mcp serve` as a subprocess, talk to it
+//! through stdin/stdout, and assert on the live JSON-RPC responses.
+//! Cover the fix points that unit tests can't reach:
+//!   - prod-first sort ordering survives serde_json round-trip and
+//!     centralized_compress truncation (R1/R2 fixes)
+//!   - SQL caller_count filtering produces the same shape MCP clients see (R4/R5)
+//!   - find_references explanatory error for test-only symbols (A fix)
+
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+use tempfile::TempDir;
+
+fn binary_path() -> String {
+    env!("CARGO_BIN_EXE_code-graph-mcp").to_string()
+}
+
+/// Build a fixture project with one target function plus enough callers
+/// (mix of prod, inline test, tests/ dir, benches/) to force compression
+/// truncation and stress the prod-first sort.
+fn setup_fixture_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let tests_dir = project.path().join("tests");
+    std::fs::create_dir_all(&tests_dir).unwrap();
+    let benches_dir = project.path().join("benches");
+    std::fs::create_dir_all(&benches_dir).unwrap();
+
+    // Target with 3 prod callers in src/cli.rs
+    std::fs::write(src.join("target.rs"), "pub fn target_fn() -> i32 { 42 }\n").unwrap();
+    std::fs::write(src.join("lib.rs"), "pub mod target;\npub mod cli;\npub mod inline_tests;\n").unwrap();
+    std::fs::write(src.join("cli.rs"), r#"use crate::target::target_fn;
+pub fn prod_caller_a() -> i32 { target_fn() }
+pub fn prod_caller_b() -> i32 { target_fn() + 1 }
+pub fn prod_caller_c() -> i32 { target_fn() + 2 }
+"#).unwrap();
+
+    // 25 inline tests in src/inline_tests.rs (trigger compression > 20-element cap)
+    let mut inline = String::from("use crate::target::target_fn;\n");
+    for i in 0..25 {
+        inline.push_str(&format!(
+            "#[cfg(test)]\n#[test]\nfn test_inline_{i:02}_calls_target() {{ assert_eq!(target_fn(), 42); }}\n"
+        ));
+    }
+    std::fs::write(src.join("inline_tests.rs"), inline).unwrap();
+
+    // 5 integration tests in tests/integration.rs
+    let mut integ = String::new();
+    for i in 0..5 {
+        integ.push_str(&format!(
+            "#[test]\nfn test_integ_{i}_calls_target() {{ assert_eq!(fixture_lib::target::target_fn(), 42); }}\n"
+        ));
+    }
+    std::fs::write(tests_dir.join("integration.rs"), integ).unwrap();
+
+    // 1 bench
+    std::fs::write(benches_dir.join("bench_target.rs"),
+        "fn bench_target() { let _ = fixture_lib::target::target_fn(); }\n").unwrap();
+
+    // Cargo.toml so the indexer picks the right language root
+    std::fs::write(project.path().join("Cargo.toml"), r#"[package]
+name = "fixture_lib"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#).unwrap();
+
+    // Index in-process (faster + deterministic than letting the spawned
+    // server do it on first call).
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    project
+}
+
+struct McpClient {
+    child: Child,
+    next_id: i64,
+    reader: BufReader<std::process::ChildStdout>,
+}
+
+impl McpClient {
+    fn spawn(project_root: &std::path::Path) -> Self {
+        let mut child = Command::new(binary_path())
+            .arg("serve")
+            .current_dir(project_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mcp server");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let reader = BufReader::new(stdout);
+        let mut client = Self { child, next_id: 1, reader };
+
+        // Initialize handshake — required before tools/list or tools/call
+        let init = client.request("initialize", json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "stdio-test", "version": "0.0.0"},
+        }), Duration::from_secs(15));
+        assert!(
+            init.get("result").is_some(),
+            "initialize failed: {:?}",
+            init
+        );
+        client
+    }
+
+    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let stdin = self.child.stdin.as_mut().expect("stdin piped");
+        writeln!(stdin, "{}", req).expect("write request");
+        stdin.flush().expect("flush stdin");
+
+        let start = Instant::now();
+        loop {
+            if start.elapsed() > timeout {
+                panic!("MCP request {} timed out after {:?}", method, timeout);
+            }
+            let mut line = String::new();
+            let n = self.reader.read_line(&mut line).expect("read line");
+            if n == 0 {
+                panic!("MCP server closed stdout before response to {}", method);
+            }
+            let line_trim = line.trim();
+            if line_trim.is_empty() {
+                continue;
+            }
+            let resp: Value = match serde_json::from_str(line_trim) {
+                Ok(v) => v,
+                Err(_) => continue, // skip non-JSON lines (shouldn't happen on stdout, but be defensive)
+            };
+            // Filter notifications (no id) and other-id responses
+            if resp.get("id").and_then(|i| i.as_i64()) == Some(id) {
+                return resp;
+            }
+        }
+    }
+
+    fn call_tool(&mut self, name: &str, args: Value) -> Value {
+        self.request("tools/call",
+            json!({"name": name, "arguments": args}),
+            Duration::from_secs(30))
+    }
+}
+
+impl Drop for McpClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// MCP wraps tool results as `{result: {content: [{type: "text", text: <json-string>}]}}`.
+/// Pull out the inner JSON.
+fn extract_tool_payload(resp: &Value) -> Value {
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected result.content[0].text string in: {}", resp));
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("tool text not JSON ({}): {}", e, text))
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+/// R1 fix: get_ast_node called_by must put prod callers first when test-heavy.
+/// Without the sort, post-truncation `called_by` would be all-test (the bug).
+#[test]
+fn mcp_get_ast_node_called_by_prod_first_under_truncation() {
+    let project = setup_fixture_project();
+    let mut client = McpClient::spawn(project.path());
+
+    let resp = client.call_tool("get_ast_node", json!({
+        "symbol_name": "target_fn",
+        "include_references": true,
+        "include_tests": true,
+        "compact": true,
+    }));
+
+    let body = extract_tool_payload(&resp);
+    let called_by = body["called_by"].as_array()
+        .unwrap_or_else(|| panic!("called_by is not an array: {}", body));
+
+    assert!(
+        !called_by.is_empty(),
+        "called_by must have entries (target has 3 prod + many test callers)"
+    );
+
+    // Look at the first 3 entries — these should be the 3 prod callers
+    // (post-sort, prod come first; tests at tail).
+    let first_three_names: Vec<&str> = called_by.iter().take(3)
+        .filter_map(|x| x["name"].as_str())
+        .collect();
+    let prod_count = first_three_names.iter()
+        .filter(|n| n.starts_with("prod_caller_"))
+        .count();
+    assert!(
+        prod_count >= 2,
+        "first 3 of called_by should include >=2 prod_caller_*; got {:?} (full body: {})",
+        first_three_names, body
+    );
+}
+
+/// R2 fix: find_references default include_tests=true must put prod first.
+#[test]
+fn mcp_find_references_default_prod_first() {
+    let project = setup_fixture_project();
+    let mut client = McpClient::spawn(project.path());
+
+    let resp = client.call_tool("find_references", json!({
+        "symbol_name": "target_fn",
+        "compact": true,
+    }));
+
+    let body = extract_tool_payload(&resp);
+    let refs = body["references"].as_array()
+        .unwrap_or_else(|| panic!("references not array: {}", body));
+    assert!(!refs.is_empty(), "references must have entries");
+
+    let first_three_names: Vec<&str> = refs.iter().take(3)
+        .filter_map(|x| x["name"].as_str())
+        .collect();
+    let prod_count = first_three_names.iter()
+        .filter(|n| n.starts_with("prod_caller_"))
+        .count();
+    assert!(
+        prod_count >= 2,
+        "first 3 of references should include >=2 prod_caller_*; got {:?}",
+        first_three_names
+    );
+}
+
+/// R4/R5 fix + A fix: caller_count is prod-only and find_references on a
+/// test-only symbol returns an explanatory error (not "not found").
+#[test]
+fn mcp_caller_count_prod_only_and_test_symbol_error_explains() {
+    let project = setup_fixture_project();
+    let mut client = McpClient::spawn(project.path());
+
+    // module_overview src — target_fn must have caller_count == 3 (prod-only),
+    // not 31 (3 prod + 25 inline test + 5 tests/ + 1 bench, target reachable).
+    let overview = client.call_tool("module_overview", json!({
+        "path": "src",
+        "compact": true,
+    }));
+    let body = extract_tool_payload(&overview);
+    let active = body["active"].as_array().expect("active array");
+    let target = active.iter()
+        .find(|e| e["name"].as_str() == Some("target_fn"))
+        .unwrap_or_else(|| panic!("target_fn missing from active exports: {}", body));
+    let caller_count = target["caller_count"].as_i64().expect("caller_count i64");
+    assert_eq!(
+        caller_count, 3,
+        "caller_count must be 3 prod-only (3 prod_caller_* in src/cli.rs), \
+         not include test/bench sources; got {}",
+        caller_count
+    );
+
+    // A fix: find_references on a test-only symbol should error with
+    // "exists but all matches are in test/bench paths" rather than the old
+    // misleading "not found".
+    let resp = client.call_tool("find_references", json!({
+        "symbol_name": "test_inline_00_calls_target",
+    }));
+    // Tool errors come back either as JSON-RPC error or as result.isError=true with text.
+    let err_text = resp.get("error")
+        .and_then(|e| e["message"].as_str())
+        .or_else(|| {
+            if resp["result"]["isError"].as_bool() == Some(true) {
+                resp["result"]["content"][0]["text"].as_str()
+            } else { None }
+        })
+        .unwrap_or_else(|| panic!("expected error response, got: {}", resp));
+
+    assert!(
+        err_text.contains("test/bench paths") || err_text.contains("bypass the test filter"),
+        "error must explain the test filter; got: {}",
+        err_text
+    );
+}

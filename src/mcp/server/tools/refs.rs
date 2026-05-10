@@ -69,12 +69,28 @@ impl McpServer {
             // No file_path: fuzzy resolve
             match self.resolve_fuzzy_name(symbol_name)? {
                 FuzzyResolution::Unique(resolved_name) => {
-                    let nodes = queries::get_node_ids_by_name(self.db.conn(), &resolved_name)?;
-                    let ids: Vec<i64> = nodes.into_iter()
-                        .filter(|(_, fp)| !is_test_symbol(&resolved_name, fp))
-                        .map(|(id, _)| id)
-                        .collect();
+                    let all_nodes = queries::get_node_ids_by_name(self.db.conn(), &resolved_name)?;
+                    let total = all_nodes.len();
+                    let (prod, filtered): (Vec<_>, Vec<_>) = all_nodes.into_iter()
+                        .partition(|(_, fp)| !is_test_symbol(&resolved_name, fp));
+                    let ids: Vec<i64> = prod.into_iter().map(|(id, _)| id).collect();
                     if ids.is_empty() {
+                        // Symbol exists but every match is in test/bench territory.
+                        // Drop the misleading "not found" — surface the filter so the
+                        // caller knows to bypass with file_path or node_id (covers the
+                        // dead-code → find_references reverse-trace flow).
+                        if total > 0 {
+                            let example_paths: Vec<String> = filtered.iter()
+                                .take(3)
+                                .map(|(_, fp)| fp.clone())
+                                .collect();
+                            return Err(anyhow!(
+                                "Symbol '{}' exists but all {} match(es) are in test/bench paths ({}). \
+                                 Pass node_id (use ast_search or get_ast_node to obtain one) or \
+                                 file_path explicitly to bypass the test filter.",
+                                symbol_name, total, example_paths.join(", ")
+                            ));
+                        }
                         return Err(anyhow!("Symbol '{}' not found in index.", symbol_name));
                     }
                     (ids, resolved_name)
@@ -87,6 +103,24 @@ impl McpServer {
                     }));
                 }
                 FuzzyResolution::NotFound => {
+                    // resolve_fuzzy_name filters test/bench candidates upstream.
+                    // Distinguish "truly absent" from "found-but-filtered" by
+                    // re-querying without that filter — the latter means the
+                    // user is on a dead-code → find_references reverse-trace and
+                    // needs to know they can bypass with node_id/file_path.
+                    let unfiltered = queries::get_node_ids_by_name(self.db.conn(), symbol_name)?;
+                    if !unfiltered.is_empty() {
+                        let example_paths: Vec<String> = unfiltered.iter()
+                            .take(3)
+                            .map(|(_, fp)| fp.clone())
+                            .collect();
+                        return Err(anyhow!(
+                            "Symbol '{}' exists but all {} match(es) are in test/bench paths ({}). \
+                             Pass node_id (use ast_search or get_ast_node to obtain one) or \
+                             file_path explicitly to bypass the test filter.",
+                            symbol_name, unfiltered.len(), example_paths.join(", ")
+                        ));
+                    }
                     return Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name.", symbol_name));
                 }
             }
@@ -139,6 +173,18 @@ impl McpServer {
             }
         }
 
+        // Stable sort prod-first: include_tests defaults to true and
+        // centralized_compress truncates large arrays to first 10 + last 5.
+        // Without prod-first ordering, alphabetic file paths sandwich prod
+        // callers (benches/, src/, tests/) and the kept window can be all-test.
+        if include_tests {
+            all_refs.sort_by_key(|r| {
+                let name = r["name"].as_str().unwrap_or("");
+                let file = r["file_path"].as_str().unwrap_or("");
+                is_test_symbol(name, file)
+            });
+        }
+
         // Group by relation for readability
         let mut by_relation: std::collections::HashMap<String, Vec<&serde_json::Value>> = std::collections::HashMap::new();
         for r in &all_refs {
@@ -185,5 +231,45 @@ impl McpServer {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::is_test_symbol;
+    use serde_json::json;
+
+    #[test]
+    fn references_prod_first_sort_survives_truncation() {
+        // get_incoming_references returns ORDER BY f.path, n.start_line.
+        // Alphabetic file paths place benches/ first, tests/ last, sandwiching
+        // production callers in src/. Truncation to first 10 + last 5 then
+        // drops them when caller count is high.
+        let mut refs = [
+            json!({"name": "bench_call_graph", "file_path": "benches/indexing.rs"}),
+            json!({"name": "cmd_health_check", "file_path": "src/cli.rs"}),
+            json!({"name": "run_full_index", "file_path": "src/indexer/pipeline/mod.rs"}),
+            json!({"name": "tool_module_overview", "file_path": "src/mcp/server/tools/overview.rs"}),
+            json!({"name": "test_camelcase_search", "file_path": "tests/integration.rs"}),
+        ];
+        refs.sort_by_key(|r| {
+            let name = r["name"].as_str().unwrap_or("");
+            let file = r["file_path"].as_str().unwrap_or("");
+            is_test_symbol(name, file)
+        });
+
+        let prod_count = refs.iter().take_while(|r| {
+            let name = r["name"].as_str().unwrap_or("");
+            let file = r["file_path"].as_str().unwrap_or("");
+            !is_test_symbol(name, file)
+        }).count();
+        assert_eq!(prod_count, 3, "prod callers must occupy contiguous prefix");
+        let prod_files: std::collections::HashSet<&str> = refs[..prod_count]
+            .iter()
+            .map(|r| r["file_path"].as_str().unwrap_or(""))
+            .collect();
+        assert!(prod_files.contains("src/cli.rs"));
+        assert!(prod_files.contains("src/indexer/pipeline/mod.rs"));
+        assert!(prod_files.contains("src/mcp/server/tools/overview.rs"));
     }
 }

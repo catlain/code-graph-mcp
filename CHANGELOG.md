@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.22.1 — dogfood loop fixes (test/prod boundary + truncation bias)
+
+Five bug fixes from a 5-round structured dogfood pass. All fixes converge on
+one root pattern: the test/prod source classification was implemented in five
+sites independently, and result truncation in `centralized_compress` was
+biased against production callers when source data ordering put tests at
+the array head/tail.
+
+### Fixes
+
+- **`get_ast_node` `called_by` post-truncation bias** (`src/mcp/server/tools/ast_node.rs`)
+  When `include_references=true include_tests=true`, SQL row order without
+  `ORDER BY` clustered test callers at array start/end, and `centralized_compress`
+  kept first 10 + last 5 — leaving zero production callers visible for
+  test-heavy targets like `conn` (49 prod / 76 test). Stable-sort prod-first
+  inside the tool before emitting.
+
+- **`find_references` references post-truncation bias** (`src/mcp/server/tools/refs.rs`)
+  Same pattern as above, but worse because `find_references` defaults
+  `include_tests=true` (rename audits need test sites). 125-caller targets
+  collapsed to a 10-prod-of-cli + 5-tests-of-tests/ window with all
+  `src/indexer/`, `src/mcp/`, `src/storage/` prod callers silently dropped.
+  Same prod-first stable sort inside the tool.
+
+- **`module_overview` `caller_count` includes test sources** (`src/storage/queries/routes.rs`)
+  `get_module_exports` `cc` LEFT JOIN counted every incoming `calls` edge —
+  did not filter source-side `is_test`. `parse_code` showed `caller_count=39`
+  while `find_references include_tests=false` / `get_ast_node impact` /
+  `project_map hot_functions` all reported 0 prod. Aligned with the four
+  other prod-only counts via the same source-side filter pattern.
+
+- **`ast_search` ranking includes test sources** (`src/storage/queries/nodes.rs`)
+  `get_nodes_with_files_by_filters` `ORDER BY (SELECT COUNT(*) FROM edges …)`
+  ranked test-only utility wrappers (e.g. `extract_relations` 0 prod / 64 test)
+  above genuinely hot prod symbols. Same source-side filter applied.
+
+- **`find_references` "Symbol not found" for test/bench symbols** (`src/mcp/server/tools/refs.rs`)
+  `resolve_fuzzy_name` filters test/bench candidates upstream; previous error
+  said "not found" even when the symbol was present. Re-query without the
+  filter to detect the "found-but-filtered" case and surface a bypass hint
+  with the actual file paths. Unblocks the dead-code → find_references
+  reverse-trace flow.
+
+### Internal refactor
+
+`src/storage/queries/{routes,nodes,project_map}.rs` now share a single
+SQL filter via `src/domain.rs::prod_source_join_sql()` +
+`PROD_SOURCE_FILTER_AND` / `TEST_SOURCE_FILTER_OR`. Five duplicate `LIKE`
+chains collapsed to one canonical source. New test/harness directory
+conventions only need a single edit going forward.
+
+### Tests
+
+- `tests/mcp_stdio_integration.rs` (new, 245 LOC) — three end-to-end JSON-RPC
+  stdio tests against a real spawned `code-graph-mcp serve` subprocess.
+  Covers prod-first sort survival across centralized_compress truncation,
+  caller_count prod-only correctness, and the new explanatory error message.
+  Caught a real gap in the error-message fix during authoring (the
+  `FuzzyResolution::NotFound` branch needed the same treatment as
+  `Unique`).
+- `cargo test --release`: 299 lib + 3 new mcp_stdio_integration + ~194 other
+  integration = 496 total, 0 failed (1 pre-existing `#[ignore]`).
+- `cargo +1.95.0 clippy --no-default-features -- -D warnings` clean.
+- `cargo +1.95.0 clippy --all-targets -- -D warnings` clean.
+
 ## v0.22.0 — 三巨头 source-file split (queries / relations / pipeline)
 
 Pure refactor release — zero behavior change, public surface preserved across

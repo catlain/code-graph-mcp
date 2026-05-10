@@ -403,10 +403,20 @@ pub fn get_nodes_with_files_by_filters(
     // Order by caller_count DESC so high-value symbols surface first; without
     // this, `ORDER BY f.path` alphabetically truncated late-path files (e.g.
     // src/storage/queries.rs — 54 Result-returning fns) out of the top-N.
+    // Subquery uses domain helpers to filter source-side test edges so test-only
+    // utility wrappers (e.g. `extract_relations` 64 test/0 prod) don't out-rank
+    // real prod hot symbols. Aligned with project_map / get_module_exports.
+    let prod_join = crate::domain::prod_source_join_sql("e");
+    let prod_where = crate::domain::PROD_SOURCE_FILTER_AND;
     let sql = format!(
         "SELECT {cols}, f.path, f.language \
          FROM nodes n JOIN files f ON f.id = n.file_id{where_clause} \
-         ORDER BY (SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.relation = '{rel}') DESC, \
+         ORDER BY (\
+             SELECT COUNT(*) FROM edges e \
+             {prod_join} \
+             WHERE e.target_id = n.id AND e.relation = '{rel}' \
+               AND {prod_where} \
+         ) DESC, \
                   f.path ASC, n.start_line ASC \
          LIMIT ?{limit_idx}",
         cols = NODE_SELECT_ALIASED,
@@ -821,6 +831,110 @@ mod tests {
         assert_eq!(top1.len(), 1);
         assert_eq!(top1[0].node.id, hot,
             "limit=1 with alphabetical ORDER BY would return cold_fn — regression guard");
+    }
+
+    #[test]
+    fn test_get_nodes_with_files_by_filters_excludes_test_sources_in_ranking() {
+        // Aligned with project_map hot_functions / get_module_exports caller_count:
+        // ranking subquery must filter test/bench source nodes so test-only utility
+        // wrappers (e.g. extract_relations 0 prod / 64 test) don't out-rank prod hot fns.
+        let (db, _tmp) = test_db();
+        let prod_file = upsert_file(db.conn(), &FileRecord {
+            path: "src/prod.rs".into(), blake3_hash: "h1".into(),
+            last_modified: 1, language: Some("rust".into()),
+        }).unwrap();
+        let test_file = upsert_file(db.conn(), &FileRecord {
+            path: "src/prod_tests.rs".into(), blake3_hash: "h2".into(),
+            last_modified: 1, language: Some("rust".into()),
+        }).unwrap();
+        let bench_file = upsert_file(db.conn(), &FileRecord {
+            path: "benches/foo.rs".into(), blake3_hash: "h3".into(),
+            last_modified: 1, language: Some("rust".into()),
+        }).unwrap();
+        let integ_file = upsert_file(db.conn(), &FileRecord {
+            path: "tests/integration.rs".into(), blake3_hash: "h4".into(),
+            last_modified: 1, language: Some("rust".into()),
+        }).unwrap();
+
+        // Target #1: real prod hot fn (1 prod caller)
+        let real_hot = insert_node(db.conn(), &NodeRecord {
+            file_id: prod_file, node_type: "function".into(), name: "real_hot".into(),
+            qualified_name: None, start_line: 1, end_line: 3,
+            code_content: "fn real_hot() -> Result<()> {}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: Some("Result<()>".into()),
+            param_types: None, is_test: false,
+        }).unwrap();
+        // Target #2: test-only wrapper (0 prod, 4 test/bench callers)
+        let fake_hot = insert_node(db.conn(), &NodeRecord {
+            file_id: prod_file, node_type: "function".into(), name: "fake_hot".into(),
+            qualified_name: None, start_line: 5, end_line: 7,
+            code_content: "fn fake_hot() -> Result<()> {}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: Some("Result<()>".into()),
+            param_types: None, is_test: false,
+        }).unwrap();
+
+        // 1 prod caller for real_hot
+        let prod_caller = insert_node(db.conn(), &NodeRecord {
+            file_id: prod_file, node_type: "function".into(), name: "prod_caller".into(),
+            qualified_name: None, start_line: 10, end_line: 12,
+            code_content: "fn prod_caller(){}".into(), signature: None,
+            doc_comment: None, context_string: None, name_tokens: None,
+            return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        insert_edge(db.conn(), prod_caller, real_hot, "calls", None).unwrap();
+
+        // 4 callers for fake_hot — all test/bench sources
+        let inline_test = insert_node(db.conn(), &NodeRecord {
+            file_id: prod_file, node_type: "function".into(), name: "inline_test".into(),
+            qualified_name: None, start_line: 20, end_line: 22,
+            code_content: "fn inline_test(){}".into(), signature: None,
+            doc_comment: None, context_string: None, name_tokens: None,
+            return_type: None, param_types: None, is_test: true, // AST-flag inline test
+        }).unwrap();
+        let test_prefix = insert_node(db.conn(), &NodeRecord {
+            file_id: test_file, node_type: "function".into(), name: "test_foo".into(),
+            qualified_name: None, start_line: 1, end_line: 3,
+            code_content: "fn test_foo(){}".into(), signature: None,
+            doc_comment: None, context_string: None, name_tokens: None,
+            return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        let bench_caller = insert_node(db.conn(), &NodeRecord {
+            file_id: bench_file, node_type: "function".into(), name: "bench_foo".into(),
+            qualified_name: None, start_line: 1, end_line: 3,
+            code_content: "fn bench_foo(){}".into(), signature: None,
+            doc_comment: None, context_string: None, name_tokens: None,
+            return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        let integ_caller = insert_node(db.conn(), &NodeRecord {
+            file_id: integ_file, node_type: "function".into(), name: "verify_path".into(),
+            qualified_name: None, start_line: 1, end_line: 3,
+            code_content: "fn verify_path(){}".into(), signature: None,
+            doc_comment: None, context_string: None, name_tokens: None,
+            return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        insert_edge(db.conn(), inline_test, fake_hot, "calls", None).unwrap();
+        insert_edge(db.conn(), test_prefix, fake_hot, "calls", None).unwrap();
+        insert_edge(db.conn(), bench_caller, fake_hot, "calls", None).unwrap();
+        insert_edge(db.conn(), integ_caller, fake_hot, "calls", None).unwrap();
+
+        let types: &[&str] = &["function"];
+        let results = get_nodes_with_files_by_filters(
+            db.conn(), Some(types), Some("Result"), None, None, 10,
+        ).unwrap();
+
+        // Both targets returned but real_hot (1 prod) outranks fake_hot (4 test/bench)
+        let real_pos = results.iter().position(|nf| nf.node.id == real_hot)
+            .expect("real_hot must appear");
+        let fake_pos = results.iter().position(|nf| nf.node.id == fake_hot)
+            .expect("fake_hot must appear");
+        assert!(
+            real_pos < fake_pos,
+            "real_hot (1 prod caller) must rank above fake_hot (4 test/bench callers); \
+             got positions real={} fake={}",
+            real_pos, fake_pos,
+        );
     }
 
     /// `name_filter` does case-insensitive substring on n.name. Underwrites the

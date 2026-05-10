@@ -140,19 +140,31 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     // Phase 1: Try explicit exports (JS/TS)
     // Filter n.is_test=0 — AST-level flag catches inline `#[cfg(test)] mod tests`
     // whose names don't match the name-heuristic in is_test_symbol.
-    let sql_exports =
+    // Caller count subquery uses domain helpers to filter source-side test edges
+    // so prod-only counts align with project_map / find_references / get_ast_node
+    // impact (see feedback_test_classifier_dual_sources for the full inventory).
+    let prod_join = crate::domain::prod_source_join_sql("e2");
+    let prod_where = crate::domain::PROD_SOURCE_FILTER_AND;
+    let sql_exports = format!(
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
                 COALESCE(cc.cnt, 0) as caller_count,
                 n.start_line, n.end_line
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          JOIN edges e ON e.target_id = n.id AND e.relation = ?1
-         LEFT JOIN (SELECT target_id, COUNT(*) as cnt FROM edges WHERE relation = ?3 GROUP BY target_id) cc
-           ON cc.target_id = n.id
+         LEFT JOIN (
+             SELECT e2.target_id, COUNT(*) as cnt
+             FROM edges e2
+             {prod_join}
+             WHERE e2.relation = ?3
+               AND {prod_where}
+             GROUP BY e2.target_id
+         ) cc ON cc.target_id = n.id
          WHERE f.path LIKE ?2 ESCAPE '\\'
            AND n.is_test = 0
-         ORDER BY caller_count DESC";
-    let mut stmt = conn.prepare(sql_exports)?;
+         ORDER BY caller_count DESC"
+    );
+    let mut stmt = conn.prepare(&sql_exports)?;
     let rows = stmt.query_map(rusqlite::params![REL_EXPORTS, &prefix_pattern, REL_CALLS], |row| {
         Ok(ModuleExport {
             node_id: row.get(0)?,
@@ -171,21 +183,29 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
         return Ok(results);
     }
 
-    // Phase 2: Fallback for non-JS/TS — all named top-level symbols in matching files
-    let sql_fallback =
+    // Phase 2: Fallback for non-JS/TS — all named top-level symbols in matching files.
+    // Caller count subquery filters source-side test edges (see Phase 1 comment).
+    let sql_fallback = format!(
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
                 COALESCE(cc.cnt, 0) as caller_count,
                 n.start_line, n.end_line
          FROM nodes n
          JOIN files f ON f.id = n.file_id
-         LEFT JOIN (SELECT target_id, COUNT(*) as cnt FROM edges WHERE relation = ?2 GROUP BY target_id) cc
-           ON cc.target_id = n.id
+         LEFT JOIN (
+             SELECT e2.target_id, COUNT(*) as cnt
+             FROM edges e2
+             {prod_join}
+             WHERE e2.relation = ?2
+               AND {prod_where}
+             GROUP BY e2.target_id
+         ) cc ON cc.target_id = n.id
          WHERE f.path LIKE ?1 ESCAPE '\\'
            AND n.type != 'module'
            AND n.name != '<module>'
            AND n.is_test = 0
-         ORDER BY caller_count DESC";
-    let mut stmt2 = conn.prepare(sql_fallback)?;
+         ORDER BY caller_count DESC"
+    );
+    let mut stmt2 = conn.prepare(&sql_fallback)?;
     let rows2 = stmt2.query_map(rusqlite::params![&prefix_pattern, REL_CALLS], |row| {
         Ok(ModuleExport {
             node_id: row.get(0)?,
@@ -286,6 +306,70 @@ mod tests {
         assert!(
             !names.contains(&"arrays_are_homogeneous"),
             "is_test=1 node leaked into module exports: {:?}", names,
+        );
+    }
+
+    #[test]
+    fn test_get_module_exports_caller_count_excludes_test_sources() {
+        // Counterpart to project_map's hot_functions test: caller_count must
+        // count only production callers. Test/benches sources must not inflate
+        // it. Three callers (1 prod + 2 test) — count must be 1.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        // Production file with the target export
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
+             VALUES ('src/foo.rs', 'h1', 0, 'rust', 0)",
+            [],
+        ).unwrap();
+        // Bench file
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
+             VALUES ('benches/bench_foo.rs', 'h2', 0, 'rust', 0)",
+            [],
+        ).unwrap();
+        // Tests dir file
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
+             VALUES ('tests/integration.rs', 'h3', 0, 'rust', 0)",
+            [],
+        ).unwrap();
+        // Target: production export
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (1, 'function', 'compute_thing', 'compute_thing', 1, 5, 'fn compute_thing(){}', 0)",
+            [],
+        ).unwrap(); // node 1 (target)
+        // Prod caller (real production code)
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (1, 'function', 'prod_caller', 'prod_caller', 10, 20, 'fn prod_caller(){}', 0)",
+            [],
+        ).unwrap(); // node 2
+        // Bench caller (path = benches/, name doesn't start with test_)
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (2, 'function', 'bench_compute', 'bench_compute', 1, 10, 'fn bench_compute(){}', 0)",
+            [],
+        ).unwrap(); // node 3
+        // Integration test caller (path = tests/, but is_test=0 since path-based)
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (3, 'function', 'test_compute_works', 'test_compute_works', 1, 10, 'fn test_compute_works(){}', 0)",
+            [],
+        ).unwrap(); // node 4
+        // Edges: all three call the target (node 1)
+        conn.execute("INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (2, 1, 'calls', NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (3, 1, 'calls', NULL)", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (4, 1, 'calls', NULL)", []).unwrap();
+
+        let exports = get_module_exports(conn, "src/foo.rs").unwrap();
+        let target = exports.iter().find(|e| e.name == "compute_thing")
+            .expect("compute_thing must be in exports");
+        assert_eq!(
+            target.caller_count, 1,
+            "caller_count must exclude bench_/tests/ source edges; got {} (expected 1 prod-only)",
+            target.caller_count,
         );
     }
 }

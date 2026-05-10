@@ -113,7 +113,12 @@ impl McpServer {
                     let callers = queries::get_edge_sources_with_files(self.db.conn(), n.id, CALLS)?;
                     result["calls"] = json!(callees.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
                     let (filtered, test_count) = if include_tests {
-                        (callers, 0)
+                        // Stable sort prod-first: downstream truncation in centralized_compress
+                        // keeps first 10 + last 5; without this, test-heavy SQL row order can
+                        // crowd all production callers out of the kept window.
+                        let mut all = callers;
+                        all.sort_by_key(|(n, f)| is_test_symbol(n, f));
+                        (all, 0)
                     } else {
                         let total = callers.len();
                         let prod: Vec<_> = callers.into_iter()
@@ -220,7 +225,12 @@ impl McpServer {
             let callers = queries::get_edge_sources_with_files(self.db.conn(), node.id, CALLS)?;
             result["calls"] = json!(callees.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
             let (filtered, test_count) = if include_tests {
-                (callers, 0)
+                // Stable sort prod-first: downstream truncation in centralized_compress
+                // keeps first 10 + last 5; without this, test-heavy SQL row order can
+                // crowd all production callers out of the kept window.
+                let mut all = callers;
+                all.sort_by_key(|(n, f)| is_test_symbol(n, f));
+                (all, 0)
             } else {
                 let total = callers.len();
                 let prod: Vec<_> = callers.into_iter()
@@ -347,5 +357,36 @@ impl McpServer {
             return None;
         }
         Some(collected.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::is_test_symbol;
+
+    #[test]
+    fn called_by_prod_first_sort_survives_truncation() {
+        // SQL row order without ORDER BY can interleave or cluster test callers.
+        // Worst case observed: tests/integration.rs hits at array tail and
+        // src/foo/bar.rs unit tests at head, leaving zero prod callers in
+        // a `first 10 + last 5` truncation window.
+        let mut callers: Vec<(String, String)> = vec![
+            ("test_v1_to_v2_migration".into(), "src/storage/db.rs".into()),
+            ("test_init_creates_db_and_tables".into(), "src/storage/db.rs".into()),
+            ("cmd_health_check".into(), "src/cli.rs".into()),
+            ("run_full_index".into(), "src/indexer/pipeline/mod.rs".into()),
+            ("tool_module_overview".into(), "src/mcp/server/tools/overview.rs".into()),
+            ("test_camelcase_search_finds_split_tokens".into(), "tests/integration.rs".into()),
+            ("test_type_based_search".into(), "tests/integration.rs".into()),
+        ];
+        callers.sort_by_key(|(n, f)| is_test_symbol(n, f));
+
+        let prod_count = callers.iter().take_while(|(n, f)| !is_test_symbol(n, f)).count();
+        assert_eq!(prod_count, 3, "prod callers must occupy contiguous prefix");
+        let prod_names: std::collections::HashSet<&str> =
+            callers[..prod_count].iter().map(|(n, _)| n.as_str()).collect();
+        assert!(prod_names.contains("cmd_health_check"));
+        assert!(prod_names.contains("run_full_index"));
+        assert!(prod_names.contains("tool_module_overview"));
     }
 }
