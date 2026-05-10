@@ -109,22 +109,22 @@ pub fn is_function_node_type(node_type: &str) -> bool {
 pub const NON_FUNCTION_IMPACT_WARNING: &str = "Impact analysis tracks function call chains. This symbol is not a function — actual usage (imports, field access, type annotations, instantiation) may be broader than shown. Use `find_references` (MCP) or `code-graph-mcp refs <symbol>` (CLI) to find all references.";
 
 // -- Test symbol detection --
-/// Check if a symbol is a test function/file based on naming conventions.
+/// Check if a symbol is a test/harness function/file based on naming conventions.
 /// Used by both MCP server and CLI to separate test vs production callers.
+///
+/// `benches/` is classified as test/harness because criterion benchmarks are
+/// macro-driven entry points (`criterion_group!`) — counting them as production
+/// callers inflates impact-analysis risk and corrupts caller_count rankings.
 pub fn is_test_symbol(name: &str, file_path: &str) -> bool {
     name.starts_with("test_")
         || name.ends_with("Test") || name.ends_with("Tests")
         || file_path.starts_with("tests/") || file_path.starts_with("test/")
+        || file_path.starts_with("benches/") || file_path.starts_with("bench/")
         || file_path.contains("__tests__/")
         || file_path.ends_with("_test.go") || file_path.ends_with("_test.rs")
         || file_path.ends_with(".test.ts") || file_path.ends_with(".test.js")
         || file_path.ends_with(".test.tsx") || file_path.ends_with(".test.jsx")
         || file_path.ends_with(".spec.ts") || file_path.ends_with(".spec.js")
-}
-
-/// Enhanced test detection: combines naming heuristic with AST-level is_test flag.
-pub fn is_test_symbol_or_annotated(name: &str, file_path: &str, is_test_from_ast: bool) -> bool {
-    is_test_from_ast || is_test_symbol(name, file_path)
 }
 
 // -- Dead-code ignore defaults --
@@ -217,6 +217,19 @@ mod tests {
             ignores.iter().any(|p| p == "claude-plugin/"),
             "claude-plugin/ must be ignored — hook handlers are invoked from settings.json shell, not JS imports"
         );
+    }
+
+    /// `is_test_symbol` must classify Criterion bench files as harness so
+    /// `bench_*` callers don't leak into impact-analysis production caller_count
+    /// (e.g. `bench_fts5_search` was inflating `fts5_search`'s prod caller count).
+    #[test]
+    fn test_is_test_symbol_classifies_benches_as_harness() {
+        assert!(is_test_symbol("bench_fts5_search", "benches/indexing.rs"));
+        assert!(is_test_symbol("bench_call_graph", "benches/indexing.rs"));
+        assert!(is_test_symbol("anything", "bench/foo.rs"));
+        // Production code in src/ is unaffected
+        assert!(!is_test_symbol("fts5_search", "src/storage/queries/search.rs"));
+        assert!(!is_test_symbol("conn", "src/storage/db.rs"));
     }
 
     #[test]

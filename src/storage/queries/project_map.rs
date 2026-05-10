@@ -105,6 +105,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
                AND n.is_test = 0 \
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
                AND f.path NOT LIKE 'tests/%' \
+               AND f.path NOT LIKE 'benches/%' \
                AND f.path NOT LIKE '%_test.%' \
              GROUP BY n.id \
              ORDER BY cnt DESC \
@@ -234,17 +235,20 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     }
 
     // 5. Hot functions (C1: filter test code, split prod/test caller counts, C3: use REL_CALLS constant)
+    // benches/ is classified as test/harness — see domain.rs::is_test_symbol.
     let mut hot_functions = Vec::new();
     {
         let sql = "SELECT n.name, n.type, f.path, \
                COUNT(CASE WHEN src.is_test = 0 \
                           AND src.name NOT LIKE 'test\\_%' ESCAPE '\\' \
                           AND sf.path NOT LIKE 'tests/%' \
+                          AND sf.path NOT LIKE 'benches/%' \
                           AND sf.path NOT LIKE '%_test.%' \
                      THEN e.id END) as prod_cnt, \
                COUNT(CASE WHEN src.is_test = 1 \
                           OR src.name LIKE 'test\\_%' ESCAPE '\\' \
                           OR sf.path LIKE 'tests/%' \
+                          OR sf.path LIKE 'benches/%' \
                           OR sf.path LIKE '%_test.%' \
                      THEN e.id END) as test_cnt \
              FROM nodes n \
@@ -258,6 +262,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
                AND n.is_test = 0 \
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
                AND f.path NOT LIKE 'tests/%' \
+               AND f.path NOT LIKE 'benches/%' \
                AND f.path NOT LIKE '%_test.%' \
              GROUP BY n.name, n.type, f.path \
              HAVING prod_cnt > 0 \

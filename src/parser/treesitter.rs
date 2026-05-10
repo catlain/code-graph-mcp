@@ -119,8 +119,8 @@ fn extract_nodes(
 
     // JS/TS test-framework call blocks (Jest/Mocha/Vitest/Node): describe()/it()/
     // test()/beforeEach()/etc. Function definitions inside these callback args are
-    // test code, not production. Propagate in_test_context so downstream filters
-    // (is_test_symbol_or_annotated) can exclude them.
+    // test code, not production. Propagate in_test_context so the AST `is_test`
+    // flag (stored on the node and checked in SQL via `n.is_test = 0`) excludes them.
     if matches!(config.name, "javascript" | "typescript" | "tsx")
         && kind == "call_expression"
         && !in_test_context
