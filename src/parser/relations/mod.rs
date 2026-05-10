@@ -229,7 +229,26 @@ fn walk_for_relations(
                 None => None,
             };
             if let Some(scope) = call_scope {
-                if let Some((callee, qualifier)) = extract_callee(&node, source, language, None) {
+                if let Some((callee, mut qualifier)) = extract_callee(&node, source, language, current_rust_impl) {
+                    // Fill SelfRecv/SelfType payload from current impl context.
+                    // The helper emits these with empty payload because it
+                    // doesn't know the enclosing impl's type; we know it here.
+                    let needs_payload = matches!(&qualifier,
+                        helpers::CalleeQualifier::SelfRecv(t) | helpers::CalleeQualifier::SelfType(t) if t.is_empty()
+                    );
+                    if needs_payload {
+                        match &mut qualifier {
+                            helpers::CalleeQualifier::SelfRecv(t) | helpers::CalleeQualifier::SelfType(t) => {
+                                if let Some(impl_type) = current_rust_impl {
+                                    *t = impl_type.to_string();
+                                } else {
+                                    // self/Self called outside an impl block — drop qualifier (Bare).
+                                    qualifier = helpers::CalleeQualifier::Bare;
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
                     let metadata = serialize_callee_qualifier(&qualifier);
                     results.push(ParsedRelation {
                         source_name: scope,

@@ -1272,3 +1272,23 @@ fn test_rust_callee_builder_chain_qualifier() {
     );
 }
 
+#[test]
+fn test_rust_callee_self_recv_within_impl() {
+    let code = r#"
+        struct Db;
+        impl Db {
+            fn caller(&self) { self.helper(); }
+            fn helper(&self) {}
+        }
+    "#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "helper")
+        .expect("missing call to helper");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"self","v":"Db"}"#),
+        "self.method() inside impl Db emits SelfRecv with type name"
+    );
+}
+
