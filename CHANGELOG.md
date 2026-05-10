@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.24.1 — Adoption tag specificity fix
+
+### Fixed
+- adopt: MEMORY.md index-line tags renamed to MCP-tool-aligned multi-word
+  form (`impact-analysis`, `find-references`, `module-overview`,
+  `semantic-search`, `dependency-graph`, `trace-http-chain`, `http-route`,
+  `find-similar-code`). Previous single-word tags (`impact`, `refs`,
+  `overview`, `semantic`, `deps`, `trace`, `route`, `similar`) collided
+  with release-notes and commit-message prose under the claudemd §11
+  `read-the-file` hook's word-boundary + 0-2 char declension regex,
+  producing false-positive denies on prose like "fail-open semantics" or
+  "overview of changes". `callgraph`, `ast-search`, `dead-code` retained
+  (already multi-word). Affects four index-line variants in
+  `claude-plugin/scripts/adopt.js` (generic + web-* / frontend /
+  rust-go-python-node) and the Rust drift mirror in
+  `tests/routing_bench.rs`.
+
+### Migration
+- Existing adopted projects auto-refresh on next plugin SessionStart:
+  `needsRefresh` does bytewise compare of MEMORY.md against the new
+  `desiredBlock`; `stripSentinelBlock` cleans the old block (still v1
+  sentinel — no version bump needed) and the new block is written in
+  place. Lock manual edits with `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`.
+
+### Verification
+- Hook-regex stress prose: OLD tags 3 FP (`impact`, `overview`,
+  `semantics`) → NEW tags 0 FP; legitimate references still match.
+- `adopt.test.js`: 66/66 pass. New regression case `stale INDEX_LINE →
+  adopt rewrites in place without duplicating sentinel blocks` covers
+  the bump-without-strip-extension failure mode (would otherwise leave
+  orphan v1 + new v2 blocks).
+- `routing_bench index_line_drift_check`: pass (Rust mirror byte-aligned
+  with JS source).
+- routing_bench context-rich (2026-05-11, OpenRouter sonnet-4.5,
+  domain=all, 3-run majority vote, 382s): Recall 41/42 = 97.6%,
+  FP-rate 0/10 = 0%, Overall 51/52 = 98.1% — **zero regression** vs
+  v0.17.3+pm-desc-dedup baseline (Backend 22/22 = 100% kept; Frontend
+  19/20 = 95% kept; same residual path-anchored `src/components/` miss
+  unrelated to this change). Confirms tag-rename preserves routing
+  signal.
+
 ## v0.24.0 — Bare-name call qualifier (Rust)
 
 ### Fixed

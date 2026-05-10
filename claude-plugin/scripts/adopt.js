@@ -33,9 +33,16 @@ function readAdoptedBy(filePath) {
 // scratch dirs, mixed repos). Per-type variants live in `buildIndexLine` and
 // are computed per-cwd at adopt + needsRefresh time. Adopted-project receives
 // the typed variant; everyone else falls back to this canonical line.
+// Tags MUST be ≥4 chars and topic-specific (per claudemd §11-EXT Tag-specificity).
+// Generic single-word English tags (impact / refs / overview / semantic / deps /
+// trace / route / similar) substring-match release-notes / commit-message prose
+// via the §11 read-the-file hook regex (word-boundary + 0–2 declension chars),
+// producing false-positive denies. Each tag below aligns with its MCP tool name
+// (impact_analysis / find_references / module_overview / …) so hyphenated literals
+// never collide with natural prose.
 const INDEX_LINE =
   '- [code-graph-mcp](plugin_code_graph_mcp.md) ' +
-  '[impact, callgraph, refs, overview, semantic, ast-search, dead-code, similar, deps, trace] — ' +
+  '[impact-analysis, callgraph, find-references, module-overview, semantic-search, ast-search, dead-code, find-similar-code, dependency-graph, trace-http-chain] — ' +
   '改 X 影响面/谁调用 X/X 被谁用/看 X 源码/Y 模块长啥样/概念查询 优先于 Grep；字面匹配走 Grep。' +
   '核心 7（get_call_graph/module_overview/semantic_code_search/ast_search/find_references/get_ast_node/project_map）' +
   '+ 进阶 5（impact_analysis/trace_http_chain/dependency_graph/find_similar_code/find_dead_code），决策表见全文';
@@ -235,12 +242,12 @@ function buildIndexLine(projectType = 'generic') {
     case 'web-py':
     case 'web-go':
       return prefix +
-        '[trace, route, callgraph, impact, refs, overview, semantic, deps] — ' +
+        '[trace-http-chain, http-route, callgraph, impact-analysis, find-references, module-overview, semantic-search, dependency-graph] — ' +
         'HTTP 路由→handler 链路用 trace_http_chain（或 get_call_graph route_path=）；改 handler 影响面用 impact；' +
         '其他结构化查询同上 优先于 Grep。' + coreSuffix;
     case 'frontend':
       return prefix +
-        '[refs, overview, semantic, callgraph, impact, ast-search] — ' +
+        '[find-references, module-overview, semantic-search, callgraph, impact-analysis, ast-search] — ' +
         '组件重命名/重构用 find_references（含 imports/inherits）；模块层级用 module_overview；' +
         '改 props/接口前用 impact 看下游；HTTP route 通常不适用。' + coreSuffix;
     case 'rust':
@@ -248,7 +255,7 @@ function buildIndexLine(projectType = 'generic') {
     case 'python':
     case 'node':
       return prefix +
-        '[callgraph, impact, refs, overview, semantic, ast-search, dead-code, deps] — ' +
+        '[callgraph, impact-analysis, find-references, module-overview, semantic-search, ast-search, dead-code, dependency-graph] — ' +
         '改 X 影响面/谁调用 X/Y 模块 优先于 Grep；HTTP route 追踪通常不适用（无 web 框架）；' +
         '字面匹配走 Grep。' + coreSuffix;
     case 'generic':

@@ -648,7 +648,7 @@ test('buildIndexLine generic returns the canonical INDEX_LINE byte-for-byte', ()
 
 test('buildIndexLine web-rs prepends route/trace tags + handler-focused lead', () => {
   const line = buildIndexLine('web-rs');
-  assert.match(line, /\[trace, route,/, 'web-rs index line should lead with trace/route tags');
+  assert.match(line, /\[trace-http-chain, http-route,/, 'web-rs index line should lead with trace-http-chain/http-route tags');
   assert.match(line, /HTTP 路由/, 'lead sentence should mention HTTP routes');
 });
 
@@ -672,6 +672,57 @@ test('adopt + needsRefresh agree on typed INDEX_LINE — no spurious refresh in 
     const index = fs.readFileSync(indexPath, 'utf8');
     assert.ok(index.includes('优先于 Grep'),
       'MEMORY.md should contain the rust-typed index line');
+  } finally { sb.cleanup(); }
+});
+
+test('stale INDEX_LINE → adopt rewrites in place without duplicating sentinel blocks', () => {
+  // Regression for the v0.24+ tag-rename fix (feedback_adoption_tag_specificity).
+  // If a user's MEMORY.md was written by an older code-graph-mcp (pre-rename),
+  // SessionStart → maybeAutoAdopt → needsRefresh must detect the drift,
+  // stripSentinelBlock must locate the old v1 block by sentinel marker, and
+  // the rewrite must end with exactly one BEGIN/END pair. Breaks if anyone
+  // bumps SENTINEL_BEGIN without teaching stripSentinelBlock to also match
+  // the prior version — would leave an orphan v1 block plus a new v2 block.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'), '[package]\nname="x"\n');
+    // Plant pre-rename MEMORY.md: well-formed v1 sentinel + an obsolete tag
+    // line that no current buildIndexLine variant produces. Exact prior bytes
+    // don't matter — only that it differs from today's desiredBlock.
+    const stalePayload =
+      '- [code-graph-mcp](plugin_code_graph_mcp.md) [obsolete-tag, another-stale] — stale lead sentence kept for drift detection.';
+    const indexPath = path.join(sb.dir, 'MEMORY.md');
+    const neighbor = '- [user_profile.md](user_profile.md) — neighbor (must survive)';
+    fs.writeFileSync(
+      indexPath,
+      `# Memory Index\n\n${neighbor}\n\n${SENTINEL_BEGIN}\n${stalePayload}\n${SENTINEL_END}\n`
+    );
+    // Plant target file so isAdopted/needsRefresh treat this as a real prior
+    // adoption (body bytewise-identical to shipped template — drift is only
+    // in MEMORY.md, not the template body).
+    const tplBody = fs.readFileSync(TEMPLATE_PATH);
+    const marker = Buffer.from(`<!-- adopted-by: ${sb.cwd} -->\n`);
+    fs.writeFileSync(path.join(sb.dir, TARGET_NAME), Buffer.concat([marker, tplBody]));
+
+    assert.strictEqual(isAdopted({ cwd: sb.cwd, home: sb.home }), true,
+      'precondition: planted state should look adopted');
+    assert.strictEqual(needsRefresh({ cwd: sb.cwd, home: sb.home }), true,
+      'tag-list drift must trigger refresh');
+
+    adopt({ cwd: sb.cwd, home: sb.home });
+
+    const after = fs.readFileSync(indexPath, 'utf8');
+    const escBegin = SENTINEL_BEGIN.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+    const escEnd = SENTINEL_END.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+    const beginHits = (after.match(new RegExp(escBegin, 'g')) || []).length;
+    const endHits = (after.match(new RegExp(escEnd, 'g')) || []).length;
+    assert.strictEqual(beginHits, 1, 'exactly one sentinel BEGIN after rewrite (no duplicate blocks)');
+    assert.strictEqual(endHits, 1, 'exactly one sentinel END after rewrite');
+    assert.ok(!after.includes('obsolete-tag'), 'stale tag list must be gone');
+    assert.ok(!after.includes('another-stale'), 'stale tag list must be gone');
+    assert.ok(after.includes(neighbor), 'neighbor entry preserved');
+    assert.strictEqual(needsRefresh({ cwd: sb.cwd, home: sb.home }), false,
+      'post-refresh needsRefresh must be false (no SessionStart refresh loop)');
   } finally { sb.cleanup(); }
 });
 
