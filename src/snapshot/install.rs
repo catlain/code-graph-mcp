@@ -53,12 +53,24 @@ fn parse_github_remote(url: &str) -> Option<(String, String)> {
 
 fn fetch_latest_snapshot_asset_url(owner: &str, repo: &str) -> Option<String> {
     // Use `gh api` for uniform auth (public + private). Fail silent on no `gh`.
+    // Wrap with a 5s SIGTERM watchdog so a slow proxy / hung gh subprocess
+    // can't block MCP server startup indefinitely (Task 10 review Q5).
     let endpoint = format!("repos/{owner}/{repo}/releases/latest");
-    let output = std::process::Command::new("gh")
+    let child = std::process::Command::new("gh")
         .args(["api", &endpoint])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let pid_for_kill = child.id();
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        // Best-effort kill; the wait below will then return.
+        unsafe { libc::kill(pid_for_kill as i32, libc::SIGTERM); }
+    });
+    let output = child.wait_with_output().ok().filter(|o| o.status.success())?;
+    // Detach the watchdog — it'll noop after we've exited because pid is dead.
+    drop(watchdog);
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     let assets = json.get("assets")?.as_array()?;
     let mut matches: Vec<&str> = assets

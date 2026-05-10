@@ -400,7 +400,7 @@ impl McpServer {
     /// happens in `maybe_install_snapshot` inside `from_project_root` BEFORE
     /// `self.db` is opened, so the inode-swap issue never arises.
     #[allow(dead_code)] // reserved for Task 11 (reindex --from-snapshot) and Task 12 (health-check)
-    fn try_install_snapshot(&self, project_root: &Path) -> bool {
+    pub(crate) fn try_install_snapshot(&self, project_root: &Path) -> bool {
         let url = match crate::snapshot::resolve_snapshot_source(project_root) {
             Some(u) => u,
             None => {
