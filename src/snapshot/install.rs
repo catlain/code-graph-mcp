@@ -104,11 +104,9 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
         decompress_with_cap(&zst_partial, &db_partial, MAX_DECOMPRESSED_BYTES)?;
         validate(&db_partial, root)?;
 
-        // Atomic rename: on POSIX this is atomic; replaces existing file
+        // POSIX rename(2) atomically replaces the destination — pre-deleting
+        // would open a TOCTOU window where a concurrent reader sees no file.
         let final_db = cg_dir.join("index.db");
-        if final_db.exists() {
-            std::fs::remove_file(&final_db).ok();
-        }
         std::fs::rename(&db_partial, &final_db)?;
 
         // Write consumer-side meta (source_url + fetched_at)
@@ -146,9 +144,12 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
 
 fn download(url: &str, dest: &Path) -> Result<()> {
     if let Some(file_path) = url.strip_prefix("file://") {
+        // file:// is test-only and config-controlled; no path sanitisation.
         std::fs::copy(file_path, dest).context("file:// copy")?;
         return Ok(());
     }
+    // TODO: stream to disk (reqwest copy_to) and apply MAX_DECOMPRESSED_BYTES
+    // cap to the compressed payload too — currently buffers the whole response.
     let bytes = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?
