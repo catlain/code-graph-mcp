@@ -89,7 +89,7 @@ impl CliContext {
 // --- Argument helpers ---
 
 /// Flags that take a value argument (not boolean).
-const VALUE_FLAGS: &[&str] = &["--limit", "--type", "--returns", "--params", "--direction", "--depth", "--format", "--file", "--language", "--change-type", "--top-k", "--max-distance", "--node-type", "--node-id", "--context-lines", "--relation", "--min-lines"];
+const VALUE_FLAGS: &[&str] = &["--limit", "--type", "--returns", "--params", "--direction", "--depth", "--format", "--file", "--language", "--change-type", "--top-k", "--max-distance", "--node-type", "--node-id", "--context-lines", "--relation", "--min-lines", "--out", "--root"];
 
 fn get_positional(args: &[String], index: usize) -> Option<&str> {
     let mut pos = 0;
@@ -495,6 +495,41 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
         "partial"
     };
 
+    // Snapshot metadata block — reads keys written by `snapshot install`.
+    let snapshot_url = crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_SOURCE_URL)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let snapshot_commit = crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_SOURCE_COMMIT)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let snapshot_fetched_at = crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_FETCHED_AT)
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<i64>().ok());
+    let snapshot_status = if snapshot_url.is_some() { "present" } else { "absent" };
+    // commit_drift: how many local commits landed after the snapshot was taken.
+    let commit_drift = snapshot_commit.as_deref().and_then(|c| {
+        std::process::Command::new("git")
+            .args(["rev-list", "--count", &format!("{c}..HEAD")])
+            .current_dir(project_root)
+            .output()
+            .ok()
+            .and_then(|o| if o.status.success() {
+                String::from_utf8_lossy(&o.stdout).trim().parse::<i64>().ok()
+            } else {
+                None
+            })
+    });
+    let snapshot_block = serde_json::json!({
+        "status": snapshot_status,
+        "source_url": snapshot_url,
+        "source_commit": snapshot_commit,
+        "fetched_at": snapshot_fetched_at,
+        "commit_drift": commit_drift,
+    });
+
     match format {
         "json" => {
             let mut json = serde_json::json!({
@@ -510,6 +545,7 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 "embedding_coverage_pct": coverage_pct,
                 "embedding_status": embedding_status,
                 "model_available": model_available,
+                "snapshot": snapshot_block,
             });
             if let Some(ts) = status.last_indexed_at {
                 json["last_indexed_at"] = serde_json::json!(ts);
@@ -537,6 +573,7 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                     "OK: {} nodes, {} edges, {} files{}",
                     status.nodes_count, status.edges_count, status.files_count, age_info
                 );
+                println!("Snapshot: {}", snapshot_status);
             } else if !schema_ok {
                 eprintln!(
                     "UNHEALTHY: schema version mismatch (got {}, expected {})",
@@ -2997,6 +3034,77 @@ pub fn cmd_benchmark(project_root: &Path, args: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `snapshot create --out <path> [--include-embeddings] [--root <dir>] [--quiet]`
+pub fn cmd_snapshot_create(project_root: &Path, args: &[String]) -> Result<()> {
+    let out = get_flag_value(args, "--out")
+        .ok_or_else(|| anyhow::anyhow!("--out <path> is required"))?
+        .to_string();
+    let include = has_flag(args, "--include-embeddings");
+    let quiet = has_flag(args, "--quiet");
+
+    let root = get_flag_value(args, "--root")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| project_root.to_path_buf());
+
+    crate::snapshot::create(&root, std::path::Path::new(&out), include)?;
+    if !quiet {
+        eprintln!("snapshot created: {}", out);
+    }
+    Ok(())
+}
+
+/// `snapshot inspect <file.db.zst>` — JSON output to stdout
+pub fn cmd_snapshot_inspect(args: &[String]) -> Result<()> {
+    // get_positional skips args[0] (binary) and args[1] (subcommand) internally;
+    // for `snapshot inspect <file>` the dispatch happens at args[1]="snapshot",
+    // args[2]="inspect", so <file> is the first positional after the subcommand
+    // pair — but get_positional's skip-2 treats args[1] as the single subcommand.
+    // We therefore pass args starting from "inspect" as the subcommand context by
+    // reading args[3] directly (binary=0, "snapshot"=1, "inspect"=2, file=3).
+    let file = args
+        .get(3)
+        .ok_or_else(|| anyhow::anyhow!("snapshot inspect <file.db.zst> required"))?;
+    let meta = crate::snapshot::inspect(std::path::Path::new(file))?;
+    println!("{}", serde_json::to_string_pretty(&meta)?);
+    Ok(())
+}
+
+// --- reindex subcommand ---
+
+/// `reindex [--from-snapshot]` — wipe `.code-graph/` index files and re-fetch
+/// snapshot (or full-index if no snapshot available). Without `--from-snapshot`,
+/// behaves identically to `incremental-index`.
+///
+/// Equivalent to user-side `rm -rf .code-graph/index.db*` + restarting the
+/// MCP server, but with optional snapshot-bootstrap acceleration.
+pub fn cmd_reindex(project_root: &Path, args: &[String]) -> Result<()> {
+    let from_snapshot = has_flag(args, "--from-snapshot");
+    let cg_dir = project_root.join(crate::domain::CODE_GRAPH_DIR);
+
+    if from_snapshot && cg_dir.exists() {
+        // Remove just index.db + WAL files; leave usage.jsonl etc. intact.
+        for name in ["index.db", "index.db-wal", "index.db-shm"] {
+            let _ = std::fs::remove_file(cg_dir.join(name));
+        }
+    }
+
+    if from_snapshot {
+        if let Some(url) = crate::snapshot::resolve_snapshot_source(project_root) {
+            match crate::snapshot::try_install(&url, project_root) {
+                Ok(commit) => {
+                    eprintln!("Snapshot installed at commit {commit}");
+                    return cmd_incremental_index(project_root, false);
+                }
+                Err(e) => eprintln!("Snapshot install failed ({e}), falling back to full index"),
+            }
+        } else {
+            eprintln!("No snapshot source resolved, falling back to full index");
+        }
+    }
+
+    cmd_incremental_index(project_root, false)
 }
 
 #[cfg(test)]

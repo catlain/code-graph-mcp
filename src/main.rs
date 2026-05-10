@@ -49,6 +49,10 @@ fn main() -> Result<()> {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_rebuild_index(&project_root, &args)
         }
+        Some("reindex") => {
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            code_graph_mcp::cli::cmd_reindex(&project_root, &args)
+        }
         Some("health-check") => {
             // Support both --format json and --json for consistency with other commands
             let format = if args.iter().any(|a| a == "--json") {
@@ -133,6 +137,22 @@ fn main() -> Result<()> {
         }
         Some("adopt") => run_node_script("adopt.js", &[]),
         Some("unadopt") => run_node_script("adopt.js", &["unadopt".to_string()]),
+        Some("snapshot") => {
+            let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            match sub {
+                "create" => {
+                    let project_root = code_graph_mcp::cli::resolve_project_root()?;
+                    code_graph_mcp::cli::cmd_snapshot_create(&project_root, &args)
+                }
+                "inspect" => code_graph_mcp::cli::cmd_snapshot_inspect(&args),
+                _ => {
+                    eprintln!("Usage:");
+                    eprintln!("  snapshot create --out <path> [--include-embeddings] [--root <dir>] [--quiet]");
+                    eprintln!("  snapshot inspect <file.db.zst>");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some(other) => {
             eprintln!("Unknown subcommand: {}", other);
             if let Some(suggestion) = suggest_subcommand(other) {
@@ -172,6 +192,9 @@ fn print_help() {
     println!("    dead-code [path]    Find unused code (orphans and exported-unused symbols)");
     println!("    incremental-index   Run incremental index update");
     println!("    rebuild-index       Drop and rebuild the index from scratch (requires --confirm)");
+    println!("    reindex [--from-snapshot]");
+    println!("                        Reset index; with --from-snapshot, refetches the");
+    println!("                        published snapshot (else falls back to full index)");
     println!("    health-check        Query index status");
     println!("                        (Note: file watcher start/stop is MCP-only — see start_watch/stop_watch tools)");
     println!("    doctor              Diagnose and repair environment issues");
@@ -179,7 +202,11 @@ fn print_help() {
     println!("    stats               Aggregate session metrics from .code-graph/usage.jsonl");
     println!("                        (which tools you used, search/index activity)");
     println!("    adopt               Install plugin_code_graph_mcp.md memory + MEMORY.md sentinel");
-    println!("    unadopt             Remove the memory file + sentinel block\n");
+    println!("    unadopt             Remove the memory file + sentinel block");
+    println!("    snapshot create --out <path> [--include-embeddings] [--root <dir>] [--quiet]");
+    println!("                        Build a portable graph snapshot (.db.zst) for sharing");
+    println!("    snapshot inspect <file.db.zst>");
+    println!("                        Print snapshot metadata as JSON\n");
     println!("OPTIONS:");
     println!("    --json              JSON output (available on all commands)");
     println!("    --compact           Compact output (search, callgraph, map, overview, deps, refs)");
@@ -306,8 +333,8 @@ fn run_serve() -> Result<()> {
 const SUBCOMMANDS: &[&str] = &[
     "serve", "grep", "search", "ast-search", "callgraph", "impact",
     "show", "map", "overview", "deps", "trace", "similar", "refs",
-    "dead-code", "incremental-index", "rebuild-index", "health-check", "doctor",
-    "benchmark", "stats", "adopt", "unadopt",
+    "dead-code", "incremental-index", "rebuild-index", "reindex", "health-check", "doctor",
+    "benchmark", "stats", "adopt", "unadopt", "snapshot",
     // MCP tool names accepted as aliases (see dispatch above). Listed here so
     // typo-suggester picks the closer alias for inputs like "project_mapp".
     "project_map", "module_overview", "get_ast_node", "find_references",

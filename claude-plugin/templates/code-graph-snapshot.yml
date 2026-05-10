@@ -1,0 +1,35 @@
+# Copy this file into .github/workflows/ in your project to publish a
+# code-graph snapshot alongside each GitHub release. The snapshot is a
+# small (~3-5MB) zstd-compressed SQLite database that lets first-time
+# clones of your repo skip the initial full code-graph index.
+#
+# Requires: code-graph-mcp >= 0.23.0 published to npm.
+
+name: Code Graph Snapshot
+on:
+  release:
+    types: [published]
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build snapshot
+        run: |
+          npx -y code-graph-mcp@latest snapshot create --out snapshot.db
+          zstd -9 snapshot.db -o snapshot.db.zst
+          mv snapshot.db.zst "code-graph-snapshot-${GITHUB_SHA:0:7}.db.zst"
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "code-graph-snapshot-${GITHUB_SHA:0:7}.db.zst"
