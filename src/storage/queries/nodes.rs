@@ -348,13 +348,19 @@ pub fn get_nodes_by_file_path(conn: &Connection, file_path: &str) -> Result<Vec<
     Ok(results)
 }
 
-/// List nodes filtered by type/returns/params without FTS5 query.
-/// Used by ast-search when no keyword is given but structural filters are present.
+/// List nodes filtered by type/returns/params/name without FTS5 query.
+/// Used by ast-search filter-only path AND as a fallback when FTS query returned
+/// zero post-type-filter results (FTS ranking can drown structs/enums under
+/// function-name hits — e.g. `query="Result" type=struct` returns 0 because the
+/// top FTS hits for "Result" are functions like `compress_results`).
+///
+/// `name_filter` does case-insensitive substring match on `n.name`.
 pub fn get_nodes_with_files_by_filters(
     conn: &Connection,
     type_filter: Option<&[&str]>,
     returns_filter: Option<&str>,
     params_filter: Option<&str>,
+    name_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<NodeWithFile>> {
     use crate::domain::REL_CALLS;
@@ -380,7 +386,12 @@ pub fn get_nodes_with_files_by_filters(
     if let Some(pt) = params_filter {
         conditions.push(format!("LOWER(n.param_types) LIKE ?{}", param_idx));
         params.push(Box::new(format!("%{}%", pt.to_lowercase())));
-        let _ = param_idx; // suppress unused warning
+        param_idx += 1;
+    }
+    if let Some(nf) = name_filter {
+        conditions.push(format!("LOWER(n.name) LIKE ?{}", param_idx));
+        params.push(Box::new(format!("%{}%", nf.to_lowercase())));
+        let _ = param_idx;
     }
 
     let where_clause = if conditions.is_empty() {
@@ -796,7 +807,7 @@ mod tests {
 
         let types: &[&str] = &["function"];
         let results = get_nodes_with_files_by_filters(
-            db.conn(), Some(types), Some("Result"), None, 10,
+            db.conn(), Some(types), Some("Result"), None, None, 10,
         ).unwrap();
 
         assert_eq!(results[0].node.id, hot, "hot_fn (3 callers) must outrank cold_fn (1)");
@@ -805,10 +816,59 @@ mod tests {
 
         // With limit=1, hot_fn still wins even though alphabetically-first file exists
         let top1 = get_nodes_with_files_by_filters(
-            db.conn(), Some(types), Some("Result"), None, 1,
+            db.conn(), Some(types), Some("Result"), None, None, 1,
         ).unwrap();
         assert_eq!(top1.len(), 1);
         assert_eq!(top1[0].node.id, hot,
             "limit=1 with alphabetical ORDER BY would return cold_fn — regression guard");
+    }
+
+    /// `name_filter` does case-insensitive substring on n.name. Underwrites the
+    /// ast_search FTS-rank fallback (query="Result" type=struct must surface
+    /// IndexResult/CallGraphResult/etc instead of zero hits because top FTS
+    /// hits for "Result" are functions like `compress_results`).
+    #[test]
+    fn test_get_nodes_with_files_by_filters_name_filter() {
+        let (db, _tmp) = test_db();
+        let file_id = upsert_file(db.conn(), &FileRecord {
+            path: "src/lib.rs".into(), blake3_hash: "h".into(),
+            last_modified: 1, language: Some("rust".into()),
+        }).unwrap();
+
+        let mk = |name: &str, ty: &str| -> i64 {
+            insert_node(db.conn(), &NodeRecord {
+                file_id, node_type: ty.into(), name: name.into(),
+                qualified_name: None, start_line: 1, end_line: 1,
+                code_content: String::new(), signature: None,
+                doc_comment: None, context_string: None, name_tokens: None,
+                return_type: None, param_types: None, is_test: false,
+            }).unwrap()
+        };
+        let idx_struct = mk("IndexResult", "struct");
+        let cg_struct = mk("CallGraphResult", "struct");
+        let _fn1 = mk("compress_results", "function");
+        let _other = mk("FooBar", "struct");
+
+        let struct_types: &[&str] = &["struct"];
+        let r = get_nodes_with_files_by_filters(
+            db.conn(), Some(struct_types), None, None, Some("Result"), 10,
+        ).unwrap();
+        let ids: Vec<i64> = r.iter().map(|nwf| nwf.node.id).collect();
+        assert!(ids.contains(&idx_struct));
+        assert!(ids.contains(&cg_struct));
+        assert_eq!(r.len(), 2, "name LIKE %Result% under type=struct must match exactly 2 structs (FooBar excluded, compress_results excluded by type)");
+
+        // Case-insensitive
+        let r_lower = get_nodes_with_files_by_filters(
+            db.conn(), Some(struct_types), None, None, Some("result"), 10,
+        ).unwrap();
+        assert_eq!(r_lower.len(), 2, "name_filter must be case-insensitive");
+
+        // type=function + same name_filter excludes structs
+        let fn_types: &[&str] = &["function"];
+        let r_fn = get_nodes_with_files_by_filters(
+            db.conn(), Some(fn_types), None, None, Some("Result"), 10,
+        ).unwrap();
+        assert_eq!(r_fn.len(), 1, "type=function + name=Result matches only compress_results");
     }
 }

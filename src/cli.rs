@@ -1222,7 +1222,7 @@ pub fn cmd_ast_search(project_root: &Path, args: &[String]) -> Result<()> {
             None
         };
         queries::get_nodes_with_files_by_filters(
-            conn, type_refs, returns_filter, params_filter, limit,
+            conn, type_refs, returns_filter, params_filter, None, limit,
         )?
     };
 

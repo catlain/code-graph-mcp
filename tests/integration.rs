@@ -1622,6 +1622,83 @@ mod tests {
     }
 }
 
+/// v0.22.x fix: `module_overview compact: true + include_dead: true` must
+/// preserve the `dead_code` field. Previously `compact_module_overview`
+/// silently dropped it because the field wasn't in the forwarding allowlist —
+/// users got "include_dead silently no-op'd" with no way to see why.
+#[test]
+fn test_module_overview_compact_preserves_dead_code() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("lib.rs"), r#"
+pub fn used_fn() -> i32 { 42 }
+pub fn caller() -> i32 { used_fn() }
+
+// Orphan: no callers, exported but not imported anywhere
+pub fn orphan_long_function_name() -> i32 {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    a + b + c
+}
+"#).unwrap();
+
+    let server = common::init_server(&project);
+    let msg = tool_call_json("module_overview", serde_json::json!({
+        "path": ".", "include_dead": true, "compact": true
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    assert!(result.get("dead_code").is_some(),
+        "compact mode must forward dead_code; got keys: {:?}",
+        result.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+    let dead = &result["dead_code"];
+    assert!(dead["orphan_count"].is_number(),
+        "dead_code must have numeric orphan_count, got: {}", dead);
+}
+
+/// v0.22.x fix: `ast_search query=<identifier> type=<X>` must fall back to
+/// SQL `name LIKE '%<identifier>%'` when FTS rank drowns the matching type
+/// under unrelated hits. Pre-fix `query="Result" type=struct` returned 0 even
+/// though IndexResult/CallGraphResult/etc. exist, because top FTS hits for
+/// "Result" are functions like `compress_results`.
+#[test]
+fn test_ast_search_query_plus_type_fallback_to_name_like() {
+    let project = TempDir::new().unwrap();
+    // Two structs with "Result" in name + LOTS of fns with "result" in name AND
+    // body — pushes FTS rank toward functions so the post-type-filter empties
+    // out, forcing the fallback to fire. Without enough fn noise, FTS returns
+    // the structs in its top window and the fallback never triggers.
+    let mut src = String::from("pub struct IndexResult { pub n: i32 }\npub struct CallGraphResult { pub n: i32 }\npub struct OtherStruct { pub n: i32 }\n");
+    for i in 0..50 {
+        src.push_str(&format!(
+            "pub fn handle_result_{i}(result: i32) -> i32 {{ let result = result + {i}; result }}\n",
+            i = i,
+        ));
+    }
+    fs::write(project.path().join("lib.rs"), &src).unwrap();
+
+    let server = common::init_server(&project);
+    let msg = tool_call_json("ast_search", serde_json::json!({
+        "query": "Result", "type": "struct", "limit": 10
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let count = result["count"].as_u64().unwrap_or(0);
+    assert!(count >= 2,
+        "query='Result' type=struct must surface IndexResult + CallGraphResult via name-LIKE fallback, got count={}, results={}",
+        count, result["results"]);
+    let names: Vec<String> = result["results"].as_array().unwrap().iter()
+        .filter_map(|r| r["name"].as_str().map(|s| s.to_string())).collect();
+    assert!(names.iter().any(|n| n == "IndexResult"),
+        "IndexResult missing from fallback results: {:?}", names);
+    assert!(names.iter().any(|n| n == "CallGraphResult"),
+        "CallGraphResult missing from fallback results: {:?}", names);
+    // Hint must explain the fallback so caller knows what happened
+    assert!(result["hint"].as_str().map(|s| s.contains("name-substring")).unwrap_or(false),
+        "expected fallback hint, got: {:?}", result["hint"]);
+}
+
 /// v0.11.2 fix: disambiguation suggestions carry `node_id` AND `start_line`
 /// so callers can pick a specific definition — and same-file multi-defs
 /// (e.g. two `fn new()` in one module for different impl blocks) are flagged

@@ -237,8 +237,10 @@ impl McpServer {
         if full.get("warning").is_some() {
             result["warning"] = full["warning"].clone();
         }
-        // Forward truncation metadata so compact callers see the cap, not silent truncation
-        for key in ["active_capped", "showing", "total_active", "hint"] {
+        // Forward truncation metadata so compact callers see the cap, not silent truncation.
+        // `dead_code` is forwarded so `compact: true + include_dead: true` returns the
+        // dead-code section instead of silently dropping it.
+        for key in ["active_capped", "showing", "total_active", "hint", "dead_code"] {
             if let Some(v) = full.get(key) {
                 result[key] = v.clone();
             }
