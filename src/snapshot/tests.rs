@@ -108,3 +108,47 @@ fn inspect_round_trip() {
     assert!(meta.schema_version > 0);
     assert!(meta.file_size_bytes > 0);
 }
+
+use crate::snapshot::config::load_config;
+
+#[test]
+fn config_load_missing_file_returns_default() {
+    let dir = TempDir::new().unwrap();
+    let cfg = load_config(dir.path()).unwrap();
+    assert_eq!(cfg.snapshot.url, None);
+    assert_eq!(cfg.snapshot.disabled, false);
+}
+
+#[test]
+fn config_load_parses_snapshot_url() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(".code-graph.toml"),
+        "[snapshot]\nurl = \"https://example.com/x.db.zst\"\n",
+    ).unwrap();
+    let cfg = load_config(dir.path()).unwrap();
+    assert_eq!(cfg.snapshot.url.as_deref(), Some("https://example.com/x.db.zst"));
+    assert_eq!(cfg.snapshot.disabled, false);
+}
+
+#[test]
+fn config_load_parses_disabled() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(".code-graph.toml"),
+        "[snapshot]\ndisabled = true\n",
+    ).unwrap();
+    let cfg = load_config(dir.path()).unwrap();
+    assert_eq!(cfg.snapshot.disabled, true);
+}
+
+#[test]
+fn config_load_rejects_malformed_toml() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join(".code-graph.toml"), "not = valid = toml").unwrap();
+    let err = load_config(dir.path()).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("parse")
+        || err.to_string().to_lowercase().contains("expected")
+        || err.to_string().to_lowercase().contains("invalid"),
+        "got error message: {err}");
+}
