@@ -88,6 +88,53 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
 }
 
 /// Open a `.db.zst` file, decompress to a temp file, read meta, and return.
-pub fn inspect(_file: &Path) -> Result<SnapshotMeta> {
-    anyhow::bail!("snapshot::inspect not implemented")
+pub fn inspect(file: &Path) -> Result<SnapshotMeta> {
+    use crate::storage::db::Database;
+
+    let file_size_bytes = std::fs::metadata(file)?.len();
+
+    // Decompress to a temp file so we can open with rusqlite
+    let tmp = tempfile::tempdir().context("inspect tempdir")?;
+    let decompressed = tmp.path().join("snapshot.db");
+    let compressed = std::fs::read(file).context("read snapshot file")?;
+    let raw = zstd::decode_all(&compressed[..]).context("zstd decode")?;
+    std::fs::write(&decompressed, &raw).context("write decompressed snapshot")?;
+
+    let db = Database::open(&decompressed)?;
+    let conn = db.conn();
+
+    let source_commit = meta::read_meta(conn, meta::META_SNAPSHOT_SOURCE_COMMIT)?.unwrap_or_default();
+    let source_url = meta::read_meta(conn, meta::META_SNAPSHOT_SOURCE_URL)?;
+    let created_at = meta::read_meta(conn, meta::META_SNAPSHOT_CREATED_AT)?
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let tool_version = meta::read_meta(conn, meta::META_SNAPSHOT_TOOL_VERSION)?.unwrap_or_default();
+    let schema_version = meta::read_meta(conn, meta::META_SNAPSHOT_SCHEMA_VERSION)?
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(0);
+    let includes_vec = meta::read_meta(conn, meta::META_SNAPSHOT_INCLUDES_VEC)?
+        .map(|s| s == "true")
+        .unwrap_or(false);
+    let fetched_at = meta::read_meta(conn, meta::META_SNAPSHOT_FETCHED_AT)?
+        .and_then(|s| s.parse::<i64>().ok());
+
+    let node_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap_or(0);
+    let edge_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    Ok(SnapshotMeta {
+        source_commit,
+        source_url,
+        created_at,
+        tool_version,
+        schema_version,
+        includes_vec,
+        fetched_at,
+        node_count,
+        edge_count,
+        file_size_bytes,
+    })
 }

@@ -88,3 +88,23 @@ fn create_writes_meta_and_drops_vec_table() {
     let inc = snap_read_meta(conn, META_SNAPSHOT_INCLUDES_VEC).unwrap().unwrap();
     assert_eq!(inc, "false");
 }
+
+#[test]
+fn inspect_round_trip() {
+    let fixture = init_git_fixture();
+    let out_db = fixture.path().join("snapshot.db");
+    crate::snapshot::create(fixture.path(), &out_db, false).unwrap();
+
+    // Compress with zstd to mimic what the workflow produces
+    let raw = std::fs::read(&out_db).unwrap();
+    let compressed = zstd::encode_all(&raw[..], 9).unwrap();
+    let zst_path = fixture.path().join("snapshot.db.zst");
+    std::fs::write(&zst_path, &compressed).unwrap();
+
+    let meta = crate::snapshot::inspect(&zst_path).unwrap();
+    assert_eq!(meta.tool_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(meta.includes_vec, false);
+    assert!(meta.created_at > 0);
+    assert!(meta.schema_version > 0);
+    assert!(meta.file_size_bytes > 0);
+}
