@@ -1166,3 +1166,17 @@ fn test_rust_callee_type_method_call_path() {
     );
 }
 
+// T4: reserved-only path collapses to bare
+#[test]
+fn test_rust_callee_crate_only_path_collapses_to_bare() {
+    let code = "fn caller() { crate::foo(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "foo")
+        .expect("missing call to foo");
+    assert_eq!(
+        call.metadata, None,
+        "crate::foo() qualifier collapses to Bare after stripping reserved prefix"
+    );
+}
+
