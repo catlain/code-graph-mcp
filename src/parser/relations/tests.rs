@@ -1312,3 +1312,15 @@ fn test_rust_callee_self_type_within_impl() {
     );
 }
 
+#[test]
+fn test_non_rust_callee_metadata_unchanged() {
+    let code = "function caller() { foo.bar(); baz(); }";
+    let relations = extract_relations(code, "javascript").unwrap();
+    for r in relations.iter().filter(|r| r.relation == REL_CALLS) {
+        assert_eq!(
+            r.metadata, None,
+            "non-Rust REL_CALLS relations must keep metadata=None (regression guard for {})",
+            r.target_name
+        );
+    }
+}
