@@ -94,6 +94,10 @@ pub(crate) fn extract_callee(
         .or_else(|| node.named_child(0))?;
 
     match function.kind() {
+        // Rust grammar uses "identifier" for bare callees. Other grammars
+        // (e.g. Kotlin) use "simple_identifier"; if we ever share this match
+        // arm with them, intentionally let "simple_identifier" fall through
+        // to the `_` arm where extract_callee_name handles it generically.
         "identifier" => {
             Some((node_text(&function, source).to_string(), CalleeQualifier::Bare))
         }
@@ -136,9 +140,10 @@ fn extract_rust_scoped(
     }
     let name = all.pop()?;
     let mut path: Vec<String> = all;
-    while path.first().is_some_and(|s| matches!(s.as_str(), "crate" | "super" | "self")) {
-        path.remove(0);
-    }
+    let skip = path.iter()
+        .take_while(|s| matches!(s.as_str(), "crate" | "super" | "self"))
+        .count();
+    path.drain(..skip);
     if path.is_empty() {
         Some((name, CalleeQualifier::Bare))
     } else {
