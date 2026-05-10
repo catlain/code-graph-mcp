@@ -153,7 +153,8 @@ fn config_load_rejects_malformed_toml() {
         "got error message: {err}");
 }
 
-use crate::snapshot::install::resolve_snapshot_source;
+use crate::snapshot::install::{resolve_snapshot_source, try_install};
+use crate::snapshot::meta::{META_SNAPSHOT_FETCHED_AT, META_SNAPSHOT_SOURCE_URL};
 
 #[test]
 fn resolve_returns_none_when_no_git_no_toml() {
@@ -182,6 +183,82 @@ fn resolve_returns_none_when_disabled() {
         "[snapshot]\ndisabled = true\n",
     ).unwrap();
     assert_eq!(resolve_snapshot_source(dir.path()), None);
+}
+
+fn build_local_snapshot(fixture: &TempDir) -> std::path::PathBuf {
+    let raw_db = fixture.path().join("snapshot.db");
+    crate::snapshot::create(fixture.path(), &raw_db, false).unwrap();
+    let raw = std::fs::read(&raw_db).unwrap();
+    let compressed = zstd::encode_all(&raw[..], 9).unwrap();
+    let zst_path = fixture.path().join("snapshot.db.zst");
+    std::fs::write(&zst_path, &compressed).unwrap();
+    zst_path
+}
+
+#[test]
+fn install_round_trip_file_url() {
+    let fixture = init_git_fixture();
+    let zst = build_local_snapshot(&fixture);
+
+    // Wipe .code-graph/ so install is the only path that creates it
+    let target_root = TempDir::new().unwrap();
+    Command::new("git").args(["init", "-q"]).current_dir(target_root.path()).status().unwrap();
+
+    let url = format!("file://{}", zst.display());
+    let commit = try_install(&url, target_root.path()).unwrap();
+    assert!(!commit.is_empty(), "expected non-empty source commit");
+
+    let installed = target_root.path().join(".code-graph").join("index.db");
+    assert!(installed.exists(), "expected installed at {}", installed.display());
+
+    let db = crate::storage::db::Database::open(&installed).unwrap();
+    let conn = db.conn();
+    let url_meta = read_meta(conn, META_SNAPSHOT_SOURCE_URL).unwrap();
+    assert_eq!(url_meta.as_deref(), Some(url.as_str()));
+    let fetched = read_meta(conn, META_SNAPSHOT_FETCHED_AT).unwrap();
+    assert!(fetched.is_some(), "fetched_at should be written");
+
+    // No leftover .partial files
+    let entries: Vec<_> = std::fs::read_dir(target_root.path().join(".code-graph"))
+        .unwrap().flatten().collect();
+    for entry in &entries {
+        let n = entry.file_name();
+        let s = n.to_string_lossy();
+        assert!(!s.ends_with(".partial"), "leftover partial: {s}");
+    }
+}
+
+#[test]
+fn install_rejects_http_url() {
+    let target_root = TempDir::new().unwrap();
+    let err = try_install("http://example.com/x.db.zst", target_root.path()).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("https"), "got: {err}");
+}
+
+#[test]
+fn install_rejects_corrupt_archive() {
+    let target_root = TempDir::new().unwrap();
+    Command::new("git").args(["init", "-q"]).current_dir(target_root.path()).status().unwrap();
+
+    let bad = TempDir::new().unwrap();
+    let bad_path = bad.path().join("bad.db.zst");
+    std::fs::write(&bad_path, b"not zstd data").unwrap();
+    let url = format!("file://{}", bad_path.display());
+
+    let err = try_install(&url, target_root.path()).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("zstd")
+            || err.to_string().to_lowercase().contains("decode"),
+        "got: {err}");
+
+    // Clean state — no index.db, no .partial
+    let cg_dir = target_root.path().join(".code-graph");
+    if cg_dir.exists() {
+        for entry in std::fs::read_dir(&cg_dir).unwrap().flatten() {
+            let s = entry.file_name().to_string_lossy().into_owned();
+            assert!(s != "index.db" && !s.ends_with(".partial"),
+                "leftover after failure: {s}");
+        }
+    }
 }
 
 #[test]
