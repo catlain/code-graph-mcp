@@ -36,7 +36,7 @@ mod dart;
 #[cfg(test)]
 mod tests;
 
-use helpers::{extract_callee_name, extract_string_from_subtree, MAX_SUBTREE_DEPTH};
+use helpers::{extract_callee, extract_string_from_subtree, MAX_SUBTREE_DEPTH};
 use imports::{extract_import_names, extract_python_import_names, extract_python_from_import_names};
 use inherits::{extract_superclasses, extract_implements};
 use exports::extract_export_names;
@@ -210,7 +210,9 @@ fn walk_for_relations(
                 None => None,
             };
             if let Some(scope) = call_scope {
-                if let Some(callee) = extract_callee_name(&node, source) {
+                if let Some((callee, _qualifier)) = extract_callee(&node, source, language, None) {
+                    // Task 1: qualifier discarded; metadata stays None. Subsequent tasks
+                    // serialize it once Rust-specific extraction is in place.
                     results.push(ParsedRelation {
                         source_name: scope,
                         target_name: callee,

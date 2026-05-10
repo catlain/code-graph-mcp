@@ -53,6 +53,42 @@ pub(super) fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Opt
     }
 }
 
+/// Shape of a callee's qualifier. Drives same-language candidate
+/// disambiguation in the edge resolver. See
+/// `docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // variants used in subsequent tasks (T2–T18)
+pub(crate) enum CalleeQualifier {
+    /// `foo()` — no qualifier (also: any non-Rust language)
+    Bare,
+    /// `crate::snapshot::create()` / `Module::foo()` / `Type::method()`
+    /// Stored with leading `crate`/`super`/`self` segments stripped.
+    /// Empty after strip → caller must convert to Bare before serialization.
+    Path(Vec<String>),
+    /// `Self::method()` — payload is the enclosing impl block's type name.
+    SelfType(String),
+    /// `self.method()` — payload is the enclosing impl block's type name.
+    SelfRecv(String),
+    /// `obj.method()` where receiver is a plain identifier of unknown type.
+    Receiver(String),
+    /// `OpenOptions::new().create(true)` — receiver is a call_expression
+    /// (any chain).
+    Chain,
+}
+
+/// Like `extract_callee_name` but also returns the qualifier shape.
+/// Currently returns `Bare` for all shapes; subsequent tasks add Rust-specific
+/// extraction logic. Non-Rust languages always return `Bare`.
+pub(crate) fn extract_callee(
+    node: &tree_sitter::Node,
+    source: &str,
+    language: &str,
+    current_rust_impl: Option<&str>,
+) -> Option<(String, CalleeQualifier)> {
+    let _ = (language, current_rust_impl); // suppress unused-warning until later tasks
+    extract_callee_name(node, source).map(|n| (n, CalleeQualifier::Bare))
+}
+
 pub(super) fn extract_string_from_subtree(node: &tree_sitter::Node, source: &str) -> Option<String> {
     extract_string_from_subtree_inner(node, source, 0)
 }
