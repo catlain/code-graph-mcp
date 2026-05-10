@@ -83,7 +83,7 @@ pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelat
 pub fn extract_relations_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedRelation> {
     let mut relations = Vec::new();
     let config = LanguageConfig::for_language(language);
-    walk_for_relations(tree.root_node(), source, language, &config, None, None, &mut relations, 0);
+    walk_for_relations(tree.root_node(), source, language, &config, None, None, None, &mut relations, 0);
     // Stamp source_language on every relation. walk_for_relations constructs
     // ParsedRelation with source_language: String::new(), and we fill it in
     // here so every call site inside walk doesn't need to propagate language.
@@ -101,6 +101,7 @@ fn walk_for_relations(
     config: &LanguageConfig,
     current_scope: Option<&str>,
     current_class: Option<&str>,
+    current_rust_impl: Option<&str>,
     results: &mut Vec<ParsedRelation>,
     depth: usize,
 ) {
@@ -732,10 +733,24 @@ fn walk_for_relations(
     };
     let effective_class = child_class.as_deref().or(current_class);
 
+    // Compute child_rust_impl: when entering a Rust impl_item, capture the
+    // type name so nested call_expression arms can fill SelfRecv/SelfType
+    // payloads. NOT folded into current_class because that would change
+    // scope_name building and break source_id matching downstream
+    // (relations source_name="conn" matches pf.node_names "conn"; would
+    // become "Database.conn" if folded into current_class).
+    let child_rust_impl: Option<String> = if language == "rust" && kind == "impl_item" {
+        node.child_by_field_name("type")
+            .map(|t| node_text(&t, source).to_string())
+    } else {
+        None
+    };
+    let effective_rust_impl = child_rust_impl.as_deref().or(current_rust_impl);
+
     // Recurse into children
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            walk_for_relations(child, source, language, config, active_scope, effective_class, results, depth + 1);
+            walk_for_relations(child, source, language, config, active_scope, effective_class, effective_rust_impl, results, depth + 1);
         }
     }
 }
