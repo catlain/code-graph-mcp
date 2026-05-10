@@ -495,6 +495,41 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
         "partial"
     };
 
+    // Snapshot metadata block — reads keys written by `snapshot install`.
+    let snapshot_url = crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_SOURCE_URL)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let snapshot_commit = crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_SOURCE_COMMIT)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let snapshot_fetched_at = crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_FETCHED_AT)
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<i64>().ok());
+    let snapshot_status = if snapshot_url.is_some() { "present" } else { "absent" };
+    // commit_drift: how many local commits landed after the snapshot was taken.
+    let commit_drift = snapshot_commit.as_deref().and_then(|c| {
+        std::process::Command::new("git")
+            .args(["rev-list", "--count", &format!("{c}..HEAD")])
+            .current_dir(project_root)
+            .output()
+            .ok()
+            .and_then(|o| if o.status.success() {
+                String::from_utf8_lossy(&o.stdout).trim().parse::<i64>().ok()
+            } else {
+                None
+            })
+    });
+    let snapshot_block = serde_json::json!({
+        "status": snapshot_status,
+        "source_url": snapshot_url,
+        "source_commit": snapshot_commit,
+        "fetched_at": snapshot_fetched_at,
+        "commit_drift": commit_drift,
+    });
+
     match format {
         "json" => {
             let mut json = serde_json::json!({
@@ -510,6 +545,7 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 "embedding_coverage_pct": coverage_pct,
                 "embedding_status": embedding_status,
                 "model_available": model_available,
+                "snapshot": snapshot_block,
             });
             if let Some(ts) = status.last_indexed_at {
                 json["last_indexed_at"] = serde_json::json!(ts);
@@ -537,6 +573,7 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                     "OK: {} nodes, {} edges, {} files{}",
                     status.nodes_count, status.edges_count, status.files_count, age_info
                 );
+                println!("Snapshot: {}", snapshot_status);
             } else if !schema_ok {
                 eprintln!(
                     "UNHEALTHY: schema version mismatch (got {}, expected {})",
