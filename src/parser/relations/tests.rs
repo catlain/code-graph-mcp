@@ -1136,3 +1136,17 @@ fn test_extract_csharp_inheritance() {
     assert!(implements.contains(&"ICloneable"),
         "C#: missing ICloneable (IMPLEMENTS), got: {:?}", implements);
 }
+
+#[test]
+fn test_rust_callee_path_qualifier_strips_crate() {
+    let code = "fn caller() { crate::snapshot::create(); }";
+    let relations = extract_relations(code, "rust").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "create")
+        .expect("missing call to create");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"snapshot"}"#),
+        "metadata should encode Path qualifier with crate stripped"
+    );
+}

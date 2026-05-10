@@ -33,6 +33,24 @@ mod routes;
 mod rust;
 mod dart;
 
+/// Serialize a CalleeQualifier into the wire-format JSON for `edges.metadata`.
+/// Bare → None (matches non-Rust callers and old DB rows).
+/// See spec §"Wire protocol" for the q/v key shapes.
+fn serialize_callee_qualifier(q: &helpers::CalleeQualifier) -> Option<String> {
+    use helpers::CalleeQualifier::*;
+    match q {
+        Bare => None,
+        Path(segments) => {
+            let v = segments.join("::");
+            Some(format!(r#"{{"q":"path","v":"{}"}}"#, v))
+        }
+        SelfType(t) => Some(format!(r#"{{"q":"stype","v":"{}"}}"#, t)),
+        SelfRecv(t) => Some(format!(r#"{{"q":"self","v":"{}"}}"#, t)),
+        Receiver(r) => Some(format!(r#"{{"q":"recv","v":"{}"}}"#, r)),
+        Chain => Some(r#"{"q":"chain"}"#.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -210,14 +228,13 @@ fn walk_for_relations(
                 None => None,
             };
             if let Some(scope) = call_scope {
-                if let Some((callee, _qualifier)) = extract_callee(&node, source, language, None) {
-                    // Task 1: qualifier discarded; metadata stays None. Subsequent tasks
-                    // serialize it once Rust-specific extraction is in place.
+                if let Some((callee, qualifier)) = extract_callee(&node, source, language, None) {
+                    let metadata = serialize_callee_qualifier(&qualifier);
                     results.push(ParsedRelation {
                         source_name: scope,
                         target_name: callee,
                         relation: REL_CALLS.into(),
-                        metadata: None,
+                        metadata,
                         source_language: String::new(),
                     });
                 }

@@ -77,16 +77,73 @@ pub(crate) enum CalleeQualifier {
 }
 
 /// Like `extract_callee_name` but also returns the qualifier shape.
-/// Currently returns `Bare` for all shapes; subsequent tasks add Rust-specific
-/// extraction logic. Non-Rust languages always return `Bare`.
+/// Non-Rust languages always return `Bare`. Rust dispatches on the
+/// function-node kind to detect scoped_identifier paths.
 pub(crate) fn extract_callee(
     node: &tree_sitter::Node,
     source: &str,
     language: &str,
     current_rust_impl: Option<&str>,
 ) -> Option<(String, CalleeQualifier)> {
-    let _ = (language, current_rust_impl); // suppress unused-warning until later tasks
-    extract_callee_name(node, source).map(|n| (n, CalleeQualifier::Bare))
+    let _ = current_rust_impl; // used in Task 8+
+    if language != "rust" {
+        return extract_callee_name(node, source).map(|n| (n, CalleeQualifier::Bare));
+    }
+
+    let function = node.child_by_field_name("function")
+        .or_else(|| node.named_child(0))?;
+
+    match function.kind() {
+        "identifier" => {
+            Some((node_text(&function, source).to_string(), CalleeQualifier::Bare))
+        }
+        "scoped_identifier" => extract_rust_scoped(&function, source),
+        // Other kinds added in later tasks (field_expression in T6/T7/T9).
+        _ => extract_callee_name(node, source).map(|n| (n, CalleeQualifier::Bare)),
+    }
+}
+
+/// Walk a scoped_identifier collecting all path segments + final name.
+/// `crate::a::b::foo` → segments=["crate","a","b"], name="foo"
+fn collect_scoped_path_segments(
+    node: &tree_sitter::Node,
+    source: &str,
+    out: &mut Vec<String>,
+) {
+    if node.kind() == "scoped_identifier" {
+        if let Some(path) = node.child_by_field_name("path") {
+            collect_scoped_path_segments(&path, source, out);
+        }
+        if let Some(name) = node.child_by_field_name("name") {
+            out.push(node_text(&name, source).to_string());
+        }
+    } else if matches!(node.kind(), "identifier" | "type_identifier") {
+        out.push(node_text(node, source).to_string());
+    }
+}
+
+/// Handle Rust scoped_identifier callee. Returns name + Path qualifier with
+/// reserved prefixes (crate/super/self) stripped; SelfType detected when first
+/// segment is "Self" (added in Task 10 by overriding the qualifier).
+fn extract_rust_scoped(
+    function: &tree_sitter::Node,
+    source: &str,
+) -> Option<(String, CalleeQualifier)> {
+    let mut all = Vec::new();
+    collect_scoped_path_segments(function, source, &mut all);
+    if all.is_empty() {
+        return None;
+    }
+    let name = all.pop()?;
+    let mut path: Vec<String> = all;
+    while path.first().is_some_and(|s| matches!(s.as_str(), "crate" | "super" | "self")) {
+        path.remove(0);
+    }
+    if path.is_empty() {
+        Some((name, CalleeQualifier::Bare))
+    } else {
+        Some((name, CalleeQualifier::Path(path)))
+    }
 }
 
 pub(super) fn extract_string_from_subtree(node: &tree_sitter::Node, source: &str) -> Option<String> {
