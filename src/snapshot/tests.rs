@@ -103,7 +103,7 @@ fn inspect_round_trip() {
 
     let meta = crate::snapshot::inspect(&zst_path).unwrap();
     assert_eq!(meta.tool_version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(meta.includes_vec, false);
+    assert!(!meta.includes_vec);
     assert!(meta.created_at > 0);
     assert!(meta.schema_version > 0);
     assert!(meta.file_size_bytes > 0);
@@ -116,7 +116,7 @@ fn config_load_missing_file_returns_default() {
     let dir = TempDir::new().unwrap();
     let cfg = load_config(dir.path()).unwrap();
     assert_eq!(cfg.snapshot.url, None);
-    assert_eq!(cfg.snapshot.disabled, false);
+    assert!(!cfg.snapshot.disabled);
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn config_load_parses_snapshot_url() {
     ).unwrap();
     let cfg = load_config(dir.path()).unwrap();
     assert_eq!(cfg.snapshot.url.as_deref(), Some("https://example.com/x.db.zst"));
-    assert_eq!(cfg.snapshot.disabled, false);
+    assert!(!cfg.snapshot.disabled);
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn config_load_parses_disabled() {
         "[snapshot]\ndisabled = true\n",
     ).unwrap();
     let cfg = load_config(dir.path()).unwrap();
-    assert_eq!(cfg.snapshot.disabled, true);
+    assert!(cfg.snapshot.disabled);
 }
 
 #[test]

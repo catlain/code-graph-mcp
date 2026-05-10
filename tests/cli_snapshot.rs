@@ -48,7 +48,7 @@ fn cli_snapshot_create_then_inspect_round_trip() {
         .unwrap();
     assert!(output.status.success(), "inspect failed: {}", String::from_utf8_lossy(&output.stderr));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(json["tool_version"].as_str().unwrap().len() > 0);
+    assert!(!json["tool_version"].as_str().unwrap().is_empty());
     assert!(json["schema_version"].as_i64().unwrap() > 0);
     assert!(json["created_at"].as_i64().unwrap() > 0);
     assert_eq!(json["includes_vec"].as_bool(), Some(false));

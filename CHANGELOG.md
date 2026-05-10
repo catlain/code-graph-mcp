@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.23.0 — shared graph snapshot
+
+Team-shared graph artifact via GitHub Releases. New CLI subcommands
+`snapshot create` and `snapshot inspect`. MCP server auto-fetches the
+latest published snapshot on first start (when no local index exists) and
+falls through to the existing full-index path on any failure — snapshot is
+an optimization, not a dependency. Workflow template shipped at
+`claude-plugin/templates/code-graph-snapshot.yml`. New CLI
+`reindex --from-snapshot` forces a re-fetch. Snapshot status surfaces in
+`health-check --json`. Snapshot file is symbols+edges+FTS5 only (no
+`node_vectors`) to decouple from embedding model choice. Spec:
+`docs/superpowers/specs/2026-05-10-shared-graph-snapshot-design.md`.
+
 ## v0.22.2 — index.db sub-header size guard
 
 Defensive hardening for `Database::open` recovery. The existing
