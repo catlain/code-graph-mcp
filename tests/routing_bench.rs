@@ -165,6 +165,74 @@ const FRONTEND_ORACLE: &[(&str, &str)] = &[
     ("Display the implementation of getAuthHeaders", "get_ast_node"),
 ];
 
+/// System prompt for trigger-rate mode. Unlike `SYSTEM_PROMPT` it does NOT
+/// force tool use — the whole point is measuring whether the model
+/// *chooses* a tool. Wording mirrors a generic coding-assistant role
+/// (closer to how Claude Code actually behaves) rather than
+/// "pick exactly one tool".
+const TRIGGER_SYSTEM_PROMPT: &str = "You are a coding assistant helping with a \
+    software engineering question. The tools provided are available — invoke one \
+    when it would answer the user better than guessing. Otherwise reply in prose. \
+    Do not fabricate file paths or symbol names.";
+
+/// Trigger-rate corpus — sloppy / misleading prompts that should still
+/// activate code-graph tools, modeled on real-session failure modes from
+/// the 7d audit (2026-05-12 → 2026-05-14, 141 main sessions: 1972 raw
+/// `bash grep` vs 47 code-graph calls, the 47 from one dogfooding session).
+///
+/// **Design** (v2 / 2026-05-14): the first version of this oracle gave a
+/// 100% baseline because prompts carried explicit cg-favorable anchors
+/// (`module_overview` tool name, `src/parser/relations/` paths, project-
+/// specific tokens like `MCP server` / `incremental-index`). v2 strips
+/// those anchors and adds three failure-mode categories drawn from the
+/// audit:
+///
+/// 1. **Pure symptom, zero technical anchors** ("今天报告数据不准") —
+///    model could respond with prose or default to `bash grep` to "scan".
+/// 2. **Misleading "use grep/find" framing** ("用 grep 找一下...") —
+///    user signals a wrong tool; model should resist if cg fits better.
+/// 3. **Answer-flavored guess** ("应该是 cleanup 那段没等完吧") —
+///    model could just agree without verifying; cg lets it verify.
+///
+/// `__CG__` entries: model SHOULD pick a code-graph tool. Misses split
+/// across `bash` (dominant production miss), `grep/read` (lesser miss),
+/// and `(none)` (legitimate clarification or lazy prose answer).
+///
+/// `__DECOY__` entries: model SHOULD pick Bash/Grep/Read/none — anything
+/// but a code-graph tool (boundary leak measure).
+///
+/// **Run with**: `ROUTING_BENCH_MODE=trigger-rate cargo test --release \
+/// --test routing_bench -- --ignored --nocapture`. `tool_choice: auto`,
+/// so the model can return no tool at all (a `__CG__` miss).
+///
+/// Maintenance: any rewrite invalidates prior baselines — re-bench
+/// before / after and update `feedback_routing_bench.md`.
+const TRIGGER_ORACLE: &[(&str, &str)] = &[
+    // ===== Pure symptom, zero technical anchors =====
+    ("今天的报告数据不准", "__CG__"),
+    ("test 又挂了", "__CG__"),
+    ("有 bug，帮我看看", "__CG__"),
+
+    // ===== Misleading "use grep/find" framing =====
+    ("用 grep 找一下为什么 user 数据没更新", "__CG__"),
+    ("find 一下哪里写错了", "__CG__"),
+
+    // ===== Answer-flavored guess (model should verify, not agree) =====
+    ("应该是 cleanup 那段没等完吧", "__CG__"),
+    ("是不是 cache 没刷", "__CG__"),
+
+    // ===== Generic feature reference, no path/symbol =====
+    ("看一下用户登录是怎么实现的", "__CG__"),
+    ("准备重构 error handling，影响大不大", "__CG__"),
+
+    // ===== English sloppy =====
+    ("Why does this not work?", "__CG__"),
+
+    // ===== Decoy preservation — must stay on Bash/Grep/Read =====
+    ("Read the contents of CHANGELOG.md", "__DECOY__"),
+    ("Search for literal 'FIXME' across the repo", "__DECOY__"),
+];
+
 /// Strict-A FP corpus: 10 queries that should route to a decoy (Grep or Read),
 /// not to any code-graph tool. Each query has explicit literal-text or
 /// path-based markers and zero structural component. Used in context-rich
@@ -280,22 +348,32 @@ pub(crate) fn detect_backends() -> Vec<Backend> {
 }
 
 /// Call the backend, return the picked tool name, or None if the model produced no tool_use.
+/// `force_tool=true` uses `tool_choice: required/any` (recall-bench behavior).
+/// `force_tool=false` uses `tool_choice: auto` — model is free to answer in prose,
+/// returning None. TriggerRate mode passes `false`; the None signals
+/// "model chose not to use a tool" which is the failure mode we measure.
 fn call_backend(
     client: &reqwest::blocking::Client,
     backend: &Backend,
     tools: &[Value],
     system_prompt: &str,
     query: &str,
+    force_tool: bool,
 ) -> Option<String> {
     match backend {
         Backend::Anthropic { key, model } => {
+            let tool_choice = if force_tool {
+                json!({ "type": "any" })
+            } else {
+                json!({ "type": "auto" })
+            };
             let body = json!({
                 "model": model,
                 "max_tokens": 1024,
                 "temperature": 0,
                 "system": system_prompt,
                 "tools": tools,
-                "tool_choice": { "type": "any" },
+                "tool_choice": tool_choice,
                 "messages": [{ "role": "user", "content": query }],
             });
             let resp = client.post("https://api.anthropic.com/v1/messages")
@@ -326,12 +404,13 @@ fn call_backend(
                     "parameters": t["input_schema"],
                 }
             })).collect();
+            let tool_choice = if force_tool { "required" } else { "auto" };
             let body = json!({
                 "model": model,
                 "max_tokens": 1024,
                 "temperature": 0,
                 "tools": openai_tools,
-                "tool_choice": "required",
+                "tool_choice": tool_choice,
                 "messages": [
                     { "role": "system", "content": system_prompt },
                     { "role": "user",   "content": query },
@@ -393,6 +472,13 @@ fn routing_recall_benchmark() {
     let system_prompt = build_system_prompt(mode);
     let active = active_oracle(domain);
     let oracle = build_oracle(mode, domain);
+    // Code-graph tool names from the live registry; used by TriggerRate mode
+    // to classify each pick as code-graph / decoy / none.
+    let cg_names: Vec<&str> = registry
+        .list_tools().iter().map(|t| t.name.as_str()).collect();
+    // TriggerRate uses `tool_choice: auto` so we can observe "model chose no
+    // tool"; recall modes force `tool_choice: any/required`.
+    let force_tool = !matches!(mode, BenchMode::TriggerRate);
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -417,13 +503,18 @@ fn routing_recall_benchmark() {
         for &(query, expected) in &oracle {
             let mut run_picks: Vec<Option<String>> = Vec::with_capacity(RUNS);
             for _ in 0..RUNS {
-                run_picks.push(call_backend(&client, backend, &tools, &system_prompt, query));
+                run_picks.push(call_backend(&client, backend, &tools, &system_prompt, query, force_tool));
             }
             let pick_strs: Vec<&str> = run_picks.iter()
                 .map(|p| p.as_deref().unwrap_or("(none)"))
                 .collect();
             let voted = majority_vote(&pick_strs).unwrap_or_else(|| "(none)".to_string());
-            if !matches_expected(&voted, expected) {
+            let is_match = if matches!(mode, BenchMode::TriggerRate) {
+                matches_trigger_class(&voted, expected, &cg_names)
+            } else {
+                matches_expected(&voted, expected)
+            };
+            if !is_match {
                 all_misses.push((query.to_string(), expected.to_string(), run_picks.clone()));
             }
             picks.insert(query.to_string(), voted);
@@ -467,10 +558,25 @@ fn routing_recall_benchmark() {
                 print_misses(&all_misses);
                 overall
             }
+            BenchMode::TriggerRate => {
+                let metrics = compute_trigger_metrics(&picks, &oracle, &cg_names);
+                eprintln!(
+                    "\n[routing_bench] mode=trigger-rate backend={}\n  Trigger rate (CG picked on PreferCodeGraph)   = {:.1}% ({}/{})\n  No-tool rate (none picked on PreferCodeGraph) = {:.1}% ({}/{})\n  Decoy boundary (CG NOT picked on PreferDecoy) = {:.1}% ({}/{})\n  Decoy leak (CG picked on PreferDecoy)         = {:.1}% ({}/{})",
+                    backend.label(),
+                    metrics.trigger_rate * 100.0, metrics.trigger_hits, metrics.cg_total,
+                    metrics.no_tool_rate * 100.0, metrics.cg_no_tool, metrics.cg_total,
+                    metrics.decoy_preserved_rate * 100.0, metrics.decoy_preserved, metrics.decoy_total,
+                    metrics.decoy_leak_rate * 100.0, metrics.decoy_leak, metrics.decoy_total,
+                );
+                print_misses(&all_misses);
+                metrics.trigger_rate
+            }
         };
 
         all_results.push((backend.label(), headline_recall, all_misses.len()));
-        if headline_recall < P_AT_1_THRESHOLD {
+        // TriggerRate is informational (no defined threshold) until we have a
+        // baseline; recall modes still gate on P_AT_1_THRESHOLD.
+        if !matches!(mode, BenchMode::TriggerRate) && headline_recall < P_AT_1_THRESHOLD {
             any_below_threshold.push(format!(
                 "{}: {:.1}% ({} misses)",
                 backend.label(), headline_recall * 100.0, all_misses.len(),
@@ -529,17 +635,22 @@ fn print_misses(misses: &[(String, String, Vec<Option<String>>)]) {
 
 /// Bench mode selector. `tool-only` is the legacy behavior (existing 20-query
 /// oracle, no decoys, no MEMORY.md injection). `context-rich` adds decoys,
-/// MEMORY.md, and FP_ORACLE — measures hook line quality.
+/// MEMORY.md, and FP_ORACLE — measures hook line quality. `trigger-rate`
+/// drops `tool_choice: required` and uses TRIGGER_ORACLE — measures whether
+/// the model *chooses* a tool given realistic phrasing (the failure mode
+/// recall bench hides because it forces tool use).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchMode {
     ToolOnly,
     ContextRich,
+    TriggerRate,
 }
 
 /// Pure helper for testing — accepts the env value directly.
 fn detect_mode_for(env: Option<&str>) -> BenchMode {
     match env {
         Some("context-rich") => BenchMode::ContextRich,
+        Some("trigger-rate") => BenchMode::TriggerRate,
         _ => BenchMode::ToolOnly,
     }
 }
@@ -586,6 +697,28 @@ fn active_oracle(domain: BenchDomain) -> Vec<(&'static str, &'static str)> {
     }
 }
 
+/// Bash decoy — only added in TriggerRate mode. Mirrors Claude Code's
+/// native Bash tool, which is the dominant competing route in real-world
+/// sessions (7d audit: 1972 raw `bash grep` vs 47 code-graph calls; Grep
+/// + Read decoys alone don't model this escape hatch). Kept OUT of
+/// ContextRich mode so v0.17.2/v0.17.3 baselines stay comparable.
+fn bash_decoy() -> Value {
+    json!({
+        "name": "Bash",
+        "description": "Execute shell commands. Use for grep/rg/find/git/build/file ops, \
+            ad-hoc one-off commands, or shell text-matching across files. Prefer over \
+            code-graph when you don't need AST/structural context (raw regex on logs, \
+            config, lockfiles).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "Shell command to execute" }
+            },
+            "required": ["command"]
+        }
+    })
+}
+
 /// Decoy tools added in context-rich mode. Mirrors the most common Claude
 /// Code native tools that compete with code-graph for routing. Descriptions
 /// are calibrated against the spec's strict-A FP boundary: "Prefer over
@@ -627,17 +760,24 @@ fn decoy_tools() -> Vec<Value> {
 }
 
 /// Build the `tools` array for the API call. ToolOnly returns the registry
-/// tools unchanged; ContextRich appends Grep and Read decoys.
+/// tools unchanged; ContextRich appends Grep + Read decoys (preserves
+/// v0.17.2 baselines); TriggerRate appends Grep + Read **and** Bash —
+/// modeling the dominant real-session competition (`bash grep -rn ...`).
 fn build_tools(mode: BenchMode, registry_tools: Vec<Value>) -> Vec<Value> {
     let mut tools = registry_tools;
-    if matches!(mode, BenchMode::ContextRich) {
+    if matches!(mode, BenchMode::ContextRich | BenchMode::TriggerRate) {
         tools.extend(decoy_tools());
+    }
+    if matches!(mode, BenchMode::TriggerRate) {
+        tools.push(bash_decoy());
     }
     tools
 }
 
 /// Build the system prompt. ToolOnly returns SYSTEM_PROMPT verbatim;
-/// ContextRich appends the MEMORY.md framing line + INDEX_LINE_MIRROR.
+/// ContextRich appends the MEMORY.md framing line + INDEX_LINE_MIRROR;
+/// TriggerRate uses TRIGGER_SYSTEM_PROMPT (non-forcing) + the same
+/// MEMORY.md framing so the realistic Claude Code context applies.
 fn build_system_prompt(mode: BenchMode) -> String {
     match mode {
         BenchMode::ToolOnly => SYSTEM_PROMPT.to_string(),
@@ -645,12 +785,21 @@ fn build_system_prompt(mode: BenchMode) -> String {
             "{}\n\nUser has the following entry in their project MEMORY.md (auto-loaded):\n{}",
             SYSTEM_PROMPT, INDEX_LINE_MIRROR
         ),
+        BenchMode::TriggerRate => format!(
+            "{}\n\nUser has the following entry in their project MEMORY.md (auto-loaded):\n{}",
+            TRIGGER_SYSTEM_PROMPT, INDEX_LINE_MIRROR
+        ),
     }
 }
 
 /// Build the oracle (query → expected-tool pairs). Pulls the active-domain
-/// pool via `active_oracle`; ContextRich appends FP_ORACLE.
+/// pool via `active_oracle`; ContextRich appends FP_ORACLE; TriggerRate
+/// replaces the pool entirely with TRIGGER_ORACLE (domain selector is
+/// ignored — phrasing is project-specific, not language-pool-specific).
 fn build_oracle(mode: BenchMode, domain: BenchDomain) -> Vec<(&'static str, &'static str)> {
+    if matches!(mode, BenchMode::TriggerRate) {
+        return TRIGGER_ORACLE.to_vec();
+    }
     let mut all = active_oracle(domain);
     if matches!(mode, BenchMode::ContextRich) {
         all.extend_from_slice(FP_ORACLE);
@@ -693,6 +842,90 @@ fn compute_fp_rate(picks: &HashMap<String, String>) -> f64 {
         })
         .count();
     violations as f64 / FP_ORACLE.len() as f64
+}
+
+/// Names of native-Claude-Code decoy tools available in TriggerRate mode.
+/// Boundary-preservation logic treats any of these as a valid pick on
+/// `__DECOY__` queries; conversely, a model picking Bash on a `__CG__`
+/// query counts as a trigger MISS (cg failed to recruit the model).
+const DECOY_NAMES: &[&str] = &["Grep", "Read", "Bash"];
+
+/// Trigger-rate match: a `__CG__` query is hit when the pick is any code-graph
+/// tool; a `__DECOY__` query is hit when the pick is one of DECOY_NAMES or
+/// `(none)` (model declined to use a code-graph tool — boundary preserved).
+fn matches_trigger_class(picked: &str, class: &str, cg_names: &[&str]) -> bool {
+    let is_cg = cg_names.contains(&picked);
+    let is_decoy = DECOY_NAMES.contains(&picked);
+    let is_none = picked == "(none)";
+    match class {
+        "__CG__" => is_cg,
+        "__DECOY__" => is_decoy || is_none,
+        _ => false,
+    }
+}
+
+/// Aggregated trigger-rate counters for a single backend run. All rates are
+/// in [0.0, 1.0]; counts use the raw tallies so we can report `(N/M)` next
+/// to the percentage in the bench output.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TriggerMetrics {
+    /// `__CG__` queries (total / hit / model-returned-no-tool).
+    cg_total: usize,
+    trigger_hits: usize,
+    cg_no_tool: usize,
+    /// `__DECOY__` queries (total / boundary-preserved / leaked-to-code-graph).
+    decoy_total: usize,
+    decoy_preserved: usize,
+    decoy_leak: usize,
+    /// Derived rates, defaulting to 0.0 on empty divisors.
+    trigger_rate: f64,
+    no_tool_rate: f64,
+    decoy_preserved_rate: f64,
+    decoy_leak_rate: f64,
+}
+
+/// Compute trigger-rate metrics over a TRIGGER_ORACLE-shaped slice. `picks`
+/// is the query→voted-tool map produced by the majority-vote pass; `cg_names`
+/// is the live code-graph tool roster.
+fn compute_trigger_metrics(
+    picks: &HashMap<String, String>,
+    oracle: &[(&str, &str)],
+    cg_names: &[&str],
+) -> TriggerMetrics {
+    let mut m = TriggerMetrics {
+        cg_total: 0, trigger_hits: 0, cg_no_tool: 0,
+        decoy_total: 0, decoy_preserved: 0, decoy_leak: 0,
+        trigger_rate: 0.0, no_tool_rate: 0.0,
+        decoy_preserved_rate: 0.0, decoy_leak_rate: 0.0,
+    };
+    for &(q, class) in oracle {
+        let pick = picks.get(q).map(|s| s.as_str()).unwrap_or("(none)");
+        let is_cg = cg_names.contains(&pick);
+        let is_none = pick == "(none)";
+        let is_decoy = DECOY_NAMES.contains(&pick);
+        match class {
+            "__CG__" => {
+                m.cg_total += 1;
+                if is_cg { m.trigger_hits += 1; }
+                if is_none { m.cg_no_tool += 1; }
+            }
+            "__DECOY__" => {
+                m.decoy_total += 1;
+                if is_decoy || is_none { m.decoy_preserved += 1; }
+                if is_cg { m.decoy_leak += 1; }
+            }
+            _ => {}
+        }
+    }
+    if m.cg_total > 0 {
+        m.trigger_rate = m.trigger_hits as f64 / m.cg_total as f64;
+        m.no_tool_rate = m.cg_no_tool as f64 / m.cg_total as f64;
+    }
+    if m.decoy_total > 0 {
+        m.decoy_preserved_rate = m.decoy_preserved as f64 / m.decoy_total as f64;
+        m.decoy_leak_rate = m.decoy_leak as f64 / m.decoy_total as f64;
+    }
+    m
 }
 
 /// Overall summary: (recall_hits + fp_avoidance) / total over the active
@@ -801,6 +1034,31 @@ fn frontend_oracle_well_formed() {
     assert_oracle_covers_registry("frontend/FRONTEND_ORACLE", FRONTEND_ORACLE);
 }
 
+/// TRIGGER_ORACLE invariants. Unlike ORACLE / FRONTEND_ORACLE, expected
+/// values are class sentinels (`__CG__` / `__DECOY__`) not tool names —
+/// `assert_oracle_covers_registry` doesn't apply. Validate the class
+/// vocabulary + distinct queries + minimum count instead.
+#[test]
+fn trigger_oracle_well_formed() {
+    assert!(
+        TRIGGER_ORACLE.len() >= 8,
+        "TRIGGER_ORACLE too small ({} entries); want ≥8 for stable rate estimate",
+        TRIGGER_ORACLE.len(),
+    );
+    let mut seen = std::collections::HashSet::new();
+    let mut has_cg = false;
+    let mut has_decoy = false;
+    for &(q, class) in TRIGGER_ORACLE {
+        assert!(seen.insert(q), "duplicate TRIGGER_ORACLE query: {:?}", q);
+        match class {
+            "__CG__" => has_cg = true,
+            "__DECOY__" => has_decoy = true,
+            other => panic!("unknown TRIGGER_ORACLE class {:?} (query={:?})", other, q),
+        }
+    }
+    assert!(has_cg && has_decoy, "TRIGGER_ORACLE must include both __CG__ and __DECOY__ classes");
+}
+
 /// Drift check: every tool registered in `ToolRegistry` must be referenced
 /// in the adoption template's decision table. Prevents "added a tool but
 /// forgot to update the routing decision table" — the regression that
@@ -878,6 +1136,12 @@ mod mode_tests {
     fn detect_mode_unknown_value_falls_back_to_tool_only() {
         let m = detect_mode_for(Some("invalid"));
         assert!(matches!(m, BenchMode::ToolOnly));
+    }
+
+    #[test]
+    fn detect_mode_trigger_rate() {
+        let m = detect_mode_for(Some("trigger-rate"));
+        assert!(matches!(m, BenchMode::TriggerRate));
     }
 }
 
@@ -970,6 +1234,18 @@ mod decoy_tests {
                 "decoy description must signal 'prefer over code-graph' to be measurement-fair"
             );
         }
+    }
+
+    #[test]
+    fn bash_decoy_has_required_fields_and_anchor() {
+        let tool = bash_decoy();
+        assert_eq!(tool["name"], "Bash");
+        let desc = tool["description"].as_str().unwrap();
+        assert!(
+            desc.contains("Prefer over code-graph"),
+            "Bash decoy must carry the same 'prefer over code-graph' anchor as Grep/Read"
+        );
+        assert!(tool["input_schema"]["properties"]["command"].is_object());
     }
 }
 
@@ -1184,6 +1460,140 @@ mod scoring_tests {
     fn majority_vote_empty_returns_none() {
         let v: Option<String> = majority_vote(&[] as &[&str]);
         assert_eq!(v, None);
+    }
+
+    // ===== Trigger-rate scoring tests =====
+
+    fn picks_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(q, t)| (q.to_string(), t.to_string())).collect()
+    }
+
+    #[test]
+    fn matches_trigger_class_cg_hits_when_pick_in_registry() {
+        let cg = &["get_call_graph", "module_overview"];
+        assert!(matches_trigger_class("get_call_graph", "__CG__", cg));
+        assert!(!matches_trigger_class("Grep", "__CG__", cg));
+        assert!(!matches_trigger_class("(none)", "__CG__", cg));
+    }
+
+    #[test]
+    fn matches_trigger_class_decoy_accepts_all_decoys_or_none() {
+        let cg = &["get_call_graph"];
+        assert!(matches_trigger_class("Grep", "__DECOY__", cg));
+        assert!(matches_trigger_class("Read", "__DECOY__", cg));
+        assert!(matches_trigger_class("Bash", "__DECOY__", cg),
+            "Bash is a valid decoy in TriggerRate mode");
+        assert!(matches_trigger_class("(none)", "__DECOY__", cg));
+        assert!(!matches_trigger_class("get_call_graph", "__DECOY__", cg),
+            "decoy preservation must reject a code-graph pick (boundary leak)");
+    }
+
+    #[test]
+    fn compute_trigger_metrics_bash_pick_on_cg_query_counts_as_miss() {
+        // Real-world dominant failure: model reaches for `bash grep` instead
+        // of code-graph. This must register as a miss, not a hit.
+        let oracle: &[(&str, &str)] = &[("q1", "__CG__")];
+        let cg = vec!["get_call_graph"];
+        let picks = picks_from(&[("q1", "Bash")]);
+        let m = compute_trigger_metrics(&picks, oracle, &cg);
+        assert_eq!(m.cg_total, 1);
+        assert_eq!(m.trigger_hits, 0);  // Bash is not a cg tool
+        assert_eq!(m.cg_no_tool, 0);    // it IS a tool, just the wrong one
+    }
+
+    #[test]
+    fn compute_trigger_metrics_bash_pick_on_decoy_query_preserves_boundary() {
+        let oracle: &[(&str, &str)] = &[("d1", "__DECOY__")];
+        let cg = vec!["get_call_graph"];
+        let picks = picks_from(&[("d1", "Bash")]);
+        let m = compute_trigger_metrics(&picks, oracle, &cg);
+        assert_eq!(m.decoy_total, 1);
+        assert_eq!(m.decoy_preserved, 1);
+        assert_eq!(m.decoy_leak, 0);
+    }
+
+    #[test]
+    fn matches_trigger_class_unknown_class_is_false() {
+        let cg = &["get_call_graph"];
+        assert!(!matches_trigger_class("get_call_graph", "__OTHER__", cg));
+    }
+
+    #[test]
+    fn compute_trigger_metrics_all_correct() {
+        // 2 __CG__ → both pick cg; 1 __DECOY__ → picks Grep
+        let oracle: &[(&str, &str)] = &[
+            ("q1", "__CG__"),
+            ("q2", "__CG__"),
+            ("q3", "__DECOY__"),
+        ];
+        let cg = vec!["get_call_graph"];
+        let picks = picks_from(&[
+            ("q1", "get_call_graph"),
+            ("q2", "get_call_graph"),
+            ("q3", "Grep"),
+        ]);
+        let m = compute_trigger_metrics(&picks, oracle, &cg);
+        assert_eq!(m.cg_total, 2);
+        assert_eq!(m.trigger_hits, 2);
+        assert_eq!(m.cg_no_tool, 0);
+        assert_eq!(m.decoy_total, 1);
+        assert_eq!(m.decoy_preserved, 1);
+        assert_eq!(m.decoy_leak, 0);
+        assert_eq!(m.trigger_rate, 1.0);
+        assert_eq!(m.decoy_preserved_rate, 1.0);
+        assert_eq!(m.decoy_leak_rate, 0.0);
+    }
+
+    #[test]
+    fn compute_trigger_metrics_mixed_outcomes() {
+        // 4 __CG__: 2 cg, 1 Grep (wrong route), 1 (none).
+        // 2 __DECOY__: 1 Grep (good), 1 cg (leak).
+        let oracle: &[(&str, &str)] = &[
+            ("c1", "__CG__"), ("c2", "__CG__"), ("c3", "__CG__"), ("c4", "__CG__"),
+            ("d1", "__DECOY__"), ("d2", "__DECOY__"),
+        ];
+        let cg = vec!["get_call_graph"];
+        let picks = picks_from(&[
+            ("c1", "get_call_graph"),
+            ("c2", "get_call_graph"),
+            ("c3", "Grep"),
+            ("c4", "(none)"),
+            ("d1", "Grep"),
+            ("d2", "get_call_graph"),
+        ]);
+        let m = compute_trigger_metrics(&picks, oracle, &cg);
+        assert_eq!(m.cg_total, 4);
+        assert_eq!(m.trigger_hits, 2);
+        assert_eq!(m.cg_no_tool, 1);
+        assert_eq!(m.decoy_total, 2);
+        assert_eq!(m.decoy_preserved, 1);
+        assert_eq!(m.decoy_leak, 1);
+        assert_eq!(m.trigger_rate, 0.5);
+        assert_eq!(m.no_tool_rate, 0.25);
+        assert_eq!(m.decoy_preserved_rate, 0.5);
+        assert_eq!(m.decoy_leak_rate, 0.5);
+    }
+
+    #[test]
+    fn compute_trigger_metrics_empty_oracle_zero_rates() {
+        let picks: HashMap<String, String> = HashMap::new();
+        let cg = vec!["x"];
+        let m = compute_trigger_metrics(&picks, &[], &cg);
+        assert_eq!(m.trigger_rate, 0.0);
+        assert_eq!(m.decoy_preserved_rate, 0.0);
+        assert_eq!(m.decoy_leak_rate, 0.0);
+    }
+
+    #[test]
+    fn compute_trigger_metrics_missing_pick_treated_as_none() {
+        // q1 was a __CG__ query but no pick was recorded → behaves like (none).
+        let oracle: &[(&str, &str)] = &[("q1", "__CG__")];
+        let cg = vec!["get_call_graph"];
+        let picks: HashMap<String, String> = HashMap::new();
+        let m = compute_trigger_metrics(&picks, oracle, &cg);
+        assert_eq!(m.cg_total, 1);
+        assert_eq!(m.trigger_hits, 0);
+        assert_eq!(m.cg_no_tool, 1);
     }
 }
 
