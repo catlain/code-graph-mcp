@@ -1,5 +1,126 @@
 # Changelog
 
+## v0.28.0 — trigger-rate gate + hook coverage expansion
+
+Data-driven release based on a 7-day usage audit (2026-05-12 → 2026-05-14,
+141 main sessions): **1972 raw `bash grep` vs 47 code-graph calls** (the 47
+all came from one dogfooding session — zero organic cg invocations across
+20 sampled real sessions). Recall bench has stayed at P@1=100% throughout
+2026, so the gap isn't "which tool" but "is the model reaching for a tool
+at all". This release adds a measurement axis for that and widens three
+hook-layer interventions that were missing real-world surface.
+
+### Added
+- **`BenchMode::TriggerRate`** (`tests/routing_bench.rs`): new bench mode with
+  `tool_choice: auto` (recall benches use `required` / `any`). Surfaces the
+  "model returned no tool / picked Bash" failure mode that forced-tool benches
+  hide. 12-entry hard `TRIGGER_ORACLE` (10 `__CG__` + 2 `__DECOY__`) covering
+  pure symptom prompts ("今天的报告数据不准"), misleading-grep framing
+  ("用 grep 找一下…"), answer-flavored guesses ("应该是 cleanup 那段没等完吧"),
+  and generic feature refs. New `bash_decoy()` (TriggerRate-only — kept out of
+  ContextRich so v0.17.x baselines stay comparable), `compute_trigger_metrics`,
+  `matches_trigger_class`, `DECOY_NAMES`. Baseline on Sonnet 4.5: **60.0%
+  trigger (6/10) · 30.0% no-tool (3/10) · 100% decoy boundary · 0% leak**.
+  Run with `ROUTING_BENCH_MODE=trigger-rate`.
+- **PreToolUse:Read fanout detector** (`claude-plugin/scripts/pre-read-guide.js`):
+  new hook fires on the 5th Read into the same source dir within a 30-min
+  window. 7d audit found 16 sessions with 5+ Reads into one dir (top: 13
+  reads into `backend/app/services/`) — Claude burns ~500-2000 tokens per
+  Read when one `module_overview path=X/` returns symbols + caller counts in
+  ~600. Per-cwd state in `/tmp/.code-graph-readfan-<hash>.json`, 5-min
+  per-dir cooldown, 30-min state TTL. One-line hint suggests
+  `code-graph-mcp overview <dir>/` or MCP `module_overview path=<dir>`. New
+  `tool == "Read"` matcher in `claude-plugin/hooks/hooks.json` (3s timeout).
+- **UserPromptSubmit symptom-hint fallback** (`claude-plugin/scripts/user-prompt-context.js`):
+  24-entry `SYMPTOM_PATTERNS` (`/bug/i` · `/crash/i` · `/not work/i` ·
+  `/why does/i` · `挂了` · `失败了` · `卡死` · `不准` · `缺失` · `又失败` ·
+  `为什么` · `哪里[\s\S]{0,5}(?:错|有问题|不对)` · …). When the 4 existing
+  channels (intent / qualified symbol / file path / any symbol) all return
+  no actionable query AND the message has symptom phrasing AND a 10-min
+  cooldown is cold, `determineQueryType` returns `{ type: 'symptom-hint' }`
+  and `runMain` emits ONE LINE of prose (NO CLI execution — Phase A's lesson:
+  heavy structured injection backfires on borderline prompts). Hint format:
+  `[code-graph:hint] indexed repo — for vague-symptom prompts, try
+  \`semantic_code_search "<symptom>"\` or \`module_overview <suspected-dir>\`
+  to surface candidate code structurally. Skip if not searching code.`
+  Actionable paths (impact / overview / callgraph / search) still take
+  precedence; signature gains a 5th `message = ''` param keeping all legacy
+  callers backward-compat.
+
+### Changed
+- **`pre-grep-guide.js` SRC_PATH expansion** (`claude-plugin/scripts/pre-grep-guide.js`):
+  added 20 backend / DDD / web convention prefixes — `backend frontend services
+  models domain controllers views handlers middleware routes repositories
+  entities migrations tasks jobs workers features modules api web`. Root cause:
+  the v0.21+ regex required prefix terms in `(src|tests|lib|…|app|server|
+  client)/` to be preceded by whitespace / quote / start-of-string, so the
+  dominant daagu-style miss `backend/app/services/…` never fired (`app/` sat
+  after `backend/`). Audit shows 5 of the worst-offender sessions used exactly
+  this layout. Generic terms (`core` / `utils` / `shared` / `common` / `types`)
+  deliberately omitted — too many non-code contexts. 10 new positive regression
+  tests pass; 3 precision guards (`web.config` / `node_modules/` / `docs/*.md`)
+  stay false.
+
+### Fixed
+- `doc_lazy_continuation` lint on `tests/routing_bench.rs:704` —
+  `Grep \n /// + Read decoys` wrapped such that the continuation line began
+  with `+`, which clippy 1.95 reads as a markdown bullet. Reworded to
+  `the Grep/Read decoys alone don't model…`. Both clippy passes
+  (`--no-default-features` and `--all-targets`) clean.
+
+### Failed experiment (reverted in-session, kept for lesson)
+- **Phase A — "DO NOT use when X (Grep/Read/Bash)" steering in tool descriptions**:
+  Hypothesis (mem #8234 / `feedback_negative_steering_backfire.md`): mem-style
+  negative steering should lift trigger rate. **Bench falsified the hypothesis
+  before commit**: TriggerRate baseline **60% → 40%** (3-run unanimous), two
+  brand-new misses (`今天的报告数据不准 → None`, `test 又挂了 → Bash`), and the
+  target miss (`用 grep 找一下…` → Grep) wasn't fixed. Root cause: clauses like
+  "`INSTEAD OF Grep`" + "`DO NOT for: literals (Grep)`" are self-contradictory
+  — when the user hints "grep" the second clause licenses the wrong tool. New
+  rule in `feedback_negative_steering_backfire.md`: negative steering is safe
+  only between cg-vs-cg, never pointing at native decoys. Revert via
+  `git restore`, no commit hit `main`.
+
+### Regression coverage
+- `tests/routing_bench.rs::scoring_tests::compute_trigger_metrics_*` (4
+  tests covering all-correct / mixed / empty-oracle / missing-pick), plus
+  `decoy_tests::bash_decoy_has_required_fields_and_anchor`,
+  `mode_tests::detect_mode_trigger_rate`, `trigger_oracle_well_formed`.
+- `claude-plugin/scripts/pre-read-guide.test.js` — 34 tests covering source
+  extension whitelist, dir extraction, cooldown / threshold logic, state
+  load+save round-trip, TTL pruning, malformed-JSON tolerance, hint shape,
+  silenced env, integrated 5-read flow.
+- `claude-plugin/scripts/pre-grep-guide.test.js` — 10 new positive prefix
+  regressions (`backend/app/services/`, `services/scheduler/`, `models/`,
+  `controllers/`, `domain/`, `handlers/`, `migrations/`, `features/`,
+  `api/`, `frontend/`) + 3 precision guards. 52/52 pass.
+- `claude-plugin/scripts/user-prompt-context.test.js` — 18 new tests
+  (`hasSymptom` positive + precision, `determineQueryType` symptom-fallback
+  with cooldown + precedence + backward-compat, integration via `analyze`).
+  99/99 pass.
+
+### Rationale anchor
+The strategy: don't try to argue Claude into picking better tools at the
+description level — bench has already saturated there. Instead measure
+"trigger rate" as a separate axis (Phase 0/F), widen the existing Bash and
+Read hooks to fire on real-world layouts (Phases C/D), and add a low-noise
+symptom-only fallback to the UPS hook for the bug-shaped prompts that
+slipped through the existing 4 channels (Phase E). Phase A demonstrated
+that re-trying the description angle backfires. Phase B (MCP `instructions`
+symptom-mapping line) deliberately deferred until the C/D/E real-world
+fire-rate data justifies it.
+
+Surface: plugin-shipped behavior — users with adopted CG indexes will see
+new `[code-graph]` hints on `bash grep -rn backend/services/...`, 5+ Reads
+into the same source dir, and bug-flavored prompts that previously got
+zero UPS injection. Escape hatch unchanged: `CODE_GRAPH_QUIET_HOOKS=1`
+(env in `~/.claude/settings.json`).
+
+Pre-push parity: `cargo +1.95.0 clippy --no-default-features --all-targets
+-- -D warnings` clean on both targets; `node --test claude-plugin/scripts/
+*.test.js` 251 tests pass (52 pre-grep + 34 pre-read + 99 user-prompt +
+66 other); `cargo test` full suite passes.
+
 ## v0.27.0 — Python call relations + dead-code truncation guard
 
 ### Fixed

@@ -699,8 +699,8 @@ fn active_oracle(domain: BenchDomain) -> Vec<(&'static str, &'static str)> {
 
 /// Bash decoy — only added in TriggerRate mode. Mirrors Claude Code's
 /// native Bash tool, which is the dominant competing route in real-world
-/// sessions (7d audit: 1972 raw `bash grep` vs 47 code-graph calls; Grep
-/// + Read decoys alone don't model this escape hatch). Kept OUT of
+/// sessions (7d audit: 1972 raw `bash grep` vs 47 code-graph calls; the
+/// Grep/Read decoys alone don't model this escape hatch). Kept OUT of
 /// ContextRich mode so v0.17.2/v0.17.3 baselines stay comparable.
 fn bash_decoy() -> Value {
     json!({
