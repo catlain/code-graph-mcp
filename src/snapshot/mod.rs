@@ -152,6 +152,17 @@ pub fn inspect(file: &Path) -> Result<SnapshotMeta> {
     let schema_version = meta::read_meta(conn, meta::META_SNAPSHOT_SCHEMA_VERSION)?
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(0);
+    // Magic check above only validates the SQLite header (first 16 bytes). A
+    // truncated db file passes the header check, then Database::open creates
+    // empty schema and every meta lookup returns None → defaults. Without
+    // this guard, `inspect` would return a fake "valid empty snapshot" with
+    // zeroed fields. Real snapshots always carry a non-zero schema_version.
+    if schema_version == 0 && source_commit.is_empty() && tool_version.is_empty() {
+        anyhow::bail!(
+            "{} is not a valid code-graph snapshot — meta is missing or unreadable (file may be truncated or corrupt)",
+            file.display()
+        );
+    }
     let includes_vec = meta::read_meta(conn, meta::META_SNAPSHOT_INCLUDES_VEC)?
         .map(|s| s == "true")
         .unwrap_or(false);

@@ -11,6 +11,15 @@ impl McpServer {
 
         let raw_path = args["path"].as_str()
             .ok_or_else(|| anyhow!("Missing path"))?;
+        // Reject empty-string path explicitly: it normalizes to the "match all"
+        // prefix the same way "." does, but is almost always a variable-substitution
+        // bug at the call site (env var unset, optional chain returned ""). Surface
+        // it instead of silently dumping the whole project as if path:"." was passed.
+        if raw_path.is_empty() {
+            return Err(anyhow!(
+                "path must not be empty — use '.' to scan the whole project root"
+            ));
+        }
         let compact = args["compact"].as_bool().unwrap_or(false);
         let include_deps = args["include_deps"].as_bool().unwrap_or(false);
         let include_dead = args["include_dead"].as_bool().unwrap_or(false);

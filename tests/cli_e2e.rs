@@ -489,6 +489,38 @@ fn test_cli_ast_search_class_filter() {
     assert!(stdout.contains("Logger"), "should find Logger class");
 }
 
+#[test]
+fn test_cli_ast_search_invalid_type() {
+    // Regression: --type INVALID used to print a stderr warning and exit 0
+    // with "No results matching filters" because an unknown alias normalizes
+    // to an empty Vec which silently filters every node. Must error out so
+    // users see the typo instead of believing the index is empty.
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["ast-search", "--type", "INVALID_TYPE"]);
+    assert_ne!(code, 0, "invalid --type should fail");
+    assert!(stderr.contains("Unknown type filter"), "should explain the typo; got: {stderr}");
+}
+
+#[test]
+fn test_cli_overview_empty_path_errors() {
+    // Regression: overview "" used to be silently treated like overview "."
+    // (match-all alias), which is almost always a shell-variable substitution
+    // bug. Must surface as an error so users see the empty value.
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["overview", ""]);
+    assert_ne!(code, 0, "empty path should fail");
+    assert!(stderr.contains("must not be empty"), "should explain; got: {stderr}");
+}
+
+#[test]
+fn test_cli_search_invalid_node_type() {
+    // Same regression as ast-search: --node-type INVALID was silently dropped.
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["search", "Logger", "--node-type", "INVALID_TYPE"]);
+    assert_ne!(code, 0, "invalid --node-type should fail");
+    assert!(stderr.contains("Unknown node-type filter"), "should explain the typo; got: {stderr}");
+}
+
 // ============================================================
 // trace (no HTTP routes in test project, so test graceful handling)
 // ============================================================

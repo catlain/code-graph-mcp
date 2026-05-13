@@ -127,12 +127,19 @@ impl McpServer {
         };
 
         use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_IMPLEMENTS};
+        // Schema enum is ["calls", "imports", "inherits", "implements", "all"].
+        // Unknown values used to fall through to None (no filter), masking typos —
+        // a caller passing relation:"call" silently got the same response as "all".
         let relation_filter = match relation {
             "calls" => Some(REL_CALLS),
             "imports" => Some(REL_IMPORTS),
             "inherits" => Some(REL_INHERITS),
             "implements" => Some(REL_IMPLEMENTS),
-            _ => None,
+            "all" => None,
+            _ => return Err(anyhow!(
+                "Unknown relation filter: '{}'. Valid: calls, imports, inherits, implements, all",
+                relation
+            )),
         };
 
         // Collect references for all matching node IDs

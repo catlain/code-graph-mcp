@@ -368,10 +368,29 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
     // Open with vec support so embeddings can be stored
     let db = Database::open_with_vec(&db_path)?;
 
+    // Wrap rusqlite SQLITE_BUSY ("database is locked", error code 5) — surfaces
+    // when two indexers race on the same .code-graph/index.db. Without this, the
+    // user sees a cryptic "Error code 5: database is locked" with no remediation.
+    fn wrap_busy<T>(r: Result<T>) -> Result<T> {
+        r.map_err(|e| {
+            let msg = format!("{:#}", e);
+            if msg.contains("database is locked") || msg.contains("Error code 5") {
+                anyhow::anyhow!(
+                    "Another `code-graph-mcp` process is writing to .code-graph/index.db \
+                     (an indexer or MCP server). Wait for it to finish, then retry. \
+                     Original error: {}",
+                    e
+                )
+            } else {
+                e
+            }
+        })
+    }
+
     if is_new {
         // Full index for new databases
         use crate::indexer::pipeline::run_full_index;
-        let result = run_full_index(&db, project_root, None, None)?;
+        let result = wrap_busy(run_full_index(&db, project_root, None, None))?;
         if !quiet {
             eprintln!(
                 "Full index: {} files, {} nodes, {} edges",
@@ -381,7 +400,7 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
     } else {
         // Incremental index for existing databases
         use crate::indexer::pipeline::run_incremental_index;
-        let stats = run_incremental_index(&db, project_root, None, None)?;
+        let stats = wrap_busy(run_incremental_index(&db, project_root, None, None))?;
         if !quiet {
             eprintln!(
                 "Incremental index: {} files updated, {} nodes created",
@@ -397,9 +416,9 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
         if let Some(model) = EmbeddingModel::load()? {
             let mut total = 0usize;
             loop {
-                let chunk = queries::get_unembedded_nodes(db.conn(), 64)?;
+                let chunk = wrap_busy(queries::get_unembedded_nodes(db.conn(), 64))?;
                 if chunk.is_empty() { break; }
-                embed_and_store_batch(&db, &model, &chunk)?;
+                wrap_busy(embed_and_store_batch(&db, &model, &chunk))?;
                 total += chunk.len();
             }
             if total > 0 && !quiet {
@@ -1047,6 +1066,17 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
         parse_flag_or(args, "--top-k", 20_i64)
     }.clamp(1, 100);
 
+    // Validate --node-type up-front: unknown alias normalizes to an empty Vec
+    // and silently filters every node away (see ast-search same fix).
+    if let Some(ntf) = node_type_filter {
+        if crate::domain::normalize_type_filter(ntf).is_empty() {
+            anyhow::bail!(
+                "Unknown node-type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
+                ntf
+            );
+        }
+    }
+
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
@@ -1190,6 +1220,18 @@ pub fn cmd_ast_search(project_root: &Path, args: &[String]) -> Result<()> {
             "Usage: code-graph-mcp ast-search <query> [--type fn|class|...] [--returns type] [--params text] [--json]\n\
              Either a query or at least one filter (--type, --returns, --params) is required."
         );
+    }
+
+    // Validate --type up-front: an unknown alias normalizes to an empty Vec,
+    // which silently filters every node away. Surface as an error so the user
+    // doesn't read "No results matching filters" and assume the index is empty.
+    if let Some(tf) = type_filter {
+        if crate::domain::normalize_type_filter(tf).is_empty() {
+            anyhow::bail!(
+                "Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
+                tf
+            );
+        }
     }
 
     let ctx = CliContext::open(project_root)?;
@@ -1846,6 +1888,11 @@ pub fn cmd_map(project_root: &Path, args: &[String]) -> Result<()> {
 pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
     let raw_path = get_positional(args, 0)
         .ok_or_else(|| anyhow::anyhow!("Usage: code-graph-mcp overview <path> [--json] [--compact]"))?;
+    // Reject empty-string path: mirrors MCP `tool_module_overview` (script users
+    // hit this when a shell variable is unset and overview "$X" expands to "").
+    if raw_path.is_empty() {
+        anyhow::bail!("path must not be empty — use '.' to scan the whole project root");
+    }
     // Normalize: strip leading "./" and treat bare "." as empty prefix (match all).
     // Mirrors MCP `tool_module_overview` so `cd <proj>; code-graph-mcp overview .`
     // returns the whole project the same way `module_overview path="."` does.

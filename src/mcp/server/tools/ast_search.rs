@@ -20,6 +20,18 @@ impl McpServer {
             return Err(anyhow!("Either query or at least one filter (type, returns, params) is required."));
         }
 
+        // Validate type up-front: unknown aliases normalize to an empty Vec,
+        // which would silently filter every node away. Surface the typo so the
+        // caller doesn't read "No results" and assume the index is empty.
+        if let Some(tf) = type_filter {
+            if crate::domain::normalize_type_filter(tf).is_empty() {
+                return Err(anyhow!(
+                    "Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
+                    tf
+                ));
+            }
+        }
+
         let results: Vec<queries::NodeWithFile> = if let Some(q) = query {
             // FTS5 search + filter in Rust
             let fts_result = queries::fts5_search(self.db.conn(), q, (limit * 4) as i64)?;

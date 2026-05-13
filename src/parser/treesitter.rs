@@ -432,6 +432,13 @@ fn extract_nodes(
                 // two parser walks (treesitter.rs builds nodes; relations/mod.rs
                 // builds edges).
                 let impl_name = impl_name_full.rsplit("::").next().unwrap_or(impl_name_full);
+                // Strip generic parameters so `impl<T> Foo<T>` produces method
+                // qualified_names like "Foo.method" not "Foo<T>.method". The
+                // self_filter_candidates resolver and impl_method metadata
+                // both encode the bare type name (see relations/rust.rs);
+                // keeping the impl name bare avoids a LIKE mismatch that would
+                // drop every method-level implements edge.
+                let impl_name = impl_name.split('<').next().unwrap_or(impl_name).trim();
                 extract_children(node, source, language, config, Some(impl_name), results, depth, node_is_test);
                 return;
             }
@@ -654,8 +661,15 @@ struct SignatureInfo {
 fn extract_signature_info(node: &tree_sitter::Node, source: &str) -> SignatureInfo {
     let params = node.child_by_field_name("parameters")
         .map(|p| node_text(&p, source).to_string());
+    // For TS/JS the return_type field maps to a `type_annotation` node whose
+    // text starts with the literal `:` (e.g. `: string`). For Python/Rust/Go
+    // it's the bare type (e.g. `str`, `Result<()>`). Strip a single leading
+    // colon + whitespace so all languages produce shape-consistent values
+    // (no-op when the leading char isn't `:`).
     let ret = node.child_by_field_name("return_type")
-        .map(|r| node_text(&r, source).to_string());
+        .map(|r| node_text(&r, source).to_string())
+        .map(|s| s.trim_start_matches(':').trim_start().to_string())
+        .filter(|s| !s.is_empty());
 
     let signature = match (&params, &ret) {
         (Some(p), Some(r)) => Some(format!("{} -> {}", p, r)),
@@ -1229,7 +1243,9 @@ function noReturn(x: number) {
 "#;
         let nodes = parse_code(code, "typescript").unwrap();
         let greet = nodes.iter().find(|n| n.name == "greet").unwrap();
-        assert_eq!(greet.return_type.as_deref(), Some(": string"));
+        // Leading colon + whitespace from the TS `type_annotation` node is
+        // stripped at extraction so output matches Python/Rust shape.
+        assert_eq!(greet.return_type.as_deref(), Some("string"));
 
         let no_ret = nodes.iter().find(|n| n.name == "noReturn").unwrap();
         assert!(no_ret.return_type.is_none());

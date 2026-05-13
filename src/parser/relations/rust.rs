@@ -94,7 +94,13 @@ pub(super) fn extract_rust_impl_trait(node: &tree_sitter::Node, source: &str) ->
     let trait_node = node.child_by_field_name("trait")?;
     let type_node = node.child_by_field_name("type")?;
     let trait_name = node_text(&trait_node, source).to_string();
-    let type_name = node_text(&type_node, source).to_string();
+    let type_text = node_text(&type_node, source).to_string();
+    // Strip generics so source resolution can match the bare struct name.
+    // The `type` field on a generic impl block returns the full `Type<'a, W>`
+    // text; Phase 2 source resolution (index_files.rs) does exact-name match
+    // against local node names ("Type"), so without stripping, no edge would
+    // emit for any generic trait impl — every method appears dead.
+    let type_name = type_text.split('<').next().unwrap_or(&type_text).trim().to_string();
     if trait_name.is_empty() || type_name.is_empty() {
         return None;
     }

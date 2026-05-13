@@ -1,5 +1,117 @@
 # Changelog
 
+## v0.29.0 — edge resolution precision pass (12 silent-failure fixes)
+
+Five rounds of end-to-end dogfooding surfaced 12 silent-failure / mis-attribution
+bugs across the parser → resolver → MCP/CLI surface. Net effect on the project's
+own index: **dead-code false positives dropped 21 → 6** (all remaining 6 are
+documented design limitations: receiver `obj.method()` calls, type-as-field
+references, cross-file constant access), **edges restored 3030 → 3266+** (+8%
+real call relations recovered). The user-visible behavior shift is the
+TypeScript `return_type` shape (no longer leaks `": "` prefix) — minor bump
+flags that.
+
+### Fixed — parser
+- **TypeScript `return_type` strips leading `:`** (`src/parser/treesitter.rs`):
+  `extract_signature_info` read the tree-sitter `return_type` field verbatim,
+  which on TS/JS is a `type_annotation` node whose text starts with `:`. Stored
+  values were `": string"` not `"string"`; signatures rendered `(name: string)
+  -> : string`. Now trimmed at extraction — Python / Rust / Go produce clean
+  values unchanged (no-op when first char isn't `:`).
+- **Rust generic trait impl emits no method edges** (`src/parser/relations/rust.rs`,
+  `src/parser/treesitter.rs`): `impl<'a, W: Write> Write for CapWriter<'a, W>`
+  stored `source_name = "CapWriter<'a, W>"` from `type_node` verbatim; Phase 2
+  source resolution exact-name-matched against `"CapWriter"` and dropped every
+  method edge. Every generic trait impl's methods looked dead. Now strips
+  generic params at both extraction sites (relations + treesitter qualified_name).
+- **Method-level implements edges fan out within a file**
+  (`src/parser/relations/mod.rs`, `src/indexer/pipeline/index_files.rs`): N
+  structs each `impl Trait for StructN` in one file produced N×N×methods edge
+  combinations because the resolver matched bare method names against every
+  same-name node in the file. Parser now stamps `{"q":"impl_method","v":"<Type>"}`;
+  resolver filters method candidates by `qualified_name LIKE "<Type>.%"` via
+  the existing `self_filter_candidates`.
+
+### Fixed — resolver
+- **Same-file targets dropped under Path qualifier**
+  (`src/indexer/pipeline/index_files.rs`): the `CalleeMeta::Path` branch
+  excluded `local_ids` before applying the path filter, contradicting the
+  spec's "same-file matches take precedence". `Foo::helper()` in the same
+  file as `impl Foo { fn helper }` produced zero call edges. Now includes
+  same-file candidates in the path-filtered pool.
+- **`path_filter_candidates` misses single-file Rust mods**
+  (`src/indexer/pipeline/resolve.rs`): only matched `/<seg>/` or `<seg>/`
+  directory boundaries, so `crate::domain::foo()` resolving into `src/domain.rs`
+  (single-file mod, no `domain/` directory) dropped. Now also accepts
+  `path.ends_with("/<last_seg>.rs")`. **This single fix eliminated 14 of the
+  20 dead-code false positives** (`normalize_type_filter`, all `migrate_v*_to_v*`,
+  `create_tables_sql`, etc.).
+
+### Fixed — MCP / CLI surface validation
+- **`ast_search` / `semantic_code_search` invalid `type` filter silently empty**
+  (`src/mcp/server/tools/ast_search.rs`, `src/mcp/server/tools/search.rs`,
+  `src/cli.rs`): `normalize_type_filter("INVALID")` returns empty `Vec`;
+  `.any()` on empty returns false → every node filtered out → "No results"
+  with exit 0. Now bails up-front with the valid-values list.
+- **`find_references` invalid `relation` silently falls back to `all`**
+  (`src/mcp/server/tools/refs.rs`): `match relation { "calls"=>..., _=>None }`
+  treated `"call"` (typo) identical to `"all"`. Now explicit `"all" => None`
+  + Err on anything else.
+- **`get_call_graph` `symbol_name` + `route_path` silently uses `route_path`**
+  (`src/mcp/server/tools/callgraph.rs`): schema marks them mutually exclusive
+  but impl preferred route_path silently. Now errors with the conflict.
+- **`module_overview path=""` returns the whole project**
+  (`src/mcp/server/tools/overview.rs`, `src/cli.rs`): empty string normalized
+  to the same "match all" prefix as `"."`. Common variable-substitution bug
+  (`process.env.X || ""` → dumps entire repo). Now errors; `"."` still works
+  as the documented match-all alias.
+
+### Fixed — FTS5 / snapshot / concurrency
+- **FTS5 reserved-word queries leak raw syntax error**
+  (`src/storage/queries/search.rs`): `semantic_code_search query="NOT"`
+  returned `Error: fts5: syntax error near "NOT"`. Each sanitized token is
+  now wrapped in `"…"` (FTS5 phrase syntax) — equivalent for normal tokens,
+  defuses the NOT/AND/OR/NEAR keywords.
+- **`snapshot inspect` silently succeeds on truncated SQLite**
+  (`src/snapshot/mod.rs`): a 100-byte file starting with `"SQLite format 3\0"`
+  magic passed the header check; `Database::open` initialized empty schema;
+  every meta lookup returned None → defaults. Inspect returned a fake "empty
+  valid snapshot" with zeroed fields. Now bails when all meta is missing.
+- **Concurrent `incremental-index` shows cryptic `Error code 5: database is locked`**
+  (`src/cli.rs`): two CLI processes racing on `.code-graph/index.db` got raw
+  rusqlite SQLITE_BUSY. New `wrap_busy()` translates to "Another `code-graph-mcp`
+  process is writing... Wait for it to finish, then retry." while keeping the
+  original error for debug.
+
+### Regression coverage
+- `tests/cli_e2e.rs::test_cli_ast_search_invalid_type` /
+  `test_cli_search_invalid_node_type` / `test_cli_overview_empty_path_errors`.
+- `tests/integration.rs::test_module_overview_empty_path_errors` /
+  `test_find_references_invalid_relation_errors` /
+  `test_get_call_graph_symbol_and_route_mutually_exclusive` /
+  `test_fts5_keyword_query_does_not_leak_syntax_error`.
+- `tests/integration_call_qualifier.rs::path_qualifier_keeps_same_file_target` /
+  `path_qualifier_resolves_single_file_rust_mod` /
+  `same_file_generic_impl_method_edges_dont_fan_out`.
+- `src/snapshot/tests.rs::inspect_rejects_truncated_sqlite_header`.
+- `src/parser/relations/tests.rs::test_extract_rust_impl_trait_generic_type_strips_params`.
+
+353+67+50+9+19 tests pass; `cargo +1.95.0 clippy --no-default-features` and
+`--all-targets` both clean under `-D warnings`.
+
+### Known limitations preserved
+Six dead-code entries remain after this pass and are documented design gaps,
+not bugs:
+- Receiver method calls (`obj.method()` where receiver type isn't statically
+  inferable): `validate`, `file_exists`, `db()`.
+- Type-as-field references (`pub foo: SomeStruct`): `SnapshotConfig`.
+- Cross-file constant access via Path qualifier (extractor doesn't emit edges
+  for non-call identifier references): `PROD_SOURCE_FILTER_AND`,
+  `TEST_SOURCE_FILTER_OR`.
+
+Fixing these requires either a Rust type inferencer or extending edge
+extraction to non-call identifier references — out of scope for this release.
+
 ## v0.28.0 — trigger-rate gate + hook coverage expansion
 
 Data-driven release based on a 7-day usage audit (2026-05-12 → 2026-05-14,

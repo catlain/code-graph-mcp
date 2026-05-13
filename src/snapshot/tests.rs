@@ -289,6 +289,28 @@ fn inspect_accepts_raw_db_when_no_zstd_magic() {
 }
 
 #[test]
+fn inspect_rejects_truncated_sqlite_header() {
+    // Regression: a file just long enough to pass the SQLite magic check
+    // ("SQLite format 3\0" + a few extra bytes) used to slip through the
+    // header gate. Database::open would create empty schema, every meta
+    // lookup would return None → defaults, and inspect returned a fake
+    // "valid empty snapshot" with zeroed fields. Real snapshots always
+    // carry meta — bail when it's missing.
+    let dir = TempDir::new().unwrap();
+    let bad = dir.path().join("truncated.db");
+    // 100 bytes starting with the SQLite header magic + zeros
+    let mut buf = b"SQLite format 3\0".to_vec();
+    buf.resize(100, 0);
+    std::fs::write(&bad, &buf).unwrap();
+    let err = crate::snapshot::inspect(&bad).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not a valid code-graph snapshot") || msg.contains("meta is missing"),
+        "expected truncated-db rejection, got: {msg}"
+    );
+}
+
+#[test]
 fn inspect_rejects_garbage_with_clear_error() {
     let dir = TempDir::new().unwrap();
     let bad = dir.path().join("garbage.db.zst");

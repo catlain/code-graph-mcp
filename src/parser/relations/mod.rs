@@ -539,11 +539,21 @@ fn walk_for_relations(
                                 if let Some(name_node) = child.child_by_field_name("name") {
                                     let method_name = node_text(&name_node, source);
                                     if !method_name.is_empty() {
+                                        // Stamp impl_type so Phase 2 can filter
+                                        // method candidates by qualified_name. Without
+                                        // it, a file with N structs each implementing
+                                        // the same trait fans every impl's method
+                                        // edge to all N same-named method nodes —
+                                        // every struct appears to implement every
+                                        // other struct's methods.
                                         results.push(ParsedRelation {
                                             source_name: type_name.clone(),
                                             target_name: method_name.to_string(),
                                             relation: REL_IMPLEMENTS.into(),
-                                            metadata: None,
+                                            metadata: Some(format!(
+                                                r#"{{"q":"impl_method","v":{}}}"#,
+                                                serde_json::Value::String(type_name.clone())
+                                            )),
                                             source_language: String::new(),
                                         });
                                     }

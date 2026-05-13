@@ -20,6 +20,17 @@ impl McpServer {
         let node_type_filter = args["node_type"].as_str();
         let compact = args["compact"].as_bool().unwrap_or(false);
 
+        // Validate node_type up-front: unknown aliases normalize to empty and
+        // would silently filter every result away (see tool_ast_search parity).
+        if let Some(nt) = node_type_filter {
+            if crate::domain::normalize_type_filter(nt).is_empty() {
+                return Err(anyhow!(
+                    "Unknown node_type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
+                    nt
+                ));
+            }
+        }
+
         // Query quality factor: penalize vague/short queries so relevance scores
         // reflect actual match quality, not just relative rank position.
         let meaningful_tokens: Vec<&str> = query.split_whitespace()

@@ -46,7 +46,18 @@ impl McpServer {
     pub(in crate::mcp::server) fn tool_get_call_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         // Route mode: when route_path is set, dispatch to HTTP-chain tracer.
         // Folds the former trace_http_chain tool into get_call_graph (v0.18.4).
-        if args.get("route_path").and_then(|v| v.as_str()).is_some() {
+        // Schema marks symbol_name and route_path mutually exclusive — enforce it
+        // so a caller passing both doesn't silently get route-only behavior with
+        // symbol_name dropped on the floor.
+        let has_route = args.get("route_path").and_then(|v| v.as_str()).is_some();
+        let has_symbol = args.get("symbol_name").and_then(|v| v.as_str()).is_some()
+            || args.get("function_name").and_then(|v| v.as_str()).is_some();
+        if has_route && has_symbol {
+            return Err(anyhow!(
+                "symbol_name and route_path are mutually exclusive — pass exactly one"
+            ));
+        }
+        if has_route {
             return self.tool_trace_http_chain(args);
         }
 

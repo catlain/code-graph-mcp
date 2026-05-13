@@ -1201,6 +1201,111 @@ function run() { return helper(); }
 }
 
 #[test]
+fn test_fts5_keyword_query_does_not_leak_syntax_error() {
+    // Regression: a query consisting solely of FTS5 reserved words (NOT/AND/OR/NEAR)
+    // leaked the raw "fts5: syntax error near \"NOT\"" error to the caller because
+    // sanitized tokens were passed bare to MATCH and re-parsed as operators.
+    // Each token is now wrapped in double quotes so it's treated as a phrase.
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/a.ts"),
+        "export function helper(): number { return 1; }\n"
+    ).unwrap();
+    let server = common::init_server(&project);
+
+    for query in ["NOT", "AND OR NOT", "NEAR", "OR"] {
+        let msg = tool_call_json("semantic_code_search", serde_json::json!({"query": query}));
+        let resp = server.handle_message(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+        let is_err = parsed["result"]["isError"] == serde_json::Value::Bool(true);
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !is_err || !text.contains("fts5:"),
+            "FTS5 keyword query '{query}' should not leak raw FTS5 syntax error; got: {text}"
+        );
+    }
+}
+
+#[test]
+fn test_module_overview_empty_path_errors() {
+    // Regression: path:"" used to normalize to "" the same way path:"." does,
+    // silently returning the whole-project overview. Common variable-substitution
+    // bug at the call site — must error instead of silently dumping everything.
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/a.ts"), "export function a() { return 1; }\n").unwrap();
+    let server = common::init_server(&project);
+
+    let msg = tool_call_json("module_overview", serde_json::json!({"path": ""}));
+    let resp = server.handle_message(&msg).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+    assert_eq!(parsed["result"]["isError"], serde_json::Value::Bool(true),
+        "empty path must error: {:?}", parsed);
+    let text = parsed["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("must not be empty"),
+        "should explain the empty-path requirement; got: {text}");
+
+    // "." should still work as the "match all" alias
+    let msg = tool_call_json("module_overview", serde_json::json!({"path": "."}));
+    let resp = server.handle_message(&msg).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+    assert_ne!(parsed["result"]["isError"], serde_json::Value::Bool(true),
+        "'.' should still be the match-all alias: {:?}", parsed);
+}
+
+#[test]
+fn test_find_references_invalid_relation_errors() {
+    // Regression: unknown `relation` values used to fall through to None (no filter)
+    // and silently return "all" results, masking caller typos like relation:"call".
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/a.ts"),
+        "export function helper(): number { return 1; }\nfunction run() { return helper(); }\n"
+    ).unwrap();
+    let server = common::init_server(&project);
+    let init = tool_call_json("semantic_code_search", serde_json::json!({"query": "helper"}));
+    let _ = server.handle_message(&init);
+
+    let msg = tool_call_json("find_references", serde_json::json!({
+        "symbol_name": "helper",
+        "relation": "BOGUS_RELATION",
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+    assert_eq!(parsed["result"]["isError"], serde_json::Value::Bool(true),
+        "invalid relation must error, not silently fall back: {:?}", parsed);
+    let text = parsed["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Unknown relation"), "should explain the typo; got: {text}");
+}
+
+#[test]
+fn test_get_call_graph_symbol_and_route_mutually_exclusive() {
+    // Regression: passing both symbol_name and route_path used to silently dispatch
+    // to route mode and drop symbol_name on the floor. The schema marks them
+    // mutually exclusive — enforce it so conflicting input surfaces as an error.
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/a.ts"),
+        "export function helper(): number { return 1; }\n"
+    ).unwrap();
+    let server = common::init_server(&project);
+    let init = tool_call_json("semantic_code_search", serde_json::json!({"query": "helper"}));
+    let _ = server.handle_message(&init);
+
+    let msg = tool_call_json("get_call_graph", serde_json::json!({
+        "symbol_name": "helper",
+        "route_path": "GET /api/x",
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+    assert_eq!(parsed["result"]["isError"], serde_json::Value::Bool(true),
+        "conflicting symbol_name+route_path must error: {:?}", parsed);
+    let text = parsed["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("mutually exclusive"),
+        "should explain the conflict; got: {text}");
+}
+
+#[test]
 fn test_dependency_graph_compact_mode() {
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();

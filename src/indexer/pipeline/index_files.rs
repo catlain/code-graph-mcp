@@ -446,6 +446,40 @@ pub(super) fn index_files(
                     }
                 }
 
+                // Rust trait impl method-level edges: parser stamps
+                // `{"q":"impl_method","v":"<TypeName>"}` so we can restrict
+                // candidate target methods to those that actually belong to
+                // this impl block (qualified_name LIKE "<TypeName>.%"). Without
+                // this, N structs implementing the same trait in one file all
+                // fan their method edges onto every same-name method node.
+                if rel.relation == REL_IMPLEMENTS {
+                    if let Some(ref meta_str) = rel.metadata {
+                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                            if meta.get("q").and_then(|v| v.as_str()) == Some("impl_method") {
+                                if let Some(impl_type) = meta.get("v").and_then(|v| v.as_str()) {
+                                    use super::resolve::self_filter_candidates;
+                                    let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
+                                    let filtered = self_filter_candidates(impl_type, &all, db)?;
+                                    if filtered.is_empty() {
+                                        // No project method belongs to this type — drop
+                                        // (would be an external trait method anyway).
+                                        continue;
+                                    }
+                                    for &src_id in &source_ids {
+                                        for &tgt_id in &filtered {
+                                            if src_id != tgt_id
+                                                && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                total_edges_created += 1;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Bare-name call qualifier (Rust): inspect metadata to
                 // skip / restrict candidate set before the existing fallback
                 // chain. See spec
@@ -489,12 +523,18 @@ pub(super) fn index_files(
                         }
                         Some(CalleeMeta::Path(segments)) => {
                             let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
+                            // Same-file candidates take precedence per the bare-name
+                            // qualifier design ("same-file matches still take precedence").
+                            // Previously this filtered them out, so `Foo::helper()` in the
+                            // same file as `impl Foo { fn helper }` produced no edge —
+                            // the same-file pool was excluded before the Path filter,
+                            // and the cross-file Path filter (which scans /Foo/ in the
+                            // path) couldn't match a single-file project either.
                             let same_lang: Vec<i64> = all.iter()
                                 .filter(|id| matches!(
                                     node_id_to_language.get(id).and_then(|l| l.as_deref()),
                                     Some(l) if l == pf.language.as_str()
                                 ))
-                                .filter(|id| !local_ids.contains(id))
                                 .copied()
                                 .collect();
                             let filtered = path_filter_candidates(

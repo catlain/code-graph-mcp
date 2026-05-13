@@ -278,12 +278,25 @@ pub(super) fn path_filter_candidates(
         id_to_qn.insert(id, qn);
     }
 
+    // For the LAST segment, also accept the path ending in `<seg>.rs` —
+    // Rust commonly puts single-file mods at `src/<mod>.rs` (e.g. `src/domain.rs`
+    // for `crate::domain::*`), which has no `/domain/` directory boundary the
+    // directory-style check below would catch. Without this, every
+    // `crate::domain::foo()` call drops on the floor and `domain::foo` looks dead.
+    let last_seg = segments.last().cloned().unwrap_or_default();
+    let single_file_suffix = if !last_seg.is_empty() {
+        Some(format!("/{}.rs", last_seg))
+    } else {
+        None
+    };
+
     let kept: Vec<i64> = candidates.iter().copied().filter(|id| {
         let path = node_id_to_path.get(id).map(String::as_str).unwrap_or("");
         let qn = id_to_qn.get(id).map(String::as_str).unwrap_or("");
 
         let path_match = path.contains(&format!("/{}/", path_chain))
-            || path.starts_with(&format!("{}/", path_chain));
+            || path.starts_with(&format!("{}/", path_chain))
+            || single_file_suffix.as_deref().is_some_and(|sfx| path.ends_with(sfx));
 
         let qn_match = qn == qn_chain
             || qn.starts_with(&format!("{}.", qn_chain))

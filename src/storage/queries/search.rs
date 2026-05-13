@@ -83,9 +83,16 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
         Ok((node, -bm25))
     };
 
+    // Wrap each sanitized term in double quotes so a bare token like "NOT"
+    // (FTS5 keyword) parses as a phrase query for that token instead of as the
+    // unary NOT operator. After sanitization tokens contain only [A-Za-z0-9_]
+    // so `"<token>"` is always a well-formed FTS5 phrase. Same protection for
+    // AND, OR, NEAR — covers user queries that happen to contain reserved words.
+    let quoted: Vec<String> = terms.iter().map(|t| format!("\"{}\"", t)).collect();
+
     // Strategy: AND-first for multi-term queries (higher precision), fallback to OR
     if terms.len() > 1 {
-        let and_query = terms.join(" AND ");
+        let and_query = quoted.join(" AND ");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![and_query, limit], map_row_with_bm25)?;
         let pairs: Vec<(NodeResult, f64)> = rows.collect::<Result<Vec<_>, _>>()?;
@@ -119,8 +126,9 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
                         test_filter
                     );
                     let mut probe = conn.prepare(&probe_sql)?;
+                    let probe_query = format!("\"{}\"", sanitized_original);
                     let exists: bool =
-                        probe.exists(rusqlite::params![sanitized_original])?;
+                        probe.exists(rusqlite::params![probe_query])?;
                     if !exists {
                         return Ok(FtsResult {
                             nodes: vec![],
@@ -134,7 +142,7 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
         // Fallback: OR gives broader recall
     }
 
-    let or_query = terms.join(" OR ");
+    let or_query = quoted.join(" OR ");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![or_query, limit], map_row_with_bm25)?;
     let pairs: Vec<(NodeResult, f64)> = rows.collect::<Result<Vec<_>, _>>()?;

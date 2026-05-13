@@ -211,3 +211,117 @@ fn non_rust_callgraph_unchanged() {
     let count: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
     assert_eq!(count, 1, "JS caller→helper edge must survive (no qualifier filtering for non-Rust)");
 }
+
+#[test]
+fn path_qualifier_resolves_single_file_rust_mod() {
+    // Regression: path_filter_candidates only looked for "/domain/" or
+    // "domain/" directory boundaries, so `crate::domain::foo()` resolving to
+    // a function in `src/domain.rs` (single-file mod, no directory) silently
+    // dropped — every cross-file qualified call into a single-file mod marked
+    // the target as dead code. Accept `<last_seg>.rs` suffix too.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "src/domain.rs", r#"
+        pub fn helper_in_domain() -> i32 { 42 }
+    "#);
+    write(root, "src/main.rs", r#"
+        pub fn caller() -> i32 {
+            crate::domain::helper_in_domain()
+        }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let callers = callers_of(&db, "helper_in_domain");
+    assert!(
+        callers.iter().any(|c| c == "caller"),
+        "caller→crate::domain::helper_in_domain() must resolve when target lives in src/domain.rs (single-file mod); got: {:?}",
+        callers
+    );
+}
+
+#[test]
+fn same_file_generic_impl_method_edges_dont_fan_out() {
+    // Regression: 3 structs each `impl SameTrait for StructX` in one file used
+    // to produce 3×3 = 9 method-edge slots per method name (every struct
+    // appeared to implement every same-name method) because Phase 2 resolved
+    // bare target_name "run" against all 3 same-name method nodes in the
+    // file. Parser now stamps {"q":"impl_method","v":"<Type>"} so the resolver
+    // filters method candidates by qualified_name LIKE "<Type>.%".
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "src/lib.rs", r#"
+        pub trait DoWork { fn run(&self); }
+        pub struct A;
+        impl DoWork for A { fn run(&self) {} }
+        pub struct B<T>(T);
+        impl<T: Clone> DoWork for B<T> { fn run(&self) {} }
+        pub struct C<'a, U>(&'a U);
+        impl<'a, U: Default> DoWork for C<'a, U> { fn run(&self) {} }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let mut stmt = db.conn().prepare(
+        "SELECT src.name, tgt.qualified_name
+         FROM edges e
+         JOIN nodes src ON src.id = e.source_id
+         JOIN nodes tgt ON tgt.id = e.target_id
+         WHERE e.relation = 'implements'
+           AND tgt.name = 'run'
+         ORDER BY src.name"
+    ).unwrap();
+    let pairs: Vec<(String, String)> = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    }).unwrap().filter_map(|r| r.ok()).collect();
+
+    // Each struct must implement only its own method (3 edges, not 9).
+    assert_eq!(pairs.len(), 3,
+        "expected one implements edge per (struct, its-own-run) pair; got {:?}", pairs);
+    assert!(pairs.contains(&("A".to_string(), "A.run".to_string())),
+        "A should implement A.run; got {:?}", pairs);
+    assert!(pairs.contains(&("B".to_string(), "B.run".to_string())),
+        "B should implement B.run (bare, no <T>); got {:?}", pairs);
+    assert!(pairs.contains(&("C".to_string(), "C.run".to_string())),
+        "C should implement C.run (bare, no <'a, U>); got {:?}", pairs);
+}
+
+#[test]
+fn path_qualifier_keeps_same_file_target() {
+    // Regression: the Path branch of edge resolution filtered out local_ids
+    // (same-file targets) before applying the path filter, contradicting the
+    // spec's "same-file matches still take precedence". Net effect: a Rust
+    // file with `impl Foo { fn helper() }` and a sibling caller doing
+    // `Foo::helper()` produced no call edge — same-file pool was excluded,
+    // and the cross-file Path filter (which scans `/Foo/` in the file path)
+    // never matched in a single-file project.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "src/lib.rs", r#"
+        pub struct Foo;
+        impl Foo {
+            pub fn helper() -> i32 { 42 }
+        }
+        pub fn caller() -> i32 {
+            Foo::helper()
+        }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let callers = callers_of(&db, "helper");
+    assert!(
+        callers.iter().any(|c| c == "caller"),
+        "caller→Foo::helper() must produce a call edge even when target is in the same file; got: {:?}",
+        callers
+    );
+}

@@ -476,6 +476,36 @@ impl MyTrait for MyStruct {
 }
 
 #[test]
+fn test_extract_rust_impl_trait_generic_type_strips_params() {
+    // Regression: `impl<'a, W: Write> Write for CapWriter<'a, W>` stored
+    // source_name as the verbatim "CapWriter<'a, W>" text from the tree-sitter
+    // type field. Phase 2 source resolution does exact name match against
+    // local node names ("CapWriter"), so source_ids ended up empty and no
+    // implements edges emitted — every method on a generic trait impl
+    // appeared as dead code. Strip generics so source_name is the bare type.
+    let source = r#"
+trait MyTrait { fn do_thing(&self); }
+struct Generic<'a, W: std::io::Write>(&'a W);
+impl<'a, W: std::io::Write> MyTrait for Generic<'a, W> {
+    fn do_thing(&self) {}
+}
+"#;
+    let relations = extract_relations(source, "rust").unwrap();
+    let impls: Vec<(&str, &str)> = relations.iter()
+        .filter(|r| r.relation == REL_IMPLEMENTS)
+        .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+        .collect();
+    assert!(
+        impls.contains(&("Generic", "MyTrait")),
+        "type-level edge must use bare struct name (no generics); got: {:?}", impls
+    );
+    assert!(
+        impls.contains(&("Generic", "do_thing")),
+        "method-level edge must use bare struct name; got: {:?}", impls
+    );
+}
+
+#[test]
 fn test_bare_impl_no_implements_relation() {
     // `impl Type { ... }` (no trait) should produce zero REL_IMPLEMENTS relations
     let source = r#"
