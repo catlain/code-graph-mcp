@@ -170,6 +170,75 @@ test('isSilenced: VERBOSE_HOOKS=1 alone → not silenced (noisy by default alrea
   assert.equal(isSilenced({ CODE_GRAPH_VERBOSE_HOOKS: '1' }), false);
 });
 
+// ── Phase C: extended prefixes (real-world backend / DDD / web conventions) ──
+
+// daagu pattern: `backend/app/services/...` — `app/` is preceded by `backend/`,
+// which doesn't satisfy the `(?:^|\s|["'])` lookbehind in the old SRC_PATH.
+// 7d audit found 5 of the worst missed sessions used exactly this layout.
+test('shouldHint: grep -rn on backend/app/services/ (daagu)', () => {
+  assert.equal(
+    shouldHint('grep -rn "pct_chg|pct_change" backend/app/services/context_builder.py'),
+    true
+  );
+});
+
+test('shouldHint: grep -rn on backend/app/services/scheduler/', () => {
+  assert.equal(
+    shouldHint('grep -rn "TASK_ZOMBIE|zombie recovery|reason=age" backend/app/services/scheduler/'),
+    true
+  );
+});
+
+test('shouldHint: grep on services/ (no backend prefix)', () => {
+  assert.equal(shouldHint('grep -rn "fetchUser" services/auth/'), true);
+});
+
+test('shouldHint: grep on models/ (Rails / Django)', () => {
+  assert.equal(shouldHint('grep -rn "before_save" models/user.rb'), true);
+});
+
+test('shouldHint: grep on controllers/ (Rails / ASP.NET)', () => {
+  assert.equal(shouldHint('grep -rn "def index" controllers/UsersController.rb'), true);
+});
+
+test('shouldHint: grep on domain/ (DDD architecture)', () => {
+  assert.equal(shouldHint('grep -rn "Aggregate" domain/orders/'), true);
+});
+
+test('shouldHint: grep on handlers/ (web server)', () => {
+  assert.equal(shouldHint('grep -rn "func New" handlers/api/'), true);
+});
+
+test('shouldHint: grep on migrations/ (db schema)', () => {
+  assert.equal(shouldHint('grep -rn "add_column" migrations/'), true);
+});
+
+test('shouldHint: grep on features/ (modular monolith)', () => {
+  assert.equal(shouldHint('grep -rn "useFeature" features/billing/'), true);
+});
+
+test('shouldHint: grep on api/ + frontend/', () => {
+  assert.equal(shouldHint('grep -rn "POST" api/v1/'), true);
+  assert.equal(shouldHint('grep -rn "import React" frontend/'), true);
+});
+
+// Precision guards — these MUST still NOT fire after the expansion.
+
+test('shouldHint: grep on web.config (config file ext keeps suppression)', () => {
+  assert.equal(shouldHint('grep "<connectionStrings" web.config'), false);
+});
+
+test('shouldHint: grep on node_modules/ (NOT in src list)', () => {
+  assert.equal(shouldHint('grep -rn "deprecated" node_modules/some-pkg/'), false);
+});
+
+test('shouldHint: grep on docs/ (docs trees stay out)', () => {
+  // We deliberately did NOT add `docs` to the prefix list — docs are typically
+  // markdown and the existing CONFIG_TARGET_ONLY already filters `.md`-only
+  // greps. A bare `grep "X" docs/foo.md` would be CONFIG_TARGET_ONLY-suppressed.
+  assert.equal(shouldHint('grep "v0.24" docs/CHANGELOG.md'), false);
+});
+
 // ── Regression cases from real session telemetry (2026-05-11) ───────
 
 test('regression: grep -n "Error\\|anyhow" src/main.rs (sess 5052e2a1)', () => {

@@ -24,7 +24,16 @@ const crypto = require('crypto');
 // --- Pure logic (testable) ---
 
 const GREP_HEAD = /^\s*(?:env\s+\S+=\S+\s+)*(grep|rg|ag)\b/;
-const SRC_PATH = /(?:^|\s|["'])(src|tests|lib|scripts|claude-plugin|tools|pkg|cmd|internal|app|components?|server|client|crates|packages)\//;
+// Source-tree prefix list. Expanded v0.27+ Phase C: original `src/tests/lib/...`
+// missed real-world backend conventions where the prefix list term is preceded
+// by something else (`backend/app/...` — `app/` doesn't match because `/` isn't
+// in the lookbehind). 7d audit found 5 of the worst missed sessions used the
+// daagu `backend/app/services/...` layout. Added: backend/frontend/services/
+// models/domain/controllers/views/handlers/middleware/routes/repositories/
+// entities/migrations/tasks/jobs/workers/features/modules/api/web. Generic
+// terms like `core`/`utils`/`shared`/`common`/`types` deliberately omitted —
+// they appear in too many non-code contexts to be precise enough.
+const SRC_PATH = /(?:^|\s|["'])(src|tests|lib|libs|scripts|claude-plugin|tools|pkg|cmd|internal|app|apps|components?|server|client|crates|packages|backend|frontend|services|models|domain|controllers|views|handlers|middleware|routes|repositories|entities|migrations|tasks|jobs|workers|features|modules|api|web)\//;
 const PIPE_INTO_GREP = /\|\s*(?:grep|rg|ag)\b/;
 const CG_INVOKED = /\bcode-graph-mcp\b/;
 // A file argument that ends in a config/lockfile extension AND no source-tree
