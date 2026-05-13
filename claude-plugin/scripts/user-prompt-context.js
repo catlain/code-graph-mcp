@@ -17,6 +17,7 @@ const COOLDOWNS = {
   overview:  5 * 60 * 1000, // 5min — module structure rarely changes mid-session
   callgraph: 60 * 1000,     // 1min
   search:    60 * 1000,     // 1min
+  symptom:   10 * 60 * 1000, // 10min — Phase E meta-advisory hint, low value to repeat
 };
 
 function isCoolingDown(type) {
@@ -307,13 +308,53 @@ function detectIntents(msg) {
   };
 }
 
-function determineQueryType(intents, symbols, filePaths, isCoolingDownFn) {
+// Phase E: symptom-driven fallback. The 7d audit + TriggerRate hard-oracle
+// baseline (60%) show the failure mode "user phrases a problem without giving
+// a symbol/path/file — Claude defaults to bash grep". The 4 existing channels
+// (intent / qualified symbol / file path / any symbol) all miss on these
+// prompts. SYMPTOM_PATTERNS catches the bug-flavored prompts so we can emit
+// ONE-LINE prose hint (no CLI execution — different from the other 4 paths
+// that inject results). Keeps noise low while planting the routing seed.
+const SYMPTOM_PATTERNS = [
+  // English symptom / failure-mode markers
+  /\bbug\b/i,
+  /\bcrash(?:ed|ing|es)?\b/i,
+  /\bbroken\b/i,
+  /\bnot work(?:ing)?\b/i,
+  /\bdoesn'?t work\b/i,
+  /\bfail(?:ed|ing|s|ure)?\b/i,
+  /\bwhy (?:does|is|are|isn'?t|doesn'?t|won'?t)/i,
+  /\bmissing\b/i,
+  // Chinese symptom / failure markers
+  /有\s?bug/i,
+  /又挂/,
+  /又失败/,
+  /挂了/,
+  /失败了/,
+  /卡死/,
+  /卡住/,
+  /不准/,
+  /不对/,
+  /缺失/,
+  /丢失/,
+  /没响应/,
+  /出错/,
+  /报错/,
+  /为什么/,
+  /怎么(?:修|解决)/,
+  /哪里[\s\S]{0,5}(?:错|有问题|不对)/, // 哪里写错 / 哪里出错 / 哪里有问题 / 哪里报错了
+  /出了什么问题/,
+];
+
+function hasSymptom(msg) {
+  if (!msg || typeof msg !== 'string') return false;
+  return SYMPTOM_PATTERNS.some(p => p.test(msg));
+}
+
+function determineQueryType(intents, symbols, filePaths, isCoolingDownFn, message = '') {
   const hasStrict = symbols.symbols.length > 0 && !symbols.lowConfidence;
   const hasQualified = symbols.symbols.some(s => s.includes('::'));
   const hasAny = intents.impact || intents.modify || intents.implement || intents.understand || intents.callgraph || intents.search;
-
-  // Gate: need intent, qualified symbol, file path, or any symbol
-  if (!hasAny && !hasQualified && filePaths.length === 0 && symbols.symbols.length === 0) return null;
 
   const cd = isCoolingDownFn || (() => false);
 
@@ -322,6 +363,13 @@ function determineQueryType(intents, symbols, filePaths, isCoolingDownFn) {
   if (filePaths.length > 0 && !cd('overview')) return { type: 'overview', path: filePaths[0].replace(/\/[^/]+$/, '/') };
   if ((intents.search || intents.implement || hasQualified) && symbols.symbols.length > 0 && !cd('search')) return { type: 'search', symbol: symbols.symbols[0] };
   if ((intents.understand || !hasAny) && symbols.symbols.length > 0 && !cd('search')) return { type: 'search', symbol: symbols.symbols[0] };
+
+  // Phase E fallback: nothing actionable above, but message has symptom phrasing.
+  // Emit ONE-LINE prose hint (no CLI execution). Default-empty `message` keeps
+  // backward-compat for callers that don't pass it (legacy `analyze` helpers).
+  if (message && hasSymptom(message) && !cd('symptom')) {
+    return { type: 'symptom-hint' };
+  }
 
   return null;
 }
@@ -373,9 +421,20 @@ function runMain() {
   const filePaths = extractFilePaths(message);
   const symbols = extractSymbols(message);
   const intents = detectIntents(message);
-  const query = determineQueryType(intents, symbols, filePaths, isCoolingDown);
+  const query = determineQueryType(intents, symbols, filePaths, isCoolingDown, message);
 
   if (!query) return;
+
+  // Phase E: symptom-hint is prose-only (no CLI execution). Emit + cooldown
+  // before the result-fetching paths so it can short-circuit cleanly.
+  if (query.type === 'symptom-hint') {
+    markCooldown('symptom');
+    process.stdout.write(
+      '[code-graph:hint] indexed repo — for vague-symptom prompts, try `semantic_code_search "<symptom>"` ' +
+      'or `module_overview <suspected-dir>` to surface candidate code structurally. Skip if not searching code.\n'
+    );
+    return;
+  }
 
   const PREFIXES = {
     impact:    '[code-graph:impact] Blast radius — review before editing:',
@@ -413,4 +472,4 @@ if (require.main === module) {
   runMain();
 }
 
-module.exports = { shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE };
+module.exports = { shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE, hasSymptom, SYMPTOM_PATTERNS };

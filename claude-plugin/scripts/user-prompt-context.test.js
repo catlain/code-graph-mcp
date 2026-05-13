@@ -399,7 +399,8 @@ function analyze(msg) {
   const fp = extractFilePaths(msg);
   const sym = extractSymbols(msg);
   const intents = detectIntents(msg);
-  const query = determineQueryType(intents, sym, fp);
+  // Phase E: pass message into determineQueryType so symptom-hint fallback fires.
+  const query = determineQueryType(intents, sym, fp, undefined, msg);
   return { query, intents, symbols: sym, filePaths: fp };
 }
 
@@ -555,4 +556,133 @@ test('CODE_GRAPH_QUIET_HOOKS=1 short-circuits silently on stdout, stderr, exit 0
   assert.equal(proc.stdout, '', 'quiet must be silent on stdout');
   assert.equal(proc.stderr, '', 'quiet must be silent on stderr');
   assert.equal(proc.status, 0, 'quiet must exit 0');
+});
+
+// ── Phase E: hasSymptom + symptom-hint fallback ──────────────
+
+const { hasSymptom, SYMPTOM_PATTERNS } = require('./user-prompt-context');
+
+test('hasSymptom: 报告数据不准', () => {
+  assert.equal(hasSymptom('今天的报告数据不准'), true);
+});
+
+test('hasSymptom: test 又挂了', () => {
+  assert.equal(hasSymptom('test 又挂了'), true);
+});
+
+test('hasSymptom: Why does this not work?', () => {
+  assert.equal(hasSymptom('Why does this not work?'), true);
+});
+
+test('hasSymptom: 有 bug', () => {
+  assert.equal(hasSymptom('有 bug，帮我看看'), true);
+});
+
+test('hasSymptom: 为什么 (vague-question marker)', () => {
+  assert.equal(hasSymptom('为什么会这样'), true);
+});
+
+test('hasSymptom: 哪里写错了', () => {
+  assert.equal(hasSymptom('find 一下哪里写错了'), true);
+});
+
+test('hasSymptom: doesn\'t work / not working', () => {
+  assert.equal(hasSymptom("this doesn't work as expected"), true);
+  assert.equal(hasSymptom('the service is not working'), true);
+});
+
+test('hasSymptom: 挂了 / 失败 / 卡死', () => {
+  assert.equal(hasSymptom('test 挂了'), true);
+  assert.equal(hasSymptom('又失败了'), true);
+  assert.equal(hasSymptom('整个服务卡死了'), true);
+});
+
+// Precision: must NOT flag normal task statements as symptoms.
+test('hasSymptom: 修改 parse_code → false', () => {
+  assert.equal(hasSymptom('修改 parse_code 函数增加错误处理'), false);
+});
+
+test('hasSymptom: 看看 src/mcp/ → false', () => {
+  assert.equal(hasSymptom('看看 src/mcp/ 模块的代码结构'), false);
+});
+
+test('hasSymptom: write tests → false', () => {
+  assert.equal(hasSymptom('write tests for the embedding module'), false);
+});
+
+test('hasSymptom: empty / non-string → false', () => {
+  assert.equal(hasSymptom(''), false);
+  assert.equal(hasSymptom(null), false);
+  assert.equal(hasSymptom(undefined), false);
+});
+
+test('SYMPTOM_PATTERNS: exported + non-empty array', () => {
+  assert.ok(Array.isArray(SYMPTOM_PATTERNS));
+  assert.ok(SYMPTOM_PATTERNS.length >= 8,
+    `SYMPTOM_PATTERNS has ${SYMPTOM_PATTERNS.length} entries; want ≥8 for coverage`);
+});
+
+// ── determineQueryType: symptom-hint fallback ────────────────
+
+test('symptom-fallback: pure symptom message, no anchor → symptom-hint', () => {
+  const intents = { impact: false, modify: false, implement: false, understand: false, callgraph: false, search: false };
+  const symbols = { symbols: [], lowConfidence: false };
+  const result = determineQueryType(intents, symbols, [], undefined, '今天的报告数据不准');
+  assert.equal(result && result.type, 'symptom-hint');
+});
+
+test('symptom-fallback: intent + no symbol/path + symptom → symptom-hint', () => {
+  // "find 一下哪里写错了" — search intent fires but no symbol or path is extractable.
+  const intents = { impact: false, modify: false, implement: false, understand: false, callgraph: false, search: true };
+  const symbols = { symbols: [], lowConfidence: false };
+  const result = determineQueryType(intents, symbols, [], undefined, 'find 一下哪里写错了');
+  assert.equal(result && result.type, 'symptom-hint');
+});
+
+test('symptom-fallback: actionable path beats symptom-hint (precedence)', () => {
+  // Impact path with strict symbol must take precedence even when symptom phrasing is present.
+  const intents = { impact: true, modify: false, implement: false, understand: false, callgraph: false, search: false };
+  const symbols = { symbols: ['parse_code'], lowConfidence: false };
+  const result = determineQueryType(intents, symbols, [], undefined, '修改前看看 parse_code 的 bug 影响');
+  assert.equal(result.type, 'impact');
+});
+
+test('symptom-fallback: no symptom + no anchor → null (unchanged)', () => {
+  const intents = { impact: false, modify: false, implement: false, understand: false, callgraph: false, search: false };
+  const symbols = { symbols: [], lowConfidence: false };
+  const result = determineQueryType(intents, symbols, [], undefined, 'hello there');
+  assert.equal(result, null);
+});
+
+test('symptom-fallback: cooldown blocks symptom-hint', () => {
+  const intents = { impact: false, modify: false, implement: false, understand: false, callgraph: false, search: false };
+  const symbols = { symbols: [], lowConfidence: false };
+  const result = determineQueryType(intents, symbols, [], (t) => t === 'symptom', '今天的报告数据不准');
+  assert.equal(result, null);
+});
+
+test('symptom-fallback: omitted message arg → backward-compat null', () => {
+  // Existing callers (and the legacy bench harness) call determineQueryType
+  // without the 5th arg. The fallback must NOT fire — preserve prior behavior.
+  const intents = { impact: false, modify: false, implement: false, understand: false, callgraph: false, search: false };
+  const symbols = { symbols: [], lowConfidence: false };
+  const result = determineQueryType(intents, symbols, []);
+  assert.equal(result, null);
+});
+
+// ── Integration: analyze() with symptom-only messages ──
+
+test('integration: 今天的报告数据不准 → symptom-hint', () => {
+  const r = analyze('今天的报告数据不准');
+  assert.equal(r.query && r.query.type, 'symptom-hint');
+});
+
+test('integration: test 又挂了 → symptom-hint', () => {
+  const r = analyze('test 又挂了');
+  assert.equal(r.query && r.query.type, 'symptom-hint');
+});
+
+test('integration: Why does this not work? → symptom-hint', () => {
+  const r = analyze('Why does this not work?');
+  assert.equal(r.query && r.query.type, 'symptom-hint');
 });
