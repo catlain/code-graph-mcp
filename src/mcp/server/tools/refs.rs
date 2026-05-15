@@ -11,7 +11,9 @@ impl McpServer {
         // Treat empty/whitespace-only as absent — empty string used to fall
         // through to fuzzy-resolve and silently match a random unique candidate.
         let symbol_name_arg = args["symbol_name"].as_str().filter(|s| !s.trim().is_empty());
-        let file_path = args["file_path"].as_str();
+        // Empty file_path => no filter (treat like missing). Otherwise we'd
+        // get "Symbol 'x' not found in file ''" which is a useless error.
+        let file_path = args["file_path"].as_str().filter(|s| !s.is_empty());
         let relation = args["relation"].as_str().unwrap_or("all");
         let compact = args["compact"].as_bool().unwrap_or(false);
         // Default true preserves the "every usage site" contract for rename audits

@@ -3184,7 +3184,26 @@ pub fn cmd_snapshot_create(project_root: &Path, args: &[String]) -> Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| project_root.to_path_buf());
 
-    crate::snapshot::create(&root, std::path::Path::new(&out), include)?;
+    // Pre-flight checks for --out so SQLite VACUUM INTO doesn't leak its
+    // raw "unable to open database file" error when the user passed a dir
+    // or a path with a missing parent directory.
+    let out_path = std::path::Path::new(&out);
+    if out_path.is_dir() || out.ends_with('/') {
+        anyhow::bail!(
+            "--out '{}' is a directory; expected a file path (e.g. '{}snapshot.db' or '{}snapshot.db.zst')",
+            out, out, out
+        );
+    }
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            anyhow::bail!(
+                "--out parent directory does not exist: {} (create it first with `mkdir -p {}`)",
+                parent.display(), parent.display()
+            );
+        }
+    }
+
+    crate::snapshot::create(&root, out_path, include)?;
     if !quiet {
         eprintln!("snapshot created: {}", out);
     }

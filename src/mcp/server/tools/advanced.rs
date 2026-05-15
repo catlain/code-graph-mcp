@@ -17,8 +17,13 @@ use crate::domain::default_dead_code_ignores;
 
 impl McpServer {
     pub(in crate::mcp::server) fn tool_trace_http_chain(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        // Empty/whitespace-only acts like missing — otherwise the substring
+        // route match treats "" as a wildcard and returns "no routes found"
+        // when the project has no routes, which is indistinguishable from a
+        // misspelled route.
         let route_path_raw = args["route_path"].as_str()
-            .ok_or_else(|| anyhow!("route_path is required"))?;
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("route_path is required (e.g. 'GET /api/users')"))?;
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
         let include_middleware = args["include_middleware"].as_bool().unwrap_or(true);
 
@@ -265,7 +270,8 @@ impl McpServer {
         }
 
         let file_path = args["file_path"].as_str()
-            .ok_or_else(|| anyhow!("Missing file_path"))?;
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("file_path is required (relative to project root)"))?;
         let direction = args.get("direction")
             .and_then(|v| v.as_str())
             .unwrap_or("both");
@@ -373,10 +379,12 @@ impl McpServer {
             self.ensure_indexed()?;
         }
 
-        // Accept node_id directly, or resolve from symbol_name
+        // Accept node_id directly, or resolve from symbol_name. Treat empty
+        // symbol_name as absent — without this, the error message echoes
+        // "Symbol '' not found" which looks like a real lookup miss.
         let node_id = if let Some(id) = args["node_id"].as_i64() {
             id
-        } else if let Some(name) = args["symbol_name"].as_str() {
+        } else if let Some(name) = args["symbol_name"].as_str().filter(|s| !s.trim().is_empty()) {
             match queries::get_first_node_id_by_name(self.db.conn(), name)? {
                 Some(id) => id,
                 None => return Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", name)),

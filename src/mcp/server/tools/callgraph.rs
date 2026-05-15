@@ -74,7 +74,10 @@ impl McpServer {
             .ok_or_else(|| anyhow!("symbol_name or route_path is required"))?;
         let direction = args["direction"].as_str().unwrap_or("both");
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
-        let file_path = args["file_path"].as_str();
+        // Empty file_path is identical to absent — without this the
+        // disambiguation/fuzzy path treats Some("") as "filter by this exact
+        // path" and silently returns no edges.
+        let file_path = args["file_path"].as_str().filter(|s| !s.is_empty());
         let compact = args["compact"].as_bool().unwrap_or(false);
         let include_tests = args["include_tests"].as_bool().unwrap_or(false);
 

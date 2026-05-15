@@ -20,6 +20,21 @@ impl McpServer {
                 "path must not be empty — use '.' to scan the whole project root"
             ));
         }
+        // Reject paths that obviously aim outside the project root. The index
+        // stores file paths relative to project_root, so '/etc', '../foo', or
+        // 'C:\Windows' will never match anything — but currently they silently
+        // return `0 files` with a generic warning. An upfront error is clearer
+        // and matches the lesson from #259 (validate at parse time).
+        if raw_path.starts_with('/')
+            || raw_path.starts_with("../")
+            || raw_path.contains("/../")
+            || (raw_path.len() >= 2 && raw_path.as_bytes()[1] == b':')
+        {
+            return Err(anyhow!(
+                "path '{}' must be relative to the project root (no leading '/' or '../', no absolute paths)",
+                raw_path
+            ));
+        }
         let compact = args["compact"].as_bool().unwrap_or(false);
         let include_deps = args["include_deps"].as_bool().unwrap_or(false);
         let include_dead = args["include_dead"].as_bool().unwrap_or(false);
