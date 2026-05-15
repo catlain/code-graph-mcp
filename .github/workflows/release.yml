@@ -113,14 +113,40 @@ jobs:
         run: |
           for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
             cd npm/$pkg
-            npm publish --access public 2>&1 || echo "::warning::$pkg publish failed (may already exist)"
+            # Capture publish output so we can distinguish "already published"
+            # (E403 / EPUBLISHCONFLICT — safe to skip on workflow re-run) from
+            # auth / 404 / network failures (must fail the job). Old "|| echo
+            # warning" swallowed everything and made smoke tests the only fail
+            # signal — 15 min of red retries before anyone noticed in v0.30.0.
+            if ! out=$(npm publish --access public 2>&1); then
+              if echo "$out" | grep -qE "EPUBLISHCONFLICT|cannot publish over the previously published versions|You cannot publish over"; then
+                echo "::warning::$pkg already published at $VERSION — skipping"
+              else
+                echo "$out"
+                echo "::error::$pkg publish failed (not 'already exists' — check NPM_TOKEN / registry)"
+                exit 1
+              fi
+            else
+              echo "$out"
+            fi
             cd ../..
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish main package
-        run: npm publish --access public 2>&1 || echo "::warning::main package publish failed (may already exist)"
+        run: |
+          if ! out=$(npm publish --access public 2>&1); then
+            if echo "$out" | grep -qE "EPUBLISHCONFLICT|cannot publish over the previously published versions|You cannot publish over"; then
+              echo "::warning::main package already published at $VERSION — skipping"
+            else
+              echo "$out"
+              echo "::error::main package publish failed (not 'already exists' — check NPM_TOKEN / registry)"
+              exit 1
+            fi
+          else
+            echo "$out"
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
