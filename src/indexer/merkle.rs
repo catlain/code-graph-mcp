@@ -60,7 +60,16 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
 
     let mut file_paths: Vec<(String, std::path::PathBuf)> = Vec::new();
     for entry in walker {
-        let entry = entry?;
+        // Skip per-entry errors (permission denied on a subdir, broken
+        // symlink, etc.) rather than aborting the whole scan. Without this,
+        // one chmod-000 subdir kills `rebuild-index` for the entire repo.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("Skipping directory entry: {}", e);
+                continue;
+            }
+        };
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
@@ -126,14 +135,21 @@ pub fn scan_directory_cached(
     let mut new_cache = DirectoryCache::default();
     let mut changed_dirs: HashSet<String> = HashSet::new();
 
-    // Collect all entries
+    // Collect all entries, logging (not propagating) per-entry errors so that
+    // a single unreadable subdir doesn't kill the whole scan.
     let entries: Vec<_> = WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .build()
-        .filter_map(|e| e.ok())
+        .filter_map(|e| match e {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                tracing::warn!("Skipping directory entry: {}", err);
+                None
+            }
+        })
         .collect();
 
     // Pass 1: identify changed directories
