@@ -1,5 +1,83 @@
 # Changelog
 
+## v0.30.0 — UX pass: 16 silent-failure / misleading-feedback fixes
+
+Four rounds of end-to-end dogfooding (fresh-project workflows, MCP stdio
+fuzz, IO edge cases) surfaced 16 places where the tool silently swallowed
+errors, gave misleading guidance, or returned empty results indistinguishable
+from a successful no-op. All four commits are pure UX/correctness — no API
+removals, no behavior changes for happy paths.
+
+### Fixed — CLI feedback honesty
+- **`incremental-index` now reports file deletions** (`src/indexer/pipeline/`):
+  `IndexResult` gained `files_deleted`; the summary line reads "N files
+  updated, M files removed, K nodes created" when M > 0. Previously a
+  delete-only incremental said "0 files updated, 0 nodes created" — looked
+  like a no-op even when nodes/edges were cascade-deleted.
+- **`deps <file>` distinguishes missing-file from no-imports**
+  (`src/cli.rs`): pre-check `project_root.join(file_path).is_file()` and
+  report "File not found" before the barrel-scan fallback fires.
+- **`deps <file>` surfaces unresolved imports** (`src/cli.rs`): when all
+  edges point to `<external>` or cross-language targets and get filtered
+  out, render "(no resolved deps; N unresolved outgoing/incoming)" instead
+  of just printing the bare filename. JSON gets matching `unresolved_*`
+  fields.
+- **`callgraph` suppresses no-op fuzzy resolve** (`src/cli.rs`): no longer
+  prints `[code-graph] Resolved 'X' → 'X'` when fuzzy matched the same
+  input verbatim.
+- **`incremental-index` in non-git dir prints why it skipped** (`src/main.rs`):
+  the silent-bail guard for multi-repo workspace parents now emits "Skipping
+  index: no .git anchor or existing .code-graph/ at …" in non-quiet mode.
+  `--quiet` (hook path) remains silent — PostToolUse contract preserved.
+- **`map` on empty project replaces dangling header** (`src/cli.rs`):
+  "(empty project — no indexed source files)" instead of a lone "Modules:".
+
+### Fixed — `health-check` / `doctor` contract
+- **`health-check --json` emits valid JSON even with no index** (`src/cli.rs`):
+  returns `{healthy:false, reason:"no_index", issue:...}` + exit 0 instead
+  of bailing with stderr "No index found" + exit 1. Non-JSON mode keeps the
+  stderr+exit-1 contract for interactive callers.
+- **`doctor` routes "No index found" to the index-empty fix path**
+  (`claude-plugin/scripts/doctor.js`): old behavior labeled it `binary-broken`
+  (no fix handler) and reported "Fixing… 0/1 addressed". Now detects the
+  `reason:"no_index"` JSON flag and runs `incremental-index` automatically.
+
+### Fixed — MCP empty-string args
+- **`get_call_graph` / `find_references` / `get_ast_node` / `find_similar_code`
+  reject empty/whitespace `symbol_name`**: previously `symbol_name=""` fell
+  through to fuzzy resolve and silently matched a random Unique() candidate
+  (seen returning `function:"x"` from a DB with one fn called `x`).
+- **`get_call_graph` / `find_references` treat empty `file_path` as absent**:
+  `Some("")` used to filter to a nonexistent path, producing "Symbol 'x'
+  not found in file ''" or silent empty-edge results.
+- **`trace_http_chain(route_path="")` rejects upfront**: empty pattern used
+  to substring-match every route, returning "no routes found" indistinguishable
+  from a typo.
+- **`dependency_graph(file_path="")` rejects upfront**: empty path used to
+  trigger the "looks like a directory" hint at "", giving wrong guidance.
+
+### Fixed — path & filesystem hardening
+- **`module_overview` rejects absolute paths / `../` traversal / Windows
+  drive letters** (`src/mcp/server/tools/overview.rs`): the index stores
+  relative paths from project root, so `/etc`, `../foo`, `C:\Windows` will
+  never match. Old behavior silently returned `0 files`; now errors with
+  actionable message.
+- **`snapshot create --out` pre-flights the target path** (`src/cli.rs`):
+  rejects dir-as-out (`/tmp/`) and missing-parent (`/nonexistent/snap.db`)
+  before SQLite VACUUM INTO leaks its raw "unable to open database file"
+  error chain.
+- **`scan_directory` tolerates per-entry walk errors**
+  (`src/indexer/merkle.rs`): a single unreadable subdir (`chmod 000` build
+  artifact, restricted mount, broken symlink target) used to abort the
+  whole rebuild with `Permission denied (os error 13)`. Now skip-and-warn
+  via tracing — readable files still get indexed.
+
+### Notes
+- 526 tests pass, `cargo +1.95.0 clippy --all-targets -- -D warnings` clean
+  on both default and `--no-default-features`.
+- No public API removals. New `IndexResult.files_deleted` field is purely
+  additive. MCP tool schemas unchanged.
+
 ## v0.29.0 — edge resolution precision pass (12 silent-failure fixes)
 
 Five rounds of end-to-end dogfooding surfaced 12 silent-failure / mis-attribution
