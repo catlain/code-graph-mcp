@@ -8,7 +8,9 @@ impl McpServer {
         // node_id takes precedence — lets callers disambiguate multi-def same-file
         // collisions (e.g. two `fn new()` in one module) that file_path alone can't resolve.
         let node_id = args["node_id"].as_i64();
-        let symbol_name_arg = args["symbol_name"].as_str();
+        // Treat empty/whitespace-only as absent — empty string used to fall
+        // through to fuzzy-resolve and silently match a random unique candidate.
+        let symbol_name_arg = args["symbol_name"].as_str().filter(|s| !s.trim().is_empty());
         let file_path = args["file_path"].as_str();
         let relation = args["relation"].as_str().unwrap_or("all");
         let compact = args["compact"].as_bool().unwrap_or(false);

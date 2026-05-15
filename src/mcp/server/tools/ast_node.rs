@@ -35,7 +35,9 @@ impl McpServer {
 
         let context_lines = args["context_lines"].as_i64().unwrap_or(0).clamp(0, 100) as usize;
 
-        let symbol_name = args["symbol_name"].as_str();
+        // Empty/whitespace-only symbol_name behaves like absent — prevents
+        // "Symbol '' not found" and accidental fuzzy hits on the only candidate.
+        let symbol_name = args["symbol_name"].as_str().filter(|s| !s.trim().is_empty());
         let file_path = args["file_path"].as_str();
 
         // If only symbol_name provided (no file_path), resolve by name lookup

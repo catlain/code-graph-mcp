@@ -473,6 +473,32 @@ pub fn cmd_rebuild_index(project_root: &Path, args: &[String]) -> Result<()> {
 
 /// Run health check and print status, including index freshness.
 pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
+    // JSON callers (doctor.js, scripts, MCP UIs) need a parseable response
+    // even when the index is missing — bailing with a stderr-only anyhow error
+    // forces them to grep messages instead of reading JSON fields.
+    if format == "json" {
+        let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
+        if !db_path.exists() {
+            let payload = serde_json::json!({
+                "healthy": false,
+                "reason": "no_index",
+                "issue": format!("No index found at {}. Run: code-graph-mcp incremental-index", db_path.display()),
+                "nodes": 0,
+                "edges": 0,
+                "files": 0,
+                "watching": false,
+                "db_size_bytes": 0,
+                "search_mode": "fts_only",
+                "embedding_progress": "0/0",
+                "embedding_coverage_pct": 0,
+                "embedding_status": "unavailable",
+                "model_available": cfg!(feature = "embed-model"),
+                "snapshot": {"status": "absent", "source_url": null, "source_commit": null, "fetched_at": null, "commit_drift": null},
+            });
+            println!("{}", serde_json::to_string(&payload)?);
+            return Ok(());
+        }
+    }
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
     let status = queries::get_index_status(conn, false)?;
@@ -2546,10 +2572,21 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
     let outgoing: Vec<&_> = deps.iter().filter(|d| d.direction == "outgoing" && is_compatible_lang(&d.file_path)).collect();
     let incoming: Vec<&_> = deps.iter().filter(|d| d.direction == "incoming" && is_compatible_lang(&d.file_path)).collect();
 
+    // Distinguish "no edges at all" (handled by the barrel-fallback branch above)
+    // from "edges exist but all targets are <external> or cross-language" — the
+    // latter previously rendered as a bare filename with no explanation, which
+    // looked like a successful no-op even when the file had unresolved imports.
+    let unresolved_outgoing = deps.iter()
+        .filter(|d| d.direction == "outgoing" && !is_compatible_lang(&d.file_path))
+        .count();
+    let unresolved_incoming = deps.iter()
+        .filter(|d| d.direction == "incoming" && !is_compatible_lang(&d.file_path))
+        .count();
+
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "file": file_path,
             "depends_on": outgoing.iter().map(|d| {
                 let mut obj = serde_json::json!({"file": d.file_path, "depth": d.depth});
@@ -2562,6 +2599,12 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
                 obj
             }).collect::<Vec<_>>(),
         });
+        if unresolved_outgoing > 0 {
+            result["unresolved_outgoing"] = serde_json::json!(unresolved_outgoing);
+        }
+        if unresolved_incoming > 0 {
+            result["unresolved_incoming"] = serde_json::json!(unresolved_incoming);
+        }
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
         return Ok(());
     }
@@ -2590,6 +2633,13 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
                 writeln!(stdout, "    {} (depth {})", d.file_path, d.depth)?;
             }
         }
+    }
+    if outgoing.is_empty() && incoming.is_empty() && (unresolved_outgoing > 0 || unresolved_incoming > 0) {
+        writeln!(
+            stdout,
+            "  (no resolved deps; {} unresolved outgoing, {} unresolved incoming — targets are <external> or in another language)",
+            unresolved_outgoing, unresolved_incoming
+        )?;
     }
 
     Ok(())

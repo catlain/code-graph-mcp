@@ -49,9 +49,16 @@ impl McpServer {
         // Schema marks symbol_name and route_path mutually exclusive — enforce it
         // so a caller passing both doesn't silently get route-only behavior with
         // symbol_name dropped on the floor.
-        let has_route = args.get("route_path").and_then(|v| v.as_str()).is_some();
-        let has_symbol = args.get("symbol_name").and_then(|v| v.as_str()).is_some()
-            || args.get("function_name").and_then(|v| v.as_str()).is_some();
+        // Treat empty/whitespace-only strings as absent — without this, empty
+        // symbol_name falls through to fuzzy-resolve and silently matches a
+        // random "Unique" candidate from a 1-symbol DB (saw it match `x` when
+        // the only function was named x).
+        fn nonblank(v: Option<&str>) -> Option<&str> {
+            v.filter(|s| !s.trim().is_empty())
+        }
+        let has_route = nonblank(args.get("route_path").and_then(|v| v.as_str())).is_some();
+        let has_symbol = nonblank(args.get("symbol_name").and_then(|v| v.as_str())).is_some()
+            || nonblank(args.get("function_name").and_then(|v| v.as_str())).is_some();
         if has_route && has_symbol {
             return Err(anyhow!(
                 "symbol_name and route_path are mutually exclusive — pass exactly one"
@@ -62,8 +69,8 @@ impl McpServer {
         }
 
         // Accept both "symbol_name" (canonical) and "function_name" (legacy alias)
-        let function_name = args["symbol_name"].as_str()
-            .or_else(|| args["function_name"].as_str())
+        let function_name = nonblank(args["symbol_name"].as_str())
+            .or_else(|| nonblank(args["function_name"].as_str()))
             .ok_or_else(|| anyhow!("symbol_name or route_path is required"))?;
         let direction = args["direction"].as_str().unwrap_or("both");
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;

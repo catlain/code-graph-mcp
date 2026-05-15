@@ -91,35 +91,45 @@ function runDiagnostics() {
         }).trim();
         const hc = JSON.parse(hcOutput);
 
-        // Schema
-        if (hc.issue && hc.issue.includes('schema')) {
-          results.push({ name: 'Schema', status: 'warn', detail: hc.issue, fixId: 'schema-mismatch' });
+        // No-index short-circuit — binary deliberately returns a structured
+        // JSON with reason='no_index' instead of bailing, so we can route to
+        // the index-empty fix without grepping stderr. Falls through to the
+        // rest of runDiagnostics so Auto-update / Hooks still report.
+        if (hc.reason === 'no_index') {
+          results.push({ name: 'Schema', status: 'ok', detail: 'binary ok (no index yet)' });
+          results.push({ name: 'Index', status: 'warn', detail: 'missing — not indexed yet', fixId: 'index-empty' });
+          results.push({ name: 'Embeddings', status: 'skip', detail: 'no index' });
         } else {
-          results.push({ name: 'Schema', status: 'ok', detail: `v${hc.schema_version}` });
-        }
+          // Schema
+          if (hc.issue && hc.issue.includes('schema')) {
+            results.push({ name: 'Schema', status: 'warn', detail: hc.issue, fixId: 'schema-mismatch' });
+          } else {
+            results.push({ name: 'Schema', status: 'ok', detail: `v${hc.schema_version}` });
+          }
 
-        // Index
-        if (hc.nodes === 0) {
-          results.push({ name: 'Index', status: 'warn', detail: 'empty', fixId: 'index-empty' });
-        } else {
-          const age = hc.index_age ? ` (${hc.index_age})` : '';
-          results.push({
-            name: 'Index',
-            status: 'ok',
-            detail: `${hc.nodes} nodes, ${hc.edges} edges, ${hc.files} files${age}`,
-          });
-        }
+          // Index
+          if (hc.nodes === 0) {
+            results.push({ name: 'Index', status: 'warn', detail: 'empty', fixId: 'index-empty' });
+          } else {
+            const age = hc.index_age ? ` (${hc.index_age})` : '';
+            results.push({
+              name: 'Index',
+              status: 'ok',
+              detail: `${hc.nodes} nodes, ${hc.edges} edges, ${hc.files} files${age}`,
+            });
+          }
 
-        // Embeddings
-        const ep = hc.embedding_progress || '0/0';
-        const [done, total] = ep.split('/').map(Number);
-        if (total > 0 && done < total) {
-          const pct = Math.round((done / total) * 100);
-          results.push({ name: 'Embeddings', status: 'ok', detail: `${pct}% (${done}/${total})` });
-        } else if (total === 0) {
-          results.push({ name: 'Embeddings', status: 'ok', detail: 'no embeddable nodes' });
-        } else {
-          results.push({ name: 'Embeddings', status: 'ok', detail: `100% (${done}/${total})` });
+          // Embeddings
+          const ep = hc.embedding_progress || '0/0';
+          const [done, total] = ep.split('/').map(Number);
+          if (total > 0 && done < total) {
+            const pct = Math.round((done / total) * 100);
+            results.push({ name: 'Embeddings', status: 'ok', detail: `${pct}% (${done}/${total})` });
+          } else if (total === 0) {
+            results.push({ name: 'Embeddings', status: 'ok', detail: 'no embeddable nodes' });
+          } else {
+            results.push({ name: 'Embeddings', status: 'ok', detail: `100% (${done}/${total})` });
+          }
         }
       } catch (e) {
         const rawStderr = e.stderr ? e.stderr.toString() : '';
