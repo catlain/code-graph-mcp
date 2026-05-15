@@ -402,10 +402,17 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
         use crate::indexer::pipeline::run_incremental_index;
         let stats = wrap_busy(run_incremental_index(&db, project_root, None, None))?;
         if !quiet {
-            eprintln!(
-                "Incremental index: {} files updated, {} nodes created",
-                stats.files_indexed, stats.nodes_created
-            );
+            if stats.files_deleted > 0 {
+                eprintln!(
+                    "Incremental index: {} files updated, {} files removed, {} nodes created",
+                    stats.files_indexed, stats.files_deleted, stats.nodes_created
+                );
+            } else {
+                eprintln!(
+                    "Incremental index: {} files updated, {} nodes created",
+                    stats.files_indexed, stats.nodes_created
+                );
+            }
         }
     }
 
@@ -1410,9 +1417,11 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
     if !(has_edges || (has_seed && file_filter.is_some())) {
         match resolve_fuzzy_name_cli(conn, symbol)? {
             CliFuzzyResolution::Unique(resolved) => {
-                resolved_symbol = resolved.clone();
-                result = crate::graph::query::get_call_graph(conn, &resolved, direction, depth, file_filter)?;
-                eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
+                if resolved != symbol {
+                    result = crate::graph::query::get_call_graph(conn, &resolved, direction, depth, file_filter)?;
+                    eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
+                }
+                resolved_symbol = resolved;
             }
             CliFuzzyResolution::Ambiguous(cands) => {
                 if json_mode {
@@ -1828,6 +1837,12 @@ pub fn cmd_map(project_root: &Path, args: &[String]) -> Result<()> {
     }
 
     // Modules
+    if modules.is_empty() {
+        if entry_points.is_empty() {
+            writeln!(stdout, "(empty project — no indexed source files)")?;
+        }
+        return Ok(());
+    }
     writeln!(stdout, "Modules:")?;
     let max_modules = if compact { 15 } else { modules.len() };
     for m in modules.iter().take(max_modules) {
@@ -2481,20 +2496,32 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
             }
             return Ok(());
         }
+        let file_exists = project_root.join(file_path).is_file();
         if json_mode {
             let result = serde_json::json!({
                 "file": file_path,
                 "depends_on": [],
                 "depended_by": [],
-                "error": "No tracked dependencies (not a barrel/import file)",
+                "error": if file_exists {
+                    "No tracked dependencies (not a barrel/import file)"
+                } else {
+                    "File not found"
+                },
             });
             println!("{}", serde_json::to_string(&result)?);
         }
-        anyhow::bail!(
-            "[code-graph] No tracked dependencies for: {} (not a barrel/import file \u{2014} try `code-graph-mcp overview {}` or Read directly)",
-            file_path,
-            file_path
-        );
+        if file_exists {
+            anyhow::bail!(
+                "[code-graph] No tracked dependencies for: {} (not a barrel/import file \u{2014} try `code-graph-mcp overview {}` or Read directly)",
+                file_path,
+                file_path
+            );
+        } else {
+            anyhow::bail!(
+                "[code-graph] File not found: {} (run `code-graph-mcp incremental-index` if you just created it, or check the path)",
+                file_path
+            );
+        }
     }
 
     // Filter out cross-language false edges (name-based resolution artifacts)

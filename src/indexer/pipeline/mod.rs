@@ -44,6 +44,7 @@ pub struct IndexStats {
 
 pub struct IndexResult {
     pub files_indexed: usize,
+    pub files_deleted: usize,
     pub nodes_created: usize,
     pub edges_created: usize,
     pub stats: IndexStats,

@@ -941,6 +941,7 @@ pub(super) fn index_files(
 
     Ok(IndexResult {
         files_indexed: all_indexed.len(),
+        files_deleted: delete_paths.len(),
         nodes_created: total_nodes_created,
         edges_created: total_edges_created,
         stats,

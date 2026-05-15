@@ -122,10 +122,20 @@ function runDiagnostics() {
           results.push({ name: 'Embeddings', status: 'ok', detail: `100% (${done}/${total})` });
         }
       } catch (e) {
-        const msg = e.stderr ? e.stderr.toString().trim().slice(0, 100) : e.message.slice(0, 100);
-        results.push({ name: 'Schema', status: 'error', detail: `health-check failed: ${msg}`, fixId: 'binary-broken' });
-        results.push({ name: 'Index', status: 'skip', detail: 'health-check failed' });
-        results.push({ name: 'Embeddings', status: 'skip', detail: 'health-check failed' });
+        const rawStderr = e.stderr ? e.stderr.toString() : '';
+        const msg = rawStderr ? rawStderr.trim().slice(0, 100) : e.message.slice(0, 100);
+        // "No index found" is a missing-index situation, not a broken binary —
+        // the index-empty fix path knows how to create one. Without this branch
+        // the fixId routes to nothing and the report shows "0/1 addressed".
+        if (rawStderr.includes('No index found')) {
+          results.push({ name: 'Schema', status: 'ok', detail: 'binary ok (no index yet)' });
+          results.push({ name: 'Index', status: 'warn', detail: 'missing — not indexed yet', fixId: 'index-empty' });
+          results.push({ name: 'Embeddings', status: 'skip', detail: 'no index' });
+        } else {
+          results.push({ name: 'Schema', status: 'error', detail: `health-check failed: ${msg}`, fixId: 'binary-broken' });
+          results.push({ name: 'Index', status: 'skip', detail: 'health-check failed' });
+          results.push({ name: 'Embeddings', status: 'skip', detail: 'health-check failed' });
+        }
       }
     } else {
       results.push({ name: 'Schema', status: 'skip', detail: 'binary not executable' });
