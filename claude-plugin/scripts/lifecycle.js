@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { claudeHome } = require('./claude-config');
 
 const PLUGIN_ID = 'code-graph-mcp@code-graph-mcp';
 const OLD_PLUGIN_IDS = [
@@ -16,13 +17,18 @@ const CACHE_DIR = path.join(os.homedir(), '.cache', 'code-graph');
 // to its own marketplace path, polluting all subsequent settings.json hook processes).
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const MANIFEST_FILE = path.join(CACHE_DIR, 'install-manifest.json');
-const SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
-const INSTALLED_PLUGINS_PATH = path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json');
 const REGISTRY_FILE = path.join(CACHE_DIR, 'statusline-registry.json');
+
+// Lazy resolvers — Claude Code's config dir can be overridden by CLAUDE_CONFIG_DIR
+// (multi-account isolation). Re-read every call so test subprocesses with a
+// different env see the right path.
+function settingsPath() { return path.join(claudeHome(), 'settings.json'); }
+function installedPluginsPath() { return path.join(claudeHome(), 'plugins', 'installed_plugins.json'); }
 // Durable mirror outside ~/.cache/ — survives cache cleanup. Captures the
 // `_previous` snapshot (pre-install statusline) and any third-party providers
 // (GSD, etc.). readRegistry() self-heals from this file when primary is missing.
-const PROVIDERS_BACKUP_FILE = path.join(os.homedir(), '.claude', 'statusline-providers.json');
+function providersBackupFile() { return path.join(claudeHome(), 'statusline-providers.json'); }
+function pluginsCacheDir() { return path.join(claudeHome(), 'plugins', 'cache'); }
 
 // --- Helpers ---
 
@@ -65,7 +71,7 @@ function hasOwn(obj, key) {
 }
 
 function hasInstalledPluginRecord() {
-  const installed = readJson(INSTALLED_PLUGINS_PATH);
+  const installed = readJson(installedPluginsPath());
   return !!(installed && installed.plugins && Array.isArray(installed.plugins[PLUGIN_ID]) && installed.plugins[PLUGIN_ID].length > 0);
 }
 
@@ -83,7 +89,7 @@ function readRegistry() {
   if (primary && Array.isArray(primary) && primary.length > 0) return primary;
   // Self-heal: primary missing or empty (e.g. user cleaned ~/.cache/code-graph/).
   // Durable backup in ~/.claude/ retains `_previous` + third-party providers.
-  const backup = readJson(PROVIDERS_BACKUP_FILE);
+  const backup = readJson(providersBackupFile());
   if (backup && Array.isArray(backup) && backup.length > 0) {
     try { writeJsonAtomic(REGISTRY_FILE, backup); } catch { /* ok */ }
     return backup;
@@ -94,13 +100,13 @@ function readRegistry() {
 function writeRegistry(registry) {
   if (!registry || registry.length === 0) {
     try { fs.unlinkSync(REGISTRY_FILE); } catch { /* ok */ }
-    try { fs.unlinkSync(PROVIDERS_BACKUP_FILE); } catch { /* ok */ }
+    try { fs.unlinkSync(providersBackupFile()); } catch { /* ok */ }
     return;
   }
   writeJsonAtomic(REGISTRY_FILE, registry);
   // Mirror to durable location so cache cleanup doesn't strand `_previous`
   // or third-party provider entries.
-  try { writeJsonAtomic(PROVIDERS_BACKUP_FILE, registry); } catch { /* ok */ }
+  try { writeJsonAtomic(providersBackupFile(), registry); } catch { /* ok */ }
 }
 
 function registerStatuslineProvider(id, command, needsStdin) {
@@ -126,18 +132,18 @@ function unregisterStatuslineProvider(id) {
   return true;
 }
 
-function isPluginExplicitlyDisabled(settings = readJson(SETTINGS_PATH) || {}) {
+function isPluginExplicitlyDisabled(settings = readJson(settingsPath()) || {}) {
   return hasOwn(settings.enabledPlugins, PLUGIN_ID) && settings.enabledPlugins[PLUGIN_ID] === false;
 }
 
-function isPluginInactive(settings = readJson(SETTINGS_PATH) || {}) {
+function isPluginInactive(settings = readJson(settingsPath()) || {}) {
   if (isPluginExplicitlyDisabled(settings)) return true;
 
   const hasComposite = isOurComposite(settings);
   const hasCodeGraphRegistry = readRegistry().some((provider) => provider.id === 'code-graph');
   if (!hasComposite && !hasCodeGraphRegistry) return false;
 
-  const installed = readJson(INSTALLED_PLUGINS_PATH);
+  const installed = readJson(installedPluginsPath());
   if (!installed || !installed.plugins) return false;
   return !hasInstalledPluginRecord();
 }
@@ -165,7 +171,7 @@ function detachStatuslineIntegration(settings) {
 }
 
 function cleanupDisabledStatusline() {
-  const settings = readJson(SETTINGS_PATH);
+  const settings = readJson(settingsPath());
   if (!settings || !isPluginInactive(settings)) {
     return { cleaned: false, settingsChanged: false };
   }
@@ -173,7 +179,7 @@ function cleanupDisabledStatusline() {
   let settingsChanged = detachStatuslineIntegration(settings);
   if (removeHooksFromSettings(settings)) settingsChanged = true;
   if (settingsChanged) {
-    writeJsonAtomic(SETTINGS_PATH, settings);
+    writeJsonAtomic(settingsPath(), settings);
   }
 
   return { cleaned: true, settingsChanged };
@@ -182,7 +188,7 @@ function cleanupDisabledStatusline() {
 // --- Scope Conflict Detection ---
 
 function checkScopeConflict() {
-  const installed = readJson(INSTALLED_PLUGINS_PATH);
+  const installed = readJson(installedPluginsPath());
   if (!installed || !installed.plugins) return null;
   for (const [key, entries] of Object.entries(installed.plugins)) {
     if (key === PLUGIN_ID) continue;
@@ -207,10 +213,10 @@ function migrateOldPluginIds(settings) {
     }
 
     // Clean old ID from installed_plugins.json
-    const installed = readJson(INSTALLED_PLUGINS_PATH);
+    const installed = readJson(installedPluginsPath());
     if (installed && installed.plugins && oldId in installed.plugins) {
       delete installed.plugins[oldId];
-      writeJsonAtomic(INSTALLED_PLUGINS_PATH, installed);
+      writeJsonAtomic(installedPluginsPath(), installed);
     }
   }
 
@@ -225,10 +231,11 @@ function migrateOldPluginIds(settings) {
   }
 
   // Clean old cache paths
+  const cacheRoot = pluginsCacheDir();
   const oldCacheDirs = [
-    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'code-graph'),
-    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss-code-graph', 'code-graph'),
-    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss-code-graph'),
+    path.join(cacheRoot, 'sdsrss', 'code-graph'),
+    path.join(cacheRoot, 'sdsrss-code-graph', 'code-graph'),
+    path.join(cacheRoot, 'sdsrss-code-graph'),
   ];
   for (const dir of oldCacheDirs) {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ok */ }
@@ -284,7 +291,7 @@ function removeHooksFromSettings(settings) {
 function install() {
   const version = getPluginVersion();
   const manifest = readManifest();
-  const settings = readJson(SETTINGS_PATH) || {};
+  const settings = readJson(settingsPath()) || {};
   let settingsChanged = false;
 
   // 0. Migrate from old plugin IDs
@@ -329,7 +336,7 @@ function install() {
 
   // 3. Write settings atomically if changed
   if (settingsChanged) {
-    writeJsonAtomic(SETTINGS_PATH, settings);
+    writeJsonAtomic(settingsPath(), settings);
   }
 
   // 4. Write manifest with version
@@ -344,7 +351,7 @@ function install() {
 // --- Uninstall (clean all config) ---
 
 function uninstall() {
-  const settings = readJson(SETTINGS_PATH);
+  const settings = readJson(settingsPath());
   let settingsChanged = false;
 
   if (settings) {
@@ -370,12 +377,12 @@ function uninstall() {
 
     // 4. Write settings if changed
     if (settingsChanged) {
-      writeJsonAtomic(SETTINGS_PATH, settings);
+      writeJsonAtomic(settingsPath(), settings);
     }
   }
 
   // 5. Remove all known IDs from installed_plugins.json
-  const installedPlugins = readJson(INSTALLED_PLUGINS_PATH);
+  const installedPlugins = readJson(installedPluginsPath());
   if (installedPlugins && installedPlugins.plugins) {
     let ipChanged = false;
     for (const id of [PLUGIN_ID, ...OLD_PLUGIN_IDS]) {
@@ -384,17 +391,18 @@ function uninstall() {
         ipChanged = true;
       }
     }
-    if (ipChanged) writeJsonAtomic(INSTALLED_PLUGINS_PATH, installedPlugins);
+    if (ipChanged) writeJsonAtomic(installedPluginsPath(), installedPlugins);
   }
 
   // 6. Remove cache directory
   try { fs.rmSync(CACHE_DIR, { recursive: true, force: true }); } catch { /* ok */ }
 
   // 7. Remove plugin files from cache (all known paths, including parent dirs)
+  const cacheRoot = pluginsCacheDir();
   const pluginCacheDirs = [
-    path.join(os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME),
-    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss-code-graph'),
-    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'code-graph'),
+    path.join(cacheRoot, MARKETPLACE_NAME),
+    path.join(cacheRoot, 'sdsrss-code-graph'),
+    path.join(cacheRoot, 'sdsrss', 'code-graph'),
   ];
   for (const dir of pluginCacheDirs) {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ok */ }
@@ -409,7 +417,7 @@ function update() {
   const version = getPluginVersion();
   const manifest = readManifest();
   const oldVersion = manifest.version;
-  const settings = readJson(SETTINGS_PATH) || {};
+  const settings = readJson(settingsPath()) || {};
   let settingsChanged = false;
 
   // 0. Migrate from old plugin IDs
@@ -438,7 +446,7 @@ function update() {
 
   // 4. Write settings if changed
   if (settingsChanged) {
-    writeJsonAtomic(SETTINGS_PATH, settings);
+    writeJsonAtomic(settingsPath(), settings);
   }
 
   // 5. Clear update-check cache (force re-check after update)
@@ -463,7 +471,7 @@ function update() {
  * Cache layout: ~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/
  */
 function cleanupOldCacheVersions(keep = 3) {
-  const cacheParent = path.join(os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME);
+  const cacheParent = path.join(pluginsCacheDir(), MARKETPLACE_NAME);
   try {
     // List all subdirectories under the marketplace cache
     const entries = fs.readdirSync(cacheParent, { withFileTypes: true });
@@ -498,7 +506,7 @@ function cleanupOldCacheVersions(keep = 3) {
 // Returns { healthy, issues, repaired }.
 
 function healthCheck() {
-  const settings = readJson(SETTINGS_PATH) || {};
+  const settings = readJson(settingsPath()) || {};
   const issues = [];
 
   // Check statusLine path
@@ -554,7 +562,7 @@ module.exports = {
   removeHooksFromSettings, isOurHookEntry,
   registerStatuslineProvider, unregisterStatuslineProvider,
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
-  PROVIDERS_BACKUP_FILE,
+  settingsPath, installedPluginsPath, providersBackupFile, pluginsCacheDir,
 };
 
 // CLI: node lifecycle.js <install|uninstall|update|health>

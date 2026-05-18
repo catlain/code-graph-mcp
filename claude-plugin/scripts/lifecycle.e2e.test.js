@@ -95,3 +95,49 @@ test('lifecycle CLI handles install, disable self-heal, re-enable, and uninstall
   assert.equal(fs.existsSync(cacheDir), false);
 });
 
+test('lifecycle install writes to CLAUDE_CONFIG_DIR instead of ~/.claude when set', (t) => {
+  // Multi-account isolation: a user with CLAUDE_CONFIG_DIR=~/work-claude
+  // expects all plugin config (settings.json, installed_plugins.json,
+  // statusline-providers backup) to land under that directory, not the
+  // default ~/.claude. Default path must remain untouched.
+  const homeDir = mkHome(t);
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-cfgdir-'));
+  t.after(() => fs.rmSync(configDir, { recursive: true, force: true }));
+
+  const cfgSettings = path.join(configDir, 'settings.json');
+  const cfgInstalled = path.join(configDir, 'plugins', 'installed_plugins.json');
+  const cfgBackup = path.join(configDir, 'statusline-providers.json');
+  const defaultSettings = path.join(homeDir, '.claude', 'settings.json');
+
+  writeJson(cfgSettings, {
+    statusLine: { type: 'command', command: 'echo prior-work-status' },
+    enabledPlugins: { 'code-graph-mcp@code-graph-mcp': true },
+  });
+  writeJson(cfgInstalled, {
+    plugins: {
+      'code-graph-mcp@code-graph-mcp': [{
+        installPath: pluginRoot,
+        version: currentVersion,
+        scope: 'user',
+      }],
+    },
+  });
+
+  // Run install with CLAUDE_CONFIG_DIR set; HOME points elsewhere.
+  const env = { ...process.env, HOME: homeDir, CLAUDE_CONFIG_DIR: configDir };
+  delete env.CLAUDE_PLUGIN_ROOT;
+  execFileSync(process.execPath, [lifecycleCli, 'install'], {
+    cwd: repoRoot, env, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  // Config landed in the override dir...
+  const settings = readJson(cfgSettings);
+  assert.match(settings.statusLine.command, /statusline-composite\.js/);
+  assert.equal(fs.existsSync(cfgBackup), true,
+    'statusline-providers backup should land in CLAUDE_CONFIG_DIR');
+
+  // ...and default ~/.claude was never touched.
+  assert.equal(fs.existsSync(defaultSettings), false,
+    'default ~/.claude/settings.json must not be written when override is set');
+});
+

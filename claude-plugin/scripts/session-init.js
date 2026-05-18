@@ -2,11 +2,11 @@
 'use strict';
 const { spawn, execSync, execFileSync } = require('child_process');
 const path = require('path');
-const os = require('os');
 const fs = require('fs');
 const {
   install, update, readManifest, getPluginVersion, checkScopeConflict,
   cleanupDisabledStatusline, isPluginInactive, readJson, CACHE_DIR,
+  settingsPath,
 } = require('./lifecycle');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const { maybeAutoAdopt, isAdopted } = require('./adopt');
@@ -58,7 +58,7 @@ function syncLifecycleConfig() {
   // Self-heal: version matches but statusLine may have been lost or path corrupted
   // (e.g. plugin removed and reinstalled, or CLAUDE_PLUGIN_ROOT leaked from another plugin).
   // install() is idempotent — isOurComposite guard prevents duplicate work.
-  const settings = readJson(path.join(os.homedir(), '.claude', 'settings.json')) || {};
+  const settings = readJson(settingsPath()) || {};
   if (!settings.statusLine || !settings.statusLine.command ||
       !settings.statusLine.command.includes('statusline-composite')) {
     install();

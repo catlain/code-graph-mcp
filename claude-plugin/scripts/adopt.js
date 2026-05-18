@@ -269,9 +269,14 @@ const TARGET_NAME = 'plugin_code_graph_mcp.md';
 // Claude Code slug convention: every non-alphanumeric-non-hyphen char → `-`.
 // `/mnt/data_ssd/dev/proj` → `-mnt-data-ssd-dev-proj`
 // `/home/sds/.claude/x`   → `-home-sds--claude-x`  (double-dash from `/.`)
+//
+// `home` is the OS home dir (default `os.homedir()`). When `CLAUDE_CONFIG_DIR`
+// is set it overrides `home/.claude`, so multi-account users (personal vs work)
+// land in the directory Claude Code itself is using for `projects/`.
 function memoryDir(cwd = process.cwd(), home = os.homedir()) {
   const slug = cwd.replace(/[^a-zA-Z0-9-]/g, '-');
-  return path.join(home, '.claude', 'projects', slug, 'memory');
+  const claudeDir = process.env.CLAUDE_CONFIG_DIR || path.join(home, '.claude');
+  return path.join(claudeDir, 'projects', slug, 'memory');
 }
 
 function escapeRegex(s) {
@@ -421,9 +426,17 @@ function needsRefresh({ cwd, home, templatePath } = {}) {
 // 检测脚本是否从 Claude Code 插件 cache 运行。
 // 走 __dirname 而非 CLAUDE_PLUGIN_ROOT — 后者在多插件共存时会互相污染
 // （见 feedback_plugin_env_isolation.md）。
+// 默认匹配 `.claude/plugins/` 路径；CLAUDE_CONFIG_DIR 自定义目录时
+// 走 startsWith(CLAUDE_CONFIG_DIR/plugins/) 兜底。
 function isPluginModeInstall(scriptPath = __dirname) {
   const sep = path.sep;
-  return scriptPath.includes(`${sep}.claude${sep}plugins${sep}`);
+  if (scriptPath.includes(`${sep}.claude${sep}plugins${sep}`)) return true;
+  const envDir = process.env.CLAUDE_CONFIG_DIR;
+  if (envDir) {
+    const marker = path.join(envDir, 'plugins') + sep;
+    if (scriptPath.startsWith(marker)) return true;
+  }
+  return false;
 }
 
 // C' 上下文感知默认（v0.9.0）：插件模式下首次 SessionStart 静默 adopt。

@@ -5,7 +5,7 @@ const fs = require('fs');
 const https = require('https');
 const path = require('path');
 const os = require('os');
-const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic } = require('./lifecycle');
+const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
 const { clearCache: clearBinaryCache } = require('./find-binary');
 const { readBinaryVersion, isDevMode } = require('./version-utils');
 
@@ -272,7 +272,7 @@ async function downloadAndInstall(latest) {
 
     const pluginSrc = path.join(tmpDir, 'claude-plugin');
     const pluginDst = path.join(
-      os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME, 'code-graph-mcp', latest.version
+      pluginsCacheDir(), MARKETPLACE_NAME, 'code-graph-mcp', latest.version
     );
 
     if (fs.existsSync(pluginSrc) && getExtractedPluginVersion(pluginSrc) === latest.version) {
@@ -282,7 +282,7 @@ async function downloadAndInstall(latest) {
     }
 
     // Update installed_plugins.json to point to new version
-    const installedPath = path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json');
+    const installedPath = installedPluginsPath();
     try {
       const installed = readJson(installedPath);
       if (installed && installed.plugins && installed.plugins[PLUGIN_ID]) {

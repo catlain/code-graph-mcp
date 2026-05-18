@@ -8,6 +8,7 @@ const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-util
 const {
   getPluginVersion, readJson, healthCheck, CACHE_DIR,
   removeHooksFromSettings, isOurHookEntry, writeJsonAtomic,
+  settingsPath,
 } = require('./lifecycle');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 
@@ -190,8 +191,7 @@ function runDiagnostics() {
   //    cache/<ver>/hooks/hooks.json is now authoritative. Duplicates cause
   //    every hook to fire twice until settings.json is cleaned.
   try {
-    const SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
-    const settings = readJson(SETTINGS_PATH) || {};
+    const settings = readJson(settingsPath()) || {};
     const legacyCount = countLegacyHookEntries(settings);
     if (legacyCount === 0) {
       results.push({ name: 'Legacy hooks', status: 'ok', detail: 'settings.json is clean' });
@@ -377,10 +377,10 @@ function runRepairs(results) {
 
       case 'legacy-hooks-in-settings': {
         console.log('\n  Removing legacy code-graph hooks from settings.json...');
-        const SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
-        const settings = readJson(SETTINGS_PATH) || {};
+        const settingsFile = settingsPath();
+        const settings = readJson(settingsFile) || {};
         if (removeHooksFromSettings(settings)) {
-          writeJsonAtomic(SETTINGS_PATH, settings);
+          writeJsonAtomic(settingsFile, settings);
           console.log('  \u2705 settings.json cleaned — restart Claude Code to apply');
           fixed++;
         } else {

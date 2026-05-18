@@ -278,6 +278,44 @@ test('isPluginModeInstall rejects npx cache paths', () => {
   assert.strictEqual(isPluginModeInstall(npxPath), false);
 });
 
+test('memoryDir honors CLAUDE_CONFIG_DIR override (multi-account isolation)', () => {
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = '/home/alice/work-claude';
+  try {
+    // home arg is irrelevant when env var is set — projects live under the
+    // configured claude dir, not home/.claude.
+    assert.strictEqual(
+      memoryDir('/home/alice/proj', '/home/alice'),
+      '/home/alice/work-claude/projects/-home-alice-proj/memory'
+    );
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});
+
+test('isPluginModeInstall recognizes CLAUDE_CONFIG_DIR/plugins/... paths', () => {
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = '/home/alice/work-claude';
+  try {
+    const pluginPath = '/home/alice/work-claude/plugins/cache/code-graph-mcp@0.31.0/scripts';
+    assert.strictEqual(isPluginModeInstall(pluginPath), true);
+    // Legacy ~/.claude/plugins/ path still works even with env var set.
+    assert.strictEqual(
+      isPluginModeInstall('/home/user/.claude/plugins/cache/code-graph-mcp/scripts'),
+      true
+    );
+    // Unrelated path under same prefix is still rejected.
+    assert.strictEqual(
+      isPluginModeInstall('/home/alice/work-claude/projects/foo/memory'),
+      false
+    );
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});
+
 test('maybeAutoAdopt skips when CODE_GRAPH_NO_AUTO_ADOPT=1', () => {
   const sb = makeSandbox();
   try {

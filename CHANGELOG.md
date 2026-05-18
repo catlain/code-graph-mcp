@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.31.0 — Multi-account isolation: honor `CLAUDE_CONFIG_DIR`
+
+Closes [#20](https://github.com/sdsrss/code-graph-mcp/issues/20). Users with
+multiple Claude Code accounts (personal vs work) set `CLAUDE_CONFIG_DIR` to
+keep their `settings.json`, `plugins/`, and `projects/` separate. The plugin
+previously hardcoded `~/.claude/` across ~15 call sites, so for any account
+running with the override:
+
+- hook registrations were written to a file Claude Code did not read,
+- adoption files / MEMORY.md sentinels landed in the wrong project dir,
+- cache cleanup and `installed_plugins.json` writes pointed at the default
+  install, not the configured one.
+
+Net effect: the plugin was effectively broken under multi-account isolation.
+
+### Fixed
+- New shared helper `claude-plugin/scripts/claude-config.js` exposes
+  `claudeHome()` (returns `process.env.CLAUDE_CONFIG_DIR || ~/.claude`,
+  re-read on every call).
+- `lifecycle.js`, `auto-update.js`, `doctor.js`, `session-init.js`,
+  `adopt.js` now route all `~/.claude/...` paths through the helper.
+- `adopt.js: memoryDir()` keeps its `(cwd, home)` signature for back-compat;
+  `CLAUDE_CONFIG_DIR` simply overrides the `home + .claude` join.
+- `adopt.js: isPluginModeInstall()` matches both the legacy
+  `~/.claude/plugins/` marker and `CLAUDE_CONFIG_DIR/plugins/`.
+
+### Tests
+- New `claude-config.test.js`: env-var resolution + empty-string fallback.
+- `adopt.test.js`: `memoryDir` + `isPluginModeInstall` honor the override.
+- `lifecycle.e2e.test.js`: full install subprocess writes into
+  `CLAUDE_CONFIG_DIR` and never touches default `~/.claude/`.
+
+No default-behavior change: when `CLAUDE_CONFIG_DIR` is unset, every path
+resolves exactly as before.
+
 ## v0.30.0 — UX pass: 16 silent-failure / misleading-feedback fixes
 
 Four rounds of end-to-end dogfooding (fresh-project workflows, MCP stdio
