@@ -8,7 +8,7 @@ const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-util
 const {
   getPluginVersion, readJson, healthCheck, CACHE_DIR,
   removeHooksFromSettings, isOurHookEntry, writeJsonAtomic,
-  settingsPath,
+  settingsPath, buildSettingsHookEntries,
 } = require('./lifecycle');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 
@@ -187,20 +187,26 @@ function runDiagnostics() {
     });
   }
 
-  // 7. Legacy hooks in settings.json — v0.8.2 and earlier wrote hooks there;
-  //    cache/<ver>/hooks/hooks.json is now authoritative. Duplicates cause
-  //    every hook to fire twice until settings.json is cleaned.
+  // 7. settings.json hook coverage — v0.32.0 inversion. Current Claude Code
+  //    silently ignores plugin-cache hooks.json for PreToolUse/PostToolUse/
+  //    UserPromptSubmit. lifecycle.js install/update is responsible for
+  //    registering them in settings.json. "Missing" is the bug (previously
+  //    "present" was treated as legacy debris — that was wrong).
   try {
     const settings = readJson(settingsPath()) || {};
-    const legacyCount = countLegacyHookEntries(settings);
-    if (legacyCount === 0) {
-      results.push({ name: 'Legacy hooks', status: 'ok', detail: 'settings.json is clean' });
+    const cov = surveyHookCoverage(settings);
+    if (cov.missing.length === 0) {
+      results.push({
+        name: 'Hooks',
+        status: 'ok',
+        detail: `settings.json has all ${cov.expected.length} expected entries`,
+      });
     } else {
       results.push({
-        name: 'Legacy hooks',
+        name: 'Hooks',
         status: 'warn',
-        detail: `${legacyCount} entries in settings.json (fire twice per event)`,
-        fixId: 'legacy-hooks-in-settings',
+        detail: `missing ${cov.missing.length}/${cov.expected.length} settings.json entries: ${cov.missing.join(', ')}`,
+        fixId: 'missing-hooks-in-settings',
       });
     }
   } catch { /* probe failed — skip */ }
@@ -208,16 +214,31 @@ function runDiagnostics() {
   return results;
 }
 
-function countLegacyHookEntries(settings) {
-  if (!settings || !settings.hooks) return 0;
-  let count = 0;
-  for (const entries of Object.values(settings.hooks)) {
-    if (!Array.isArray(entries)) continue;
-    for (const entry of entries) {
-      if (isOurHookEntry(entry)) count++;
+// Inventory of (event, matcher) tuples we expect to find in settings.json after
+// install. Used by doctor to detect missing entries.
+function surveyHookCoverage(settings) {
+  const desired = buildSettingsHookEntries();
+  const expected = [];
+  for (const [event, entries] of Object.entries(desired)) {
+    for (const e of entries) {
+      expected.push(`${event}:${e.matcher || '*'}`);
     }
   }
-  return count;
+
+  const present = new Set();
+  if (settings && settings.hooks) {
+    for (const [event, entries] of Object.entries(settings.hooks)) {
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        if (isOurHookEntry(entry)) {
+          present.add(`${event}:${entry.matcher || '*'}`);
+        }
+      }
+    }
+  }
+
+  const missing = expected.filter(k => !present.has(k));
+  return { expected, present: [...present], missing };
 }
 
 // ── Report Formatting ─────────────────────────────────────
@@ -375,16 +396,15 @@ function runRepairs(results) {
         break;
       }
 
-      case 'legacy-hooks-in-settings': {
-        console.log('\n  Removing legacy code-graph hooks from settings.json...');
-        const settingsFile = settingsPath();
-        const settings = readJson(settingsFile) || {};
-        if (removeHooksFromSettings(settings)) {
-          writeJsonAtomic(settingsFile, settings);
-          console.log('  \u2705 settings.json cleaned — restart Claude Code to apply');
+      case 'missing-hooks-in-settings': {
+        console.log('\n  Registering code-graph hooks in settings.json...');
+        const { install } = require('./lifecycle');
+        const r = install();
+        if (r.hooksRegistered) {
+          console.log('  \u2705 settings.json updated — restart Claude Code to apply');
           fixed++;
         } else {
-          console.log('  \u2796 No legacy entries found');
+          console.log('  \u2796 install reported no change (settings already had entries)');
         }
         break;
       }

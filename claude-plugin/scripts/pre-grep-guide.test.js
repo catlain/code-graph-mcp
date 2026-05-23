@@ -1,7 +1,15 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { shouldHint, buildHint, commandHash, isSilenced } = require('./pre-grep-guide');
+const {
+  shouldHint,
+  shouldBlock,
+  buildHint,
+  buildBlockReason,
+  commandHash,
+  isSilenced,
+  isBlockDisabled,
+} = require('./pre-grep-guide');
 
 // ── Should fire: bare grep/rg/ag on indexed source tree ─────────────
 
@@ -261,4 +269,156 @@ test('regression: cargo test pipe filter NOT fires (sess 45691293)', () => {
 
 test('regression: grep -m1 "^version" Cargo.toml NOT fires', () => {
   assert.equal(shouldHint('grep -m1 "^version" Cargo.toml'), false);
+});
+
+// ════════════════════════════════════════════════════════════════════
+// v0.32.0 — Block tier (shouldBlock, buildBlockReason, isBlockDisabled)
+// ════════════════════════════════════════════════════════════════════
+
+// ── shouldBlock: SHOULD block — identifier-shaped symbol scan ───────
+
+test('shouldBlock: CamelCase identifier on src/', () => {
+  assert.equal(shouldBlock('grep -rn "EmbeddingModel" src/'), true);
+});
+
+test('shouldBlock: snake_case identifier on src/', () => {
+  assert.equal(shouldBlock('grep -rn "fts5_search" src/storage/'), true);
+});
+
+test('shouldBlock: fn declaration anchor on src/', () => {
+  assert.equal(shouldBlock('grep -rn "fn fts5_search" src/storage/'), true);
+});
+
+test('shouldBlock: alternation with identifiers on src/', () => {
+  assert.equal(shouldBlock('grep -rn "fn fts5_search\\|MATCH" src/storage/'), true);
+});
+
+test('shouldBlock: class declaration on src/', () => {
+  assert.equal(shouldBlock('grep -rn "class UserService" src/'), true);
+});
+
+test('shouldBlock: def declaration on backend/app/', () => {
+  assert.equal(shouldBlock('grep -rn "def fetch_user" backend/app/services/'), true);
+});
+
+test('shouldBlock: rg with CamelCase on lib/', () => {
+  assert.equal(shouldBlock('rg "AuthHandler" lib/'), true);
+});
+
+// ── shouldBlock: should NOT block (downgrade to hint) — precision flags ─
+
+test('shouldBlock: grep -l (files-with-matches) → hint only', () => {
+  assert.equal(shouldBlock('grep -rl "EmbeddingModel" src/'), false);
+});
+
+test('shouldBlock: --include=*.rs → user already filtering, hint only', () => {
+  assert.equal(shouldBlock('grep -rn --include="*.rs" "EmbeddingModel" src/'), false);
+});
+
+test('shouldBlock: --exclude-dir=tests → hint only', () => {
+  assert.equal(shouldBlock('grep -rn --exclude=tests "EmbeddingModel" src/'), false);
+});
+
+test('shouldBlock: -A 3 context flag → hint only', () => {
+  assert.equal(shouldBlock('grep -rn -A 3 "EmbeddingModel" src/'), false);
+});
+
+test('shouldBlock: -B 2 context flag → hint only', () => {
+  assert.equal(shouldBlock('grep -rn -B 2 "EmbeddingModel" src/'), false);
+});
+
+test('shouldBlock: -C 5 context flag → hint only', () => {
+  assert.equal(shouldBlock('grep -rn -C 5 "EmbeddingModel" src/'), false);
+});
+
+// ── shouldBlock: should NOT block — marker-only patterns ────────────
+
+test('shouldBlock: bare TODO marker → hint only (no cg equivalent)', () => {
+  assert.equal(shouldBlock('grep -rn "TODO" src/'), false);
+});
+
+test('shouldBlock: bare FIXME marker → hint only', () => {
+  assert.equal(shouldBlock('grep -rn "FIXME" src/'), false);
+});
+
+test('shouldBlock: bare XXX marker → hint only', () => {
+  assert.equal(shouldBlock('grep -rn "XXX" src/'), false);
+});
+
+test('shouldBlock: bare HACK marker → hint only', () => {
+  assert.equal(shouldBlock('grep -rn "HACK" src/'), false);
+});
+
+// ── shouldBlock: should NOT block — non-identifier text ─────────────
+
+test('shouldBlock: short lowercase word "foo" → hint only', () => {
+  // No CamelCase, no _, no declaration anchor → not symbol-shaped
+  assert.equal(shouldBlock('grep -rn "foo" src/'), false);
+});
+
+test('shouldBlock: short alphanumeric "v1" → hint only', () => {
+  assert.equal(shouldBlock('grep -rn "v1" src/'), false);
+});
+
+// ── shouldBlock: should NOT block — inherits shouldHint=false ──────
+
+test('shouldBlock: pipe-grep → false (already shouldHint=false)', () => {
+  assert.equal(shouldBlock('cargo test 2>&1 | grep "EmbeddingModel"'), false);
+});
+
+test('shouldBlock: code-graph-mcp already used → false', () => {
+  assert.equal(shouldBlock('code-graph-mcp grep "EmbeddingModel" src/'), false);
+});
+
+test('shouldBlock: empty / non-string → false', () => {
+  assert.equal(shouldBlock(''), false);
+  assert.equal(shouldBlock(null), false);
+});
+
+test('shouldBlock: grep on Cargo.toml only → false', () => {
+  assert.equal(shouldBlock('grep "EmbeddingModel" Cargo.toml'), false);
+});
+
+// ── buildBlockReason content ────────────────────────────────────────
+
+test('buildBlockReason: includes "denied"', () => {
+  assert.match(buildBlockReason(), /denied/i);
+});
+
+test('buildBlockReason: lists cg grep + ast-search + callgraph', () => {
+  const out = buildBlockReason();
+  assert.match(out, /code-graph-mcp grep/);
+  assert.match(out, /code-graph-mcp ast-search/);
+  assert.match(out, /code-graph-mcp callgraph/);
+});
+
+test('buildBlockReason: documents the escape hatch env var', () => {
+  assert.match(buildBlockReason(), /CODE_GRAPH_NO_BLOCK_GREP=1/);
+});
+
+test('buildBlockReason: under 700-byte budget (single CC message)', () => {
+  const out = buildBlockReason();
+  assert.ok(out.length < 700, `reason length ${out.length} exceeds budget`);
+});
+
+// ── isBlockDisabled escape hatch ────────────────────────────────────
+
+test('isBlockDisabled: default (no env) → false (block enabled)', () => {
+  assert.equal(isBlockDisabled({}), false);
+});
+
+test('isBlockDisabled: CODE_GRAPH_NO_BLOCK_GREP=1 → true', () => {
+  assert.equal(isBlockDisabled({ CODE_GRAPH_NO_BLOCK_GREP: '1' }), true);
+});
+
+test('isBlockDisabled: CODE_GRAPH_NO_BLOCK_GREP=0 → false', () => {
+  assert.equal(isBlockDisabled({ CODE_GRAPH_NO_BLOCK_GREP: '0' }), false);
+});
+
+test('isBlockDisabled: independent of CODE_GRAPH_QUIET_HOOKS', () => {
+  // QUIET_HOOKS=1 silences entirely (no block, no hint).
+  // NO_BLOCK_GREP=1 downgrades block to hint only.
+  // The two flags must be orthogonal — neither implies the other.
+  assert.equal(isBlockDisabled({ CODE_GRAPH_QUIET_HOOKS: '1' }), false);
+  assert.equal(isSilenced({ CODE_GRAPH_NO_BLOCK_GREP: '1' }), false);
 });

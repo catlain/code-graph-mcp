@@ -86,6 +86,23 @@ function syncLifecycleConfig() {
       }
     }
   }
+  // v0.32.0: self-heal if our settings.json hook coverage is incomplete
+  // (e.g. user manually edited settings.json, or settings.json got rewritten
+  // by another tool that didn't preserve our entries). Without this, the
+  // user silently loses PreToolUse/PostToolUse hooks until next plugin update.
+  const { isOurHookEntry, buildSettingsHookEntries } = require('./lifecycle');
+  const desired = buildSettingsHookEntries();
+  for (const [event, desiredEntries] of Object.entries(desired)) {
+    const presentMatchers = new Set(
+      (settings.hooks?.[event] || []).filter(isOurHookEntry).map(e => e.matcher || '*')
+    );
+    for (const e of desiredEntries) {
+      if (!presentMatchers.has(e.matcher || '*')) {
+        install();
+        return 'self-healed-missing-settings-hook';
+      }
+    }
+  }
   return 'noop';
 }
 

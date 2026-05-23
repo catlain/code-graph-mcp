@@ -1,17 +1,26 @@
 #!/usr/bin/env node
 'use strict';
 // PreToolUse(Bash) hook: detect raw `grep`/`rg`/`ag` on the indexed source tree
-// and suggest code-graph CLI alternatives. Closes the "Bash comfort zone" leak —
-// pre-training bias has Claude reach for `grep -rn` ~13× more than the indexed
-// CLI on bash-heavy days (15-day baseline: 429 raw grep vs 191 functional CLI).
+// and either BLOCK with suggestion (v0.32+) or HINT (legacy path). Closes the
+// "Bash comfort zone" leak — pre-training bias has Claude reach for `grep -rn`
+// ~13× more than the indexed CLI on bash-heavy days (15-day baseline: 429 raw
+// grep vs 191 functional CLI). v0.25.0 hint-only had ~0% transfer rate; v0.32.0
+// upgrades the narrowest "I'm searching for a symbol" subset to block-with-reason.
 //
-// Fires when ALL conditions met:
+// HINT fires when ALL conditions met (shouldHint):
 //   1. Command HEAD is grep/rg/ag (NOT piped — pipe-greps are output filters)
 //   2. Args include an indexed source-tree path (src/ tests/ lib/ scripts/ ...)
 //   3. Not searching only a config/lockfile (Cargo.toml/.gitignore/*.md/*.json)
 //   4. Command doesn't already invoke code-graph-mcp (no double-suggest)
 //   5. .code-graph/index.db exists in CWD
 //   6. Same command-hash not hinted within last 60s (per-command cooldown)
+//
+// BLOCK fires when shouldHint AND (shouldBlock):
+//   7. No precision flag in the command (-l / -A / -B / -C / --include / --exclude)
+//   8. Pattern looks identifier-like (CamelCase ≥4ch, or snake_case with _, or
+//      a declaration anchor like `fn X` / `class X` / `def X`)
+//   9. Pattern is not a bare marker word (TODO/FIXME/XXX/HACK/WARN/ERROR/NOTE)
+//  10. CODE_GRAPH_NO_BLOCK_GREP != "1" (block escape, independent of QUIET_HOOKS)
 //
 // Exits silently otherwise — zero noise for build greps, log filters, config
 // lookups, or the rare legitimate use of raw grep on indexed source.
@@ -56,6 +65,30 @@ function shouldHint(cmd) {
   return true;
 }
 
+// v0.32.0 block tier — strictly narrower than shouldHint. The disqualifying
+// flags (-l, -A, -B, -C, --include, --exclude) mean the user is already doing
+// precise filtering and a blanket "use cg" suggestion would be wrong. The
+// identifier-like check restricts blocks to "I'm looking for a symbol" — the
+// exact use case cg replaces. Marker-only patterns (TODO/FIXME) are legit raw
+// text scans with no cg equivalent.
+// Match any short-flag cluster containing l/L/A/B/C (e.g. `-l`, `-rl`, `-rln`,
+// `-A`, `-rA3`). Combined flag clusters are common in real-world usage and the
+// "precision intent" applies as soon as ANY of these letters appears.
+const BLOCK_DISQUALIFYING_FLAGS =
+  /(?:^|\s)-[a-zA-Z]*[lLABC][a-zA-Z]*(?:\s|=|\d|$)|--(?:files-with-matches|files-without-match|include|exclude|exclude-dir|after-context|before-context|context)\b/;
+const IDENTIFIER_LIKE =
+  /[A-Z][a-zA-Z0-9]{3,}|[a-z][a-z0-9]*_[a-z0-9_]+|\b(?:fn|def|class|function|struct|impl|trait|type)\s+\w/;
+const MARKER_ONLY =
+  /^[^"']*["']\s*(?:TODO|FIXME|XXX|HACK|WARN|WARNING|ERROR|NOTE)\s*["']/i;
+
+function shouldBlock(cmd) {
+  if (!shouldHint(cmd)) return false;             // narrower than hint
+  if (BLOCK_DISQUALIFYING_FLAGS.test(cmd)) return false;
+  if (MARKER_ONLY.test(cmd)) return false;        // bare TODO/FIXME — no cg equivalent
+  if (!IDENTIFIER_LIKE.test(cmd)) return false;   // no symbol-shaped target
+  return true;
+}
+
 function commandHash(cmd) {
   return crypto.createHash('sha1').update(cmd).digest('hex').slice(0, 12);
 }
@@ -84,6 +117,19 @@ function buildHint() {
   ].join('\n');
 }
 
+function buildBlockReason() {
+  // Shown to Claude via PreToolUse `decision: block` reason. Must give a
+  // concrete alternate command Claude can re-issue without further thinking.
+  return [
+    '[code-graph] Raw `grep -rn` on indexed source — denied by code-graph hook.',
+    'Use the AST-aware equivalent (returns containing fn/module per hit, repo-wide):',
+    '  code-graph-mcp grep "<pattern>" <path>          # FTS + AST context per hit',
+    '  code-graph-mcp ast-search "<pattern>" --type fn # filter by node type',
+    '  code-graph-mcp callgraph SYMBOL                 # callers + callees',
+    'For raw-text scans (log/comment/marker), re-run with `CODE_GRAPH_NO_BLOCK_GREP=1` prepended.',
+  ].join('\n');
+}
+
 // --- Main execution (only when run directly) ---
 
 // Kill switch: matches user-prompt-context.js convention. =1 forces silence
@@ -92,6 +138,13 @@ function buildHint() {
 // exact comfort-zone leak it was designed to catch.
 function isSilenced(env = process.env) {
   return env.CODE_GRAPH_QUIET_HOOKS === '1';
+}
+
+// v0.32.0 — independent of QUIET_HOOKS. =1 downgrades block tier to hint
+// (legacy v0.25.0–v0.31 behavior). Useful when raw-text scan is intentional
+// but the user still wants the hint for future commands.
+function isBlockDisabled(env = process.env) {
+  return env.CODE_GRAPH_NO_BLOCK_GREP === '1';
 }
 
 function runMain() {
@@ -110,6 +163,23 @@ function runMain() {
   if (isOnCooldown(cmd)) return;
 
   markCooldown(cmd);
+
+  if (!isBlockDisabled() && shouldBlock(cmd)) {
+    // PreToolUse block via current CC schema (`hookSpecificOutput.permissionDecision`).
+    // Verified empirically 2026-05-24: legacy `{decision:"block",reason}` was
+    // ignored by Claude Code — the grep ran anyway. The hookSpecificOutput form
+    // is the documented modern path. Exit 0 — this is a routing decision, not
+    // a hook failure (exit 2 would mark the tool call as "hook errored").
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: buildBlockReason(),
+      },
+    }) + '\n');
+    return;
+  }
+
   process.stdout.write(buildHint() + '\n');
 }
 
@@ -119,9 +189,12 @@ if (require.main === module) {
 
 module.exports = {
   shouldHint,
+  shouldBlock,
   buildHint,
+  buildBlockReason,
   commandHash,
   isOnCooldown,
   markCooldown,
   isSilenced,
+  isBlockDisabled,
 };

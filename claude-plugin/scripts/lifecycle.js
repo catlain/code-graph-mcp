@@ -245,23 +245,55 @@ function migrateOldPluginIds(settings) {
 }
 
 // --- Hook identity ---
-// Claude Code loads hooks from cache/<mp>/<plugin>/<ver>/hooks/hooks.json —
-// that file is the authoritative source. Any entries matching our hooks
-// inside settings.json are legacy migration debris (v0.8.2 and earlier wrote
-// there) and must be stripped on every install/update/session-init so events
-// don't fire twice.
+//
+// v0.32.0 ARCHITECTURE CORRECTION (see project_hooks_settings.md / feedback_pretooluse_dark_under_green_health.md):
+//
+// Empirical finding 2026-05-24: current Claude Code only loads SessionStart
+// hooks from cache/<mp>/<plugin>/<ver>/hooks/hooks.json. PreToolUse, PostToolUse,
+// UserPromptSubmit, Stop, SessionEnd entries in plugin-cache hooks.json are
+// SILENTLY IGNORED. Only ~/.claude/settings.json entries reach CC for those events.
+//
+// Therefore lifecycle.js now ACTIVELY WRITES non-SessionStart hook entries to
+// settings.json (with description markers for cleanup), and the shipped
+// claude-plugin/hooks/hooks.json carries only SessionStart. SessionStart entries
+// in claude-plugin/hooks/hooks.json continue to be CC-loaded as before.
+//
+// Pattern mirrors claude-mem-lite's install.mjs (cache hooks.json cleared
+// to prevent duplicate registration).
 
-const OUR_HOOK_SCRIPTS = ['session-init.js', 'incremental-index.js', 'user-prompt-context.js', 'pre-edit-guide.js'];
+const OUR_HOOK_SCRIPTS = [
+  'session-init.js',
+  'incremental-index.js',
+  'user-prompt-context.js',
+  'pre-edit-guide.js',
+  'pre-grep-guide.js',   // v0.32.0 — was in plugin-cache only, never fired
+  'pre-read-guide.js',   // v0.32.0 — was in plugin-cache only, never fired
+];
+
+// Description markers — primary cleanup discriminator (immune to env/path
+// pollution per feedback_plugin_env_isolation.md). New v0.32.0 markers carry
+// the version so older lifecycle.js still recognizes them as ours.
+const SETTINGS_HOOK_DESC = {
+  preToolUse:       '[code-graph-mcp v0.32+] PreToolUse re-routed via settings.json (cache hooks.json silently ignored for this event by current CC)',
+  postToolUseEdit:  '[code-graph-mcp v0.32+] PostToolUse Write|Edit incremental-index update',
+  userPromptSubmit: '[code-graph-mcp v0.32+] UserPromptSubmit context push',
+};
+
 const OUR_DESCRIPTIONS = [
+  // Legacy v0.7.x / 0.8.x descriptions — kept so very-old installs still get cleaned up.
   'StatusLine self-heal, lifecycle sync, project map injection',
   'Auto-inject impact analysis when editing functions with 2+ callers',
   'Auto-update code graph index after file edits',
   'Inject code-graph structural context based on user intent',
+  // v0.32.0 — new re-route markers
+  SETTINGS_HOOK_DESC.preToolUse,
+  SETTINGS_HOOK_DESC.postToolUseEdit,
+  SETTINGS_HOOK_DESC.userPromptSubmit,
 ];
 
 function isOurHookEntry(entry) {
   if (!entry || !entry.hooks) return false;
-  // Primary: match by description (legacy v0.7.x/0.8.x registrations).
+  // Primary: match by description (immune to path pollution).
   if (entry.description && OUR_DESCRIPTIONS.includes(entry.description)) return true;
   // Fallback: match by script name + 'code-graph' in path.
   return entry.hooks.some(h =>
@@ -284,6 +316,65 @@ function removeHooksFromSettings(settings) {
   if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
 
   return changed;
+}
+
+// --- v0.32.0: settings.json hook registration ---
+
+// Derive absolute plugin-root path from __dirname — never from CLAUDE_PLUGIN_ROOT
+// env var (per feedback_plugin_env_isolation.md, env leaks across plugins in
+// settings.json hook execution context).
+function pluginRootDir() {
+  return path.resolve(__dirname, '..');
+}
+
+function buildSettingsHookEntries() {
+  const root = pluginRootDir();
+  const scriptCmd = (name, timeout) => ({
+    type: 'command',
+    command: `node "${path.join(root, 'scripts', name)}"`,
+    timeout,
+  });
+
+  return {
+    PreToolUse: [
+      { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Edit', hooks: [scriptCmd('pre-edit-guide.js', 4)] },
+      { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Bash', hooks: [scriptCmd('pre-grep-guide.js', 3)] },
+      { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Read', hooks: [scriptCmd('pre-read-guide.js', 3)] },
+    ],
+    PostToolUse: [
+      { description: SETTINGS_HOOK_DESC.postToolUseEdit, matcher: 'Write|Edit', hooks: [scriptCmd('incremental-index.js', 10)] },
+    ],
+    UserPromptSubmit: [
+      { description: SETTINGS_HOOK_DESC.userPromptSubmit, matcher: '', hooks: [scriptCmd('user-prompt-context.js', 5)] },
+    ],
+  };
+}
+
+// Idempotent two-pass: (1) evict ALL our entries (legacy v0.7+/0.8+ markers
+// AND v0.32+ markers) across EVERY event — catches legacy SessionStart/
+// PostToolUse entries in settings.json pointing to stale plugin-cache paths;
+// (2) write fresh v0.32+ entries for the events we own. SessionStart stays
+// in plugin-cache hooks.json (it's still loaded from there), so we don't
+// re-write it to settings.json.
+function registerHooksToSettings(settings) {
+  settings.hooks = settings.hooks || {};
+  const before = JSON.stringify(settings.hooks);
+
+  // Pass 1: evict our entries across every event.
+  for (const event of Object.keys(settings.hooks)) {
+    if (!Array.isArray(settings.hooks[event])) continue;
+    settings.hooks[event] = settings.hooks[event].filter(e => !isOurHookEntry(e));
+    if (settings.hooks[event].length === 0) delete settings.hooks[event];
+  }
+
+  // Pass 2: write fresh entries for our desired events.
+  const desired = buildSettingsHookEntries();
+  for (const [event, desiredEntries] of Object.entries(desired)) {
+    const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event] : [];
+    settings.hooks[event] = [...existing, ...desiredEntries];
+  }
+
+  return before !== JSON.stringify(settings.hooks);
 }
 
 // --- Install (idempotent) ---
@@ -324,11 +415,12 @@ function install() {
   // Register code-graph provider
   registerStatuslineProvider('code-graph', codeGraphStatuslineCommand(), false);
 
-  // 2. Hooks — cache/<ver>/hooks/hooks.json is authoritative. Strip any legacy
-  //    entries from settings.json that v0.8.2 or earlier registered, so events
-  //    don't fire twice.
-  const legacyHooksRemoved = removeHooksFromSettings(settings);
-  if (legacyHooksRemoved) settingsChanged = true;
+  // 2. Hooks — v0.32.0: actively write PreToolUse/PostToolUse/UserPromptSubmit
+  //    to settings.json. Plugin-cache hooks.json is silently ignored by current
+  //    Claude Code for these events (SessionStart still loads from cache).
+  //    registerHooksToSettings is idempotent: strips priors then appends fresh.
+  const hooksRegistered = registerHooksToSettings(settings);
+  if (hooksRegistered) settingsChanged = true;
 
   // NOTE: enabledPlugins is managed by Claude Code's plugin system, not by lifecycle.
   // Do NOT add enabledPlugins entries here — it causes phantom plugin entries
@@ -345,7 +437,7 @@ function install() {
   manifest.updatedAt = new Date().toISOString();
   writeManifest(manifest);
 
-  return { version, settingsChanged, statusLineClaimed: manifest.config.statusLine, legacyHooksRemoved };
+  return { version, settingsChanged, statusLineClaimed: manifest.config.statusLine, hooksRegistered };
 }
 
 // --- Uninstall (clean all config) ---
@@ -437,10 +529,10 @@ function update() {
   // 2. Update code-graph provider in registry
   registerStatuslineProvider('code-graph', codeGraphStatuslineCommand(), false);
 
-  // 3. Hooks — strip any legacy entries from settings.json. cache hooks.json
-  //    is the new authoritative source and always has the up-to-date paths.
-  const legacyHooksRemoved = removeHooksFromSettings(settings);
-  if (legacyHooksRemoved) settingsChanged = true;
+  // 3. Hooks — v0.32.0: register PreToolUse/PostToolUse/UserPromptSubmit in
+  //    settings.json (idempotent; absolute paths re-anchor on every update).
+  const hooksRegistered = registerHooksToSettings(settings);
+  if (hooksRegistered) settingsChanged = true;
 
   // NOTE: enabledPlugins is managed by Claude Code's plugin system, not by lifecycle.
 
@@ -463,7 +555,7 @@ function update() {
   //    cache dirs are inert disk clutter, not correctness risks.
   cleanupOldCacheVersions(3);
 
-  return { oldVersion, version, settingsChanged, legacyHooksRemoved };
+  return { oldVersion, version, settingsChanged, hooksRegistered };
 }
 
 /**
@@ -560,6 +652,8 @@ module.exports = {
   readRegistry, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
   removeHooksFromSettings, isOurHookEntry,
+  registerHooksToSettings, buildSettingsHookEntries, pluginRootDir,    // v0.32.0
+  SETTINGS_HOOK_DESC, OUR_HOOK_SCRIPTS, OUR_DESCRIPTIONS,              // v0.32.0 — for tests
   registerStatuslineProvider, unregisterStatuslineProvider,
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
   settingsPath, installedPluginsPath, providersBackupFile, pluginsCacheDir,

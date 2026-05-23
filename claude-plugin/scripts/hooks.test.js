@@ -75,23 +75,77 @@ test('hooks.json: matchers avoid banned expression-DSL tokens', () => {
     'hooks.json matcher syntax regression — see v0.31.1 CHANGELOG:\n  ' + offenders.join('\n  '));
 });
 
-// Spot-check the matchers we expect to exist. Catches accidental deletion
-// of a PreToolUse hook (the change that would silently disable all of
-// today's lever-#1 work).
-test('hooks.json: required hook events are wired up', () => {
+// v0.32.0 architecture: plugin-cache hooks.json ONLY carries SessionStart.
+// PreToolUse / PostToolUse / UserPromptSubmit are registered into
+// ~/.claude/settings.json by lifecycle.js (current Claude Code silently
+// ignores plugin-cache hooks.json entries for those events — confirmed
+// 2026-05-24 via session jsonl, see feedback_pretooluse_dark_under_green_health.md).
+test('hooks.json: contains SessionStart only (v0.32.0)', () => {
   const cfg = loadHooks();
-  const have = new Set(Object.keys(cfg.hooks || {}));
-  for (const required of ['SessionStart', 'PreToolUse', 'PostToolUse', 'UserPromptSubmit']) {
-    assert.ok(have.has(required), `missing required event: ${required}`);
+  assert.deepEqual(Object.keys(cfg.hooks || {}), ['SessionStart'],
+    'plugin-cache hooks.json must contain only SessionStart; other events go via settings.json. ' +
+    'Adding entries here for PreToolUse/PostToolUse/UserPromptSubmit would be dead config — CC does not load them.');
+});
+
+test('hooks.json: SessionStart wires session-init.js', () => {
+  const cfg = loadHooks();
+  const entries = (cfg.hooks && cfg.hooks.SessionStart) || [];
+  assert.ok(entries.length > 0, 'SessionStart entry missing');
+  const cmd = entries[0].hooks && entries[0].hooks[0] && entries[0].hooks[0].command;
+  assert.match(cmd || '', /session-init\.js/);
+});
+
+// Cross-validate that lifecycle.js's buildSettingsHookEntries covers the
+// matchers we removed from hooks.json — keeps the migration whole. If a
+// future refactor accidentally drops a matcher in one place, this fails.
+test('lifecycle.buildSettingsHookEntries covers PreToolUse Edit/Bash/Read', () => {
+  const { buildSettingsHookEntries } = require('./lifecycle');
+  const desired = buildSettingsHookEntries();
+  const ptu = (desired.PreToolUse || []).map(e => e.matcher);
+  for (const tool of ['Edit', 'Bash', 'Read']) {
+    assert.ok(ptu.includes(tool), `lifecycle.js PreToolUse missing matcher: ${tool}; got ${JSON.stringify(ptu)}`);
   }
 });
 
-test('hooks.json: PreToolUse covers Edit, Bash, Read', () => {
-  const cfg = loadHooks();
-  const entries = (cfg.hooks && cfg.hooks.PreToolUse) || [];
-  const matchers = entries.map(e => e && e.matcher);
-  for (const tool of ['Edit', 'Bash', 'Read']) {
-    const found = matchers.some(m => m && (m === tool || m.split('|').includes(tool)));
-    assert.ok(found, `PreToolUse missing matcher for tool: ${tool}; got ${JSON.stringify(matchers)}`);
+test('lifecycle.buildSettingsHookEntries covers PostToolUse Write|Edit + UserPromptSubmit', () => {
+  const { buildSettingsHookEntries } = require('./lifecycle');
+  const desired = buildSettingsHookEntries();
+  const postMatchers = (desired.PostToolUse || []).map(e => e.matcher);
+  assert.ok(postMatchers.some(m => m === 'Write|Edit'),
+    `PostToolUse must have 'Write|Edit' matcher; got ${JSON.stringify(postMatchers)}`);
+  const upsMatchers = (desired.UserPromptSubmit || []).map(e => e.matcher);
+  assert.ok(upsMatchers.length > 0, 'UserPromptSubmit must have at least one matcher');
+});
+
+test('lifecycle.buildSettingsHookEntries: every entry carries description marker', () => {
+  // Description marker is the primary cleanup discriminator (immune to
+  // path/env pollution per feedback_plugin_env_isolation.md). If an entry
+  // lacks a description, isOurHookEntry falls back to path-fragment match
+  // which is less reliable. Force every entry to have one.
+  const { buildSettingsHookEntries } = require('./lifecycle');
+  const desired = buildSettingsHookEntries();
+  for (const [event, entries] of Object.entries(desired)) {
+    for (let i = 0; i < entries.length; i++) {
+      assert.ok(entries[i].description && entries[i].description.includes('[code-graph-mcp'),
+        `${event}[${i}] missing or malformed description marker`);
+    }
+  }
+});
+
+test('lifecycle.buildSettingsHookEntries: hook commands use absolute paths (no env vars)', () => {
+  // settings.json hook commands run with env pollution risk
+  // (feedback_plugin_env_isolation.md). Paths MUST be absolute, derived
+  // from __dirname, never from ${CLAUDE_PLUGIN_ROOT}.
+  const { buildSettingsHookEntries } = require('./lifecycle');
+  const desired = buildSettingsHookEntries();
+  for (const entries of Object.values(desired)) {
+    for (const e of entries) {
+      for (const h of e.hooks) {
+        assert.ok(!h.command.includes('${CLAUDE_PLUGIN_ROOT}'),
+          `command must not use \${CLAUDE_PLUGIN_ROOT}: ${h.command}`);
+        assert.ok(h.command.startsWith('node "/') || h.command.match(/node "[A-Z]:\\/),
+          `command path must be absolute: ${h.command}`);
+      }
+    }
   }
 });
