@@ -9,8 +9,8 @@
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const { findBinary } = require('./find-binary');
+const { cgTmpDir } = require('./tmp-dir');
 
 const cwd = process.cwd();
 const dbPath = path.join(cwd, '.code-graph', 'index.db');
@@ -105,7 +105,7 @@ function isCommonKeyword(s) {
 }
 
 // --- Per-symbol cooldown: 2 minutes ---
-const cooldownFile = path.join(os.tmpdir(), `.cg-impact-${symbol}`);
+const cooldownFile = path.join(cgTmpDir(), `.cg-impact-${symbol}`);
 try {
   if (Date.now() - fs.statSync(cooldownFile).mtimeMs < 120000) process.exit(0);
 } catch { /* first time for this symbol */ }

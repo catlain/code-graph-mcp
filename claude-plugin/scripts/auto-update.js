@@ -8,6 +8,7 @@ const os = require('os');
 const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
 const { clearCache: clearBinaryCache } = require('./find-binary');
 const { readBinaryVersion, isDevMode } = require('./version-utils');
+const { cgTmpDir } = require('./tmp-dir');
 
 // ── Environment Checks ────────────────────────────────────
 
@@ -251,7 +252,7 @@ async function downloadAndInstall(latest) {
     return { pluginUpdated: false, binaryUpdated: false };
   }
 
-  const tmpDir = path.join(os.tmpdir(), `code-graph-update-${Date.now()}`);
+  const tmpDir = path.join(cgTmpDir(), `update-${Date.now()}`);
   let pluginUpdated = false;
   let binaryUpdated = false;
 

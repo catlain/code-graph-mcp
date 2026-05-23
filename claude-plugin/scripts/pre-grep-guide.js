@@ -27,8 +27,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const crypto = require('crypto');
+const { cgTmpDir } = require('./tmp-dir');
 
 // --- Pure logic (testable) ---
 
@@ -115,16 +115,18 @@ function commandHash(cmd) {
   return crypto.createHash('sha1').update(cmd).digest('hex').slice(0, 12);
 }
 
+function flagPath(cmd) {
+  return path.join(cgTmpDir(), `.code-graph-bash-${commandHash(cmd)}`);
+}
+
 function isOnCooldown(cmd, now = Date.now(), windowMs = 60000) {
-  const flag = path.join(os.tmpdir(), `.code-graph-bash-${commandHash(cmd)}`);
   try {
-    return now - fs.statSync(flag).mtimeMs < windowMs;
+    return now - fs.statSync(flagPath(cmd)).mtimeMs < windowMs;
   } catch { return false; }
 }
 
 function markCooldown(cmd) {
-  const flag = path.join(os.tmpdir(), `.code-graph-bash-${commandHash(cmd)}`);
-  try { fs.writeFileSync(flag, ''); } catch { /* ok */ }
+  try { fs.writeFileSync(flagPath(cmd), ''); } catch { /* ok */ }
 }
 
 function buildHint() {

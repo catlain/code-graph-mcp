@@ -24,8 +24,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const crypto = require('crypto');
+const { cgTmpDir } = require('./tmp-dir');
 
 // --- Configuration ---
 
@@ -66,7 +66,7 @@ function cwdHash(cwd) {
 }
 
 function statePath(cwd) {
-  return path.join(os.tmpdir(), `.code-graph-readfan-${cwdHash(cwd)}.json`);
+  return path.join(cgTmpDir(), `.code-graph-readfan-${cwdHash(cwd)}.json`);
 }
 
 function loadState(cwd, now = Date.now()) {

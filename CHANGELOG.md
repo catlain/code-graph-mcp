@@ -1,5 +1,90 @@
 # Changelog
 
+## v0.32.2 — tmp-dir containment + healthCheck repair verification
+
+Three-fix patch bundling reviewer follow-ups from v0.32.1 (M3/M4) and a
+session-dogfood discovery (M6/tmp-dir). None changes the public contract
+or schema; `healthCheck()` return shape gets one additive field
+(`remaining`) and one tightened invariant (`repaired:true` requires a
+post-install re-scan to be clean).
+
+### Fixed
+
+- **`healthCheck()` `repaired:true` is now verified by a post-install
+  re-scan (M3)** — previously the function ran `install()` whenever a
+  flagged path was found and unconditionally returned `repaired:true`,
+  even if `install()` couldn't actually resolve the issue (binary
+  permanently gone, third-party registry entry not ours to touch,
+  etc.). `doctor.js` then printed "N issue(s) auto-repaired ✅" —
+  Iron Law #2 style honesty violation. v0.32.2 extracts
+  `scanForBrokenPaths()` as a pure function (also exported for direct
+  unit testing); `healthCheck()` runs it once, then if issues found
+  runs `install()` and re-runs the scan; `repaired:true` only when the
+  post-repair scan is clean. Otherwise `repaired:false` plus a new
+  `remaining[]` field listing what's still broken. `doctor.js` Hooks
+  row consumes the new shape: `repaired:true` → `ok` /
+  "N issue(s) auto-repaired"; `repaired:false` → `warn` /
+  "N invalid path(s) — auto-repair did not resolve" + `fixId:'hooks-invalid'`
+  so the user can still try the manual repair path.
+- **`doctor.js` `hooks-invalid` repair output aligned with sibling
+  message (M4)** — `runRepairs('hooks-invalid')` previously logged
+  "✅ Hooks repaired" but the sibling `missing-hooks-in-settings` case
+  already said "✅ Hooks repaired — restart Claude Code to apply".
+  `settings.json` changes only land after Claude Code restarts the hook
+  dispatcher, so both messages now say the same thing.
+- **Hook + auto-update tmp artifacts no longer collide with Claude
+  Code's transcript directory (M6)** — `pre-grep-guide.js` cooldown
+  flags (`.code-graph-bash-<hash>`), `pre-edit-guide.js` impact cache
+  (`.cg-impact-<symbol>`), `pre-read-guide.js` readfan state
+  (`.code-graph-readfan-<hash>.json`), and `auto-update.js` staging dir
+  (`code-graph-update-<ts>`) previously called `os.tmpdir()` directly.
+  Claude Code overrides `$TMPDIR` to `~/.claude/tmp/` (to capture
+  process output for transcript replay), so these artifacts landed
+  alongside 9000+ transcript subdirs. Two failure modes:
+  (a) **diagnostic blindness** — every doc / memory / debug query that
+  checked `/tmp/.code-graph-bash-*` for hook firing returned empty even
+  when the hook worked correctly (the v0.32.0 "PreToolUse dark under
+  green health" investigation burned ~2 hours chasing this red
+  herring); (b) **§8 SAFETY recursive-traversal trap** — scattering
+  0-byte flag files alongside transcript subdirs amplifies the
+  "`grep -r ~/.claude/tmp/`" footgun. Fix: new `tmp-dir.js` helper pins
+  all hook + auto-update artifacts to `${tmpdir}/code-graph-mcp/`.
+  Legacy orphans in the parent age out naturally (0-byte, no behavior
+  impact). Diagnostic memory (`feedback_pretooluse_dark_under_green_health.md`)
+  updated to point at the new location.
+
+### Internal
+
+- `lifecycle.js` now exports `scanForBrokenPaths()` as a pure function
+  for unit testing.
+- New `claude-plugin/scripts/tmp-dir.js` module — single source of
+  truth for hook + auto-update tmp paths.
+
+### Testing
+
+- 448/448 plugin script tests pass (29 new on v0.32.0 baseline):
+  - `healthCheck` clean-state → `healthy:true`, no `remaining` field
+  - `healthCheck` post-repair re-scan clean → `repaired:true`,
+    `remaining:[]`
+  - `healthCheck` post-repair re-scan still broken → `repaired:false`,
+    `remaining` lists what `install()` couldn't fix
+  - `scanForBrokenPaths` exported and returns the expected issue
+    structure
+  - `update()` from v0.31.2 manifest + empty settings.json — reviewer
+    Rec #2 covered the actual production migration path
+  - `tmp-dir.js`: `CG_TMP_DIR` resolves to
+    `${os.tmpdir()}/code-graph-mcp`, `cgTmpDir()` creates the dir on
+    demand and is idempotent, regression guard that hook flag basenames
+    never leak into the parent root (`os.tmpdir()` itself)
+
+### Process
+
+M3/M4 driven by `/superpowers:requesting-code-review` follow-ups on the
+v0.32.1 patch. M6 surfaced by an end-of-cycle user dogfood pass —
+direct invoke of `pre-grep-guide.js` showed HINT firing but zero
+`/tmp/.code-graph-bash-*` flag files; `$TMPDIR` probe revealed the
+override.
+
 ## v0.32.1 — block-tier false-positive fixes + foreign-strip risk reduction
 
 Four-finding code-review patch on v0.32.0. All findings were `Important`
