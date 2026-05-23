@@ -7,8 +7,7 @@ const os = require('os');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const {
   getPluginVersion, readJson, healthCheck, CACHE_DIR,
-  removeHooksFromSettings, isOurHookEntry, writeJsonAtomic,
-  settingsPath, buildSettingsHookEntries,
+  isOurHookEntry, settingsPath, buildSettingsHookEntries,
 } = require('./lifecycle');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 
@@ -197,13 +196,13 @@ function runDiagnostics() {
     const cov = surveyHookCoverage(settings);
     if (cov.missing.length === 0) {
       results.push({
-        name: 'Hooks',
+        name: 'Hook coverage',
         status: 'ok',
         detail: `settings.json has all ${cov.expected.length} expected entries`,
       });
     } else {
       results.push({
-        name: 'Hooks',
+        name: 'Hook coverage',
         status: 'warn',
         detail: `missing ${cov.missing.length}/${cov.expected.length} settings.json entries: ${cov.missing.join(', ')}`,
         fixId: 'missing-hooks-in-settings',

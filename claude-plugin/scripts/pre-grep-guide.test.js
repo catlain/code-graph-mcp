@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const {
   shouldHint,
   shouldBlock,
+  extractPatterns,
   buildHint,
   buildBlockReason,
   commandHash,
@@ -421,4 +422,105 @@ test('isBlockDisabled: independent of CODE_GRAPH_QUIET_HOOKS', () => {
   // The two flags must be orthogonal — neither implies the other.
   assert.equal(isBlockDisabled({ CODE_GRAPH_QUIET_HOOKS: '1' }), false);
   assert.equal(isSilenced({ CODE_GRAPH_NO_BLOCK_GREP: '1' }), false);
+});
+
+// ════════════════════════════════════════════════════════════════════
+// v0.32.1 — extractPatterns + I1/I4 false-positive regressions
+// ════════════════════════════════════════════════════════════════════
+
+// ── extractPatterns: pulls quoted args from grep/rg/ag commands ──────
+
+test('extractPatterns: single double-quoted pattern', () => {
+  assert.deepEqual(extractPatterns('grep -rn "EmbeddingModel" src/'), ['EmbeddingModel']);
+});
+
+test('extractPatterns: single-quoted pattern', () => {
+  assert.deepEqual(extractPatterns("grep -rn 'fts5_search' src/"), ['fts5_search']);
+});
+
+test('extractPatterns: env-prefixed verb', () => {
+  assert.deepEqual(extractPatterns('env LANG=C grep -rn "Foo" src/'), ['Foo']);
+});
+
+test('extractPatterns: multiple -e patterns', () => {
+  // Multi-pattern grep: both quoted args should be returned.
+  const got = extractPatterns('grep -rn -e "first" -e "second" src/');
+  assert.deepEqual(got, ['first', 'second']);
+});
+
+test('extractPatterns: pattern with alternation', () => {
+  assert.deepEqual(
+    extractPatterns('grep -rn "fn fts5_search\\|MATCH" src/storage/'),
+    ['fn fts5_search\\|MATCH']
+  );
+});
+
+test('extractPatterns: no quotes at all → empty array', () => {
+  // Unquoted pattern (`grep foo src/`) — we deliberately don't try to parse
+  // shell tokenization; shouldBlock falls back to hint in this case.
+  assert.deepEqual(extractPatterns('grep -rn foo src/'), []);
+});
+
+test('extractPatterns: empty / non-string → empty array', () => {
+  assert.deepEqual(extractPatterns(''), []);
+  assert.deepEqual(extractPatterns(null), []);
+  assert.deepEqual(extractPatterns(undefined), []);
+});
+
+test('extractPatterns: rg / ag head also stripped', () => {
+  assert.deepEqual(extractPatterns('rg "Foo" lib/'), ['Foo']);
+  assert.deepEqual(extractPatterns('ag "Bar" src/'), ['Bar']);
+});
+
+// ── I1 regression: identifier-shaped PATHS no longer trigger block ──
+
+test('I1: grep -rn "abc" src/EmbeddingModel.rs → HINT (path has CamelCase, pattern doesn\'t)', () => {
+  // CamelCase is in the FILENAME, not the pattern. v0.32.0 false-blocked
+  // this. Pattern "abc" has no identifier shape → must downgrade to hint.
+  assert.equal(shouldBlock('grep -rn "abc" src/EmbeddingModel.rs'), false);
+});
+
+test('I1: grep -rn "x" src/some_module/file.rs → HINT (path has snake_case)', () => {
+  assert.equal(shouldBlock('grep -rn "x" src/some_module/file.rs'), false);
+});
+
+test('I1: grep -rn "the quick brown fox" src/EmbeddingModel.rs → HINT (English prose pattern)', () => {
+  assert.equal(shouldBlock('grep -rn "the quick brown fox" src/EmbeddingModel.rs'), false);
+});
+
+test('I1: unquoted pattern grep -rn foo src/ → HINT (conservative fallback)', () => {
+  // Without quotes we can't safely identify the pattern arg via shell rules
+  // alone. Conservative: hint only.
+  assert.equal(shouldBlock('grep -rn foo src/'), false);
+});
+
+test('I1: identifier pattern still blocks even with non-identifier path', () => {
+  // Sanity check the inverse — block tier shouldn't get over-relaxed.
+  // Path is plain `src/` but pattern is CamelCase → still block.
+  assert.equal(shouldBlock('grep -rn "EmbeddingModel" src/'), true);
+});
+
+// ── I4 regression: declaration-anchor + `type` keyword fixes ─────────
+
+test('I4: grep -rn "# type checking" src/ → HINT (comment scan, "type" not a decl keyword anymore)', () => {
+  assert.equal(shouldBlock('grep -rn "# type checking" src/'), false);
+});
+
+test('I4: grep -rn "some type X" src/ → HINT (type not at pattern start, no longer over-matches)', () => {
+  assert.equal(shouldBlock('grep -rn "some type X" src/'), false);
+});
+
+test('I4: grep -rn "the def keyword" src/ → HINT (def not at pattern start)', () => {
+  // "the def keyword" had `\bdef\s+\w` match `def k` previously.
+  // ^\s*(?:fn|def|...) anchor stops this.
+  assert.equal(shouldBlock('grep -rn "the def keyword" src/'), false);
+});
+
+test('I4: grep -rn "def calc_total" src/ → BLOCK (def at start + snake_case)', () => {
+  // Real declaration search — still blocks correctly.
+  assert.equal(shouldBlock('grep -rn "def calc_total" src/'), true);
+});
+
+test('I4: grep -rn "fn render" src/ → BLOCK (decl anchor at start)', () => {
+  assert.equal(shouldBlock('grep -rn "fn render" src/'), true);
 });

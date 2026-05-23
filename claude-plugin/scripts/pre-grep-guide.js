@@ -76,17 +76,39 @@ function shouldHint(cmd) {
 // "precision intent" applies as soon as ANY of these letters appears.
 const BLOCK_DISQUALIFYING_FLAGS =
   /(?:^|\s)-[a-zA-Z]*[lLABC][a-zA-Z]*(?:\s|=|\d|$)|--(?:files-with-matches|files-without-match|include|exclude|exclude-dir|after-context|before-context|context)\b/;
+// v0.32.1: drop the `type` declaration keyword (too common in English prose
+// like "# type checking") and anchor declaration anchors to pattern start
+// (otherwise `"some type X"` matches). CamelCase and snake_case still match
+// anywhere — they're distinctive enough on their own.
 const IDENTIFIER_LIKE =
-  /[A-Z][a-zA-Z0-9]{3,}|[a-z][a-z0-9]*_[a-z0-9_]+|\b(?:fn|def|class|function|struct|impl|trait|type)\s+\w/;
+  /[A-Z][a-zA-Z0-9]{3,}|[a-z][a-z0-9]*_[a-z0-9_]+|^\s*(?:fn|def|class|function|struct|impl|trait)\s+\w/;
 const MARKER_ONLY =
   /^[^"']*["']\s*(?:TODO|FIXME|XXX|HACK|WARN|WARNING|ERROR|NOTE)\s*["']/i;
+
+// v0.32.1: pull the pattern argument(s) out of the command before running
+// IDENTIFIER_LIKE — testing the full cmd false-positives on CamelCase /
+// snake_case in PATH ARGUMENTS like `src/EmbeddingModel.rs` or
+// `src/some_module/`. The pattern arg is what the user is actually searching
+// for, and that's the only thing we should evaluate against "is this a
+// symbol-shaped target".
+function extractPatterns(cmd) {
+  if (!cmd || typeof cmd !== 'string') return [];
+  // Strip leading verb + env prefix
+  const stripped = cmd.replace(/^\s*(?:env\s+\S+=\S+\s+)*(?:grep|rg|ag)\s+/, '');
+  // Collect every quoted argument — first one is the pattern in standard grep
+  // usage; subsequent ones (e.g. `-e "second"`) are also patterns or filter
+  // expressions and worth screening too.
+  const matches = [...stripped.matchAll(/"([^"]+)"|'([^']+)'/g)];
+  return matches.map(m => m[1] !== undefined ? m[1] : m[2]);
+}
 
 function shouldBlock(cmd) {
   if (!shouldHint(cmd)) return false;             // narrower than hint
   if (BLOCK_DISQUALIFYING_FLAGS.test(cmd)) return false;
   if (MARKER_ONLY.test(cmd)) return false;        // bare TODO/FIXME — no cg equivalent
-  if (!IDENTIFIER_LIKE.test(cmd)) return false;   // no symbol-shaped target
-  return true;
+  const patterns = extractPatterns(cmd);
+  if (patterns.length === 0) return false;        // unquoted pattern — conservative, hint
+  return patterns.some(p => IDENTIFIER_LIKE.test(p));
 }
 
 function commandHash(cmd) {
@@ -190,6 +212,7 @@ if (require.main === module) {
 module.exports = {
   shouldHint,
   shouldBlock,
+  extractPatterns,    // v0.32.1 — exposed for tests
   buildHint,
   buildBlockReason,
   commandHash,

@@ -295,10 +295,13 @@ function isOurHookEntry(entry) {
   if (!entry || !entry.hooks) return false;
   // Primary: match by description (immune to path pollution).
   if (entry.description && OUR_DESCRIPTIONS.includes(entry.description)) return true;
-  // Fallback: match by script name + 'code-graph' in path.
+  // Fallback: script name + MARKETPLACE_NAME in path. v0.32.1: tightened from
+  // bare 'code-graph' (which would claim a user's own ~/code-graph/foo.js) to
+  // the actual marketplace dir name 'code-graph-mcp' — Requirement 3 says
+  // foreign-entry strip is unacceptable, so be conservative.
   return entry.hooks.some(h =>
     h.command && OUR_HOOK_SCRIPTS.some(s => h.command.includes(s)) &&
-    h.command.includes('code-graph')
+    h.command.includes(MARKETPLACE_NAME)
   );
 }
 
@@ -320,15 +323,12 @@ function removeHooksFromSettings(settings) {
 
 // --- v0.32.0: settings.json hook registration ---
 
-// Derive absolute plugin-root path from __dirname — never from CLAUDE_PLUGIN_ROOT
-// env var (per feedback_plugin_env_isolation.md, env leaks across plugins in
-// settings.json hook execution context).
-function pluginRootDir() {
-  return path.resolve(__dirname, '..');
-}
+// PLUGIN_ROOT (module-level, line 18) is the canonical __dirname-derived
+// absolute path — never CLAUDE_PLUGIN_ROOT env (env leaks across plugins
+// in settings.json hook execution context per feedback_plugin_env_isolation.md).
 
 function buildSettingsHookEntries() {
-  const root = pluginRootDir();
+  const root = PLUGIN_ROOT;
   const scriptCmd = (name, timeout) => ({
     type: 'command',
     command: `node "${path.join(root, 'scripts', name)}"`,
@@ -652,8 +652,9 @@ module.exports = {
   readRegistry, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
   removeHooksFromSettings, isOurHookEntry,
-  registerHooksToSettings, buildSettingsHookEntries, pluginRootDir,    // v0.32.0
+  registerHooksToSettings, buildSettingsHookEntries,                  // v0.32.0
   SETTINGS_HOOK_DESC, OUR_HOOK_SCRIPTS, OUR_DESCRIPTIONS,              // v0.32.0 — for tests
+  PLUGIN_ROOT,                                                         // v0.32.1 — for tests / consumers
   registerStatuslineProvider, unregisterStatuslineProvider,
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
   settingsPath, installedPluginsPath, providersBackupFile, pluginsCacheDir,
