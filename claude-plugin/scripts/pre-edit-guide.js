@@ -10,10 +10,17 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { findBinary } = require('./find-binary');
 
 const cwd = process.cwd();
 const dbPath = path.join(cwd, '.code-graph', 'index.db');
 if (!fs.existsSync(dbPath)) process.exit(0);
+
+// Resolve binary the same way the other hooks do — bare PATH lookup misses
+// npm-global installs on systems where the global bin dir isn't on PATH for
+// non-login shells (a real failure mode reported in mem #8187).
+const binary = findBinary();
+if (!binary) process.exit(0);
 
 // --- Parse tool input ---
 let input;
@@ -63,7 +70,7 @@ if (!symbol || symbol.length < 3) {
         .sort((a, b) => b.length - a.length);
       for (const candidate of candidates.slice(0, 5)) {
         try {
-          const raw = execFileSync('code-graph-mcp', ['grep', candidate, filePath, '--json'], {
+          const raw = execFileSync(binary, ['grep', candidate, filePath, '--json'], {
             cwd, timeout: 2000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
           });
           const grepResult = JSON.parse(raw);

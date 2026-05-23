@@ -33,11 +33,11 @@ function hasBuiltBinary() {
  * Run the launcher, send one MCP message on stdin, collect stdout/stderr,
  * resolve once we either see a JSON-RPC response on stdout or hit timeout.
  */
-function runLauncherInitialize(timeoutMs = 15000) {
+function runLauncherInitialize(timeoutMs = 15000, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [LAUNCHER], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env },
+      env: { ...process.env, ...extraEnv },
       cwd: REPO_ROOT,
     });
 
@@ -80,7 +80,11 @@ test('mcp-launcher resolves dev binary and forwards MCP JSON-RPC stdin/stdout', 
     return;
   }
 
-  const { stdout, stderr } = await runLauncherInitialize();
+  // REPO_ROOT has its own .mcp.json registering code-graph-dev (v0.31.2
+  // landed that to capture dev session metrics), which trips the launcher's
+  // dedup gate. Force the original launch path so this test still covers
+  // it. The dedup behavior gets its own test below.
+  const { stdout, stderr } = await runLauncherInitialize(15000, { CODE_GRAPH_FORCE_PLUGIN_MCP: '1' });
 
   // Find the JSON-RPC line in the bytes the launcher forwarded from the binary.
   // Stderr may contain "[code-graph] ..." breadcrumbs from the launcher; those
@@ -93,6 +97,22 @@ test('mcp-launcher resolves dev binary and forwards MCP JSON-RPC stdin/stdout', 
   assert.equal(resp.id, 1);
   assert.ok(resp.result.serverInfo, 'response must carry serverInfo from the binary');
   assert.equal(resp.result.serverInfo.name, 'code-graph-mcp');
+});
+
+test('mcp-launcher enters dedup stub when project .mcp.json registers a code-graph server', async () => {
+  // REPO_ROOT/.mcp.json registers code-graph-dev → dedup gate fires →
+  // launcher serves a 0-tools stub with a distinctive serverInfo.name.
+  // No need for the release binary; the stub is implemented in the
+  // launcher script itself.
+  const { stdout, stderr } = await runLauncherInitialize();
+  const respLine = stdout.trim().split('\n').find((l) => l.includes('"result"'));
+  assert.ok(respLine,
+    `expected stub JSON-RPC result on stdout, got: ${stdout.slice(0, 400)} | stderr: ${stderr.slice(0, 400)}`);
+  const resp = JSON.parse(respLine);
+  assert.match(resp.result.serverInfo.name, /stub|dedup/i,
+    `serverInfo.name should indicate stub mode, got ${JSON.stringify(resp.result.serverInfo)}`);
+  assert.match(stderr, /plugin MCP serving 0 tools/,
+    `stderr should explain the dedup, got: ${stderr.slice(0, 400)}`);
 });
 
 test('mcp-launcher sets _FIND_BINARY_ROOT from __dirname (does not trust CLAUDE_PLUGIN_ROOT)', () => {

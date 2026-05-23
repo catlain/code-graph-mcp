@@ -15,6 +15,79 @@ const fs = require('fs');
 // Always derive from __dirname — CLAUDE_PLUGIN_ROOT can leak from other plugins
 process.env._FIND_BINARY_ROOT = path.resolve(__dirname, '..');
 
+// --- Tool-catalog dedup gate -----------------------------------------------
+// If the user's project has its own .mcp.json registering a code-graph server
+// (the recommended pattern for dev work on this repo — points at a local
+// `target/release/code-graph-mcp` so usage telemetry lands in the project's
+// `.code-graph/usage.jsonl`), the plugin's own MCP server adds a SECOND copy
+// of the same 7 tools to the catalog, costing context budget and splitting
+// the agent's choice between two equivalent namespaces.
+//
+// Detect that case and serve a minimal "0-tools" MCP stub so this plugin
+// stops contributing to the catalog. Hooks, skills, agents stay registered
+// (they live outside the MCP server). Env override
+// `CODE_GRAPH_FORCE_PLUGIN_MCP=1` bypasses the gate.
+function projectHasLocalCodeGraphMcp(cwd) {
+  try {
+    const p = path.join(cwd, '.mcp.json');
+    if (!fs.existsSync(p)) return false;
+    const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const servers = (cfg && cfg.mcpServers) || {};
+    return Object.keys(servers).some(n => /code[-_]?graph/i.test(n));
+  } catch { return false; }
+}
+
+function serveEmptyMcpStub() {
+  let buf = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      let req;
+      try { req = JSON.parse(line); } catch { continue; }
+      if (!req || typeof req.method !== 'string') continue;
+      // JSON-RPC notifications (id missing) get no response.
+      if (typeof req.id === 'undefined') continue;
+      const method = req.method;
+      let result, error;
+      if (method === 'initialize') {
+        result = {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: 'code-graph-mcp (plugin stub, dedup)', version: '0.31.1' },
+        };
+      } else if (method === 'tools/list') {
+        result = { tools: [] };
+      } else if (method === 'resources/list') {
+        result = { resources: [] };
+      } else if (method === 'prompts/list') {
+        result = { prompts: [] };
+      } else {
+        error = { code: -32601, message: 'method not found (plugin MCP is in dedup stub mode)' };
+      }
+      const resp = error
+        ? { jsonrpc: '2.0', id: req.id, error }
+        : { jsonrpc: '2.0', id: req.id, result };
+      process.stdout.write(JSON.stringify(resp) + '\n');
+    }
+  });
+  process.stdin.on('end', () => process.exit(0));
+}
+
+if (process.env.CODE_GRAPH_FORCE_PLUGIN_MCP !== '1' && projectHasLocalCodeGraphMcp(process.cwd())) {
+  process.stderr.write(
+    '[code-graph] project .mcp.json registers a code-graph server; ' +
+    'plugin MCP serving 0 tools to avoid duplicate catalog entries. ' +
+    'Set CODE_GRAPH_FORCE_PLUGIN_MCP=1 to override.\n'
+  );
+  serveEmptyMcpStub();
+  return; // top-level function scope of mcp-launcher.js
+}
+
 const { findBinary, clearCache } = require('./find-binary');
 
 let binary = findBinary();

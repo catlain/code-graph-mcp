@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.31.2 — dedup plugin MCP catalog when project provides its own + regression gate
+
+Follow-up to v0.31.1's PreToolUse repair. Four small functional cleanups:
+
+### Fixed
+- `claude-plugin/scripts/mcp-launcher.js` — when the user's project has its
+  own `.mcp.json` registering a `code-graph*` server (the recommended setup
+  for dev work on this repo, so usage telemetry lands in the project's
+  `.code-graph/usage.jsonl`), the plugin's MCP server now serves a minimal
+  "0 tools" JSON-RPC stub instead of registering a duplicate 7-tool catalog.
+  Saves ~4-8 KB of context per session and removes the AI's ambiguity
+  between the two equivalent namespaces. Env override
+  `CODE_GRAPH_FORCE_PLUGIN_MCP=1` bypasses the dedup gate.
+- `claude-plugin/scripts/pre-edit-guide.js` — `code-graph-mcp` binary is now
+  resolved via `findBinary()` (consistent with `mcp-launcher.js` and
+  `incremental-index.js`) instead of a bare PATH lookup, so npm-global
+  installs on systems where the global bin dir isn't on PATH for non-login
+  shells (the failure mode behind mem #8187) no longer leave the hook
+  silently inert.
+
+### Added
+- `claude-plugin/scripts/hooks.test.js` (5 tests) — regression gate that
+  parses `hooks/hooks.json` and rejects matchers containing the expression
+  DSL tokens (`==`, `tool `, `||`, `&&`, `"`) that caused the v0.25.0 →
+  v0.31.0 silent breakage. Verified by a negative test (re-injecting the
+  broken matcher makes the gate fail with a concrete diagnostic). Wired
+  into `.github/workflows/ci.yml`'s `plugin-tests` job alongside
+  `pre-edit-guide.test.js`, which was also missing from the CI matrix.
+
 ## v0.31.1 — fix: PreToolUse hooks never fired
 
 Two compounding bugs caused `PreToolUse:Edit`/`Bash`/`Read` hooks and the

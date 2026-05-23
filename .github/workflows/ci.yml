@@ -65,7 +65,12 @@ jobs:
         with:
           node-version: 20
       - name: Plugin lifecycle tests
-        run: node --test claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js scripts/release-smoke.test.js
+        # Note: this curated list is not the full set of *.test.js under
+        # claude-plugin/scripts/ — only tests verified to pass in CI without
+        # local dev setup. hooks.test.js / pre-edit-guide.test.js were added
+        # in v0.31.2 after the matcher-regression bug; future additions
+        # should be vetted locally first, not blind-globbed.
+        run: node --test claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js claude-plugin/scripts/hooks.test.js claude-plugin/scripts/pre-edit-guide.test.js scripts/release-smoke.test.js
 
   # Supply-chain CVE scan over Cargo.lock (376 transitive deps including the
   # Candle ML stack). cargo-audit reads RustSec advisories and exits non-zero
