@@ -201,6 +201,12 @@ jobs:
         with:
           generate_release_notes: true
           files: release-assets/*
+          # On push.tags trigger github.ref_name = "vX.Y.Z" and softprops picks
+          # it up implicitly. On workflow_dispatch from main, github.ref_name =
+          # "main" — softprops then errors with "GitHub Releases requires a
+          # tag". Explicit tag_name with the same inputs.tag fallback the rest
+          # of the job uses keeps both triggers working.
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
 
   # Post-publish verification: in a clean env on each OS, install the JUST-
   # PUBLISHED package from the npm registry and assert the binary runs and
