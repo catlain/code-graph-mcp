@@ -173,9 +173,20 @@ impl McpServer {
         // Folds the former dependency_graph tool (v0.18.4).
         if include_deps {
             if path.contains('.') && !path.ends_with('/') {
+                // Pre-validate deps_direction at the outer tool layer. Without this,
+                // a bogus value would be swallowed by the outer Err-→`dependencies_unavailable`
+                // muffler below and the user would see an OK response with the error
+                // buried in a field they likely don't read.
+                let deps_direction = args.get("deps_direction").and_then(|v| v.as_str()).unwrap_or("both");
+                if !matches!(deps_direction, "outgoing" | "incoming" | "both") {
+                    return Err(anyhow!(
+                        "deps_direction must be one of: outgoing, incoming, both (got '{}')",
+                        deps_direction
+                    ));
+                }
                 let dep_args = json!({
                     "file_path": path,
-                    "direction": args.get("deps_direction").and_then(|v| v.as_str()).unwrap_or("both"),
+                    "direction": deps_direction,
                     "depth": args.get("deps_depth").and_then(|v| v.as_i64()).unwrap_or(2),
                     "compact": compact,
                     "skip_indexing": true,

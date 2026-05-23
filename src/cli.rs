@@ -146,9 +146,52 @@ fn collect_flag_values(args: &[String], flag: &str) -> Vec<String> {
     out
 }
 
-/// Get a flag value that represents a file path, normalizing `./` prefix.
-fn get_path_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    get_flag_value(args, flag).map(|p| p.strip_prefix("./").unwrap_or(p))
+/// Normalize a user-provided path argument to a project-relative string.
+///
+/// - `"."` → `""` (whole project — matches MCP `module_overview` semantics)
+/// - `"./foo"` → `"foo"`
+/// - absolute path under `project_root` → relative portion (lexical first, canonical fallback for symlinks)
+/// - absolute path outside `project_root` → error
+/// - relative path → unchanged
+///
+/// Why: indexed `file_path` columns in SQLite are project-relative. When users
+/// paste an absolute path from an IDE (very common), the CLI used to silently
+/// return empty/wrong results (`overview` "No symbols found", `dead-code` exit-0
+/// "No dead code found", `deps` bogus barrel-scan fallback). All three are
+/// indistinguishable from real "no results" → user trusts the wrong answer.
+fn normalize_user_path(project_root: &Path, raw: &str) -> Result<String> {
+    if raw == "." {
+        return Ok(String::new());
+    }
+    if let Some(rest) = raw.strip_prefix("./") {
+        return Ok(rest.to_string());
+    }
+    let p = Path::new(raw);
+    if !p.is_absolute() {
+        return Ok(raw.to_string());
+    }
+    if let Ok(rel) = p.strip_prefix(project_root) {
+        return Ok(rel.to_string_lossy().into_owned());
+    }
+    if let (Ok(canon_p), Ok(canon_root)) = (p.canonicalize(), project_root.canonicalize()) {
+        if let Ok(rel) = canon_p.strip_prefix(&canon_root) {
+            return Ok(rel.to_string_lossy().into_owned());
+        }
+    }
+    anyhow::bail!(
+        "path '{}' is outside the project root '{}' \u{2014} use a relative path or one under the project root",
+        raw, project_root.display()
+    );
+}
+
+/// Get a flag value that represents a file path, normalized to project-relative.
+/// Returns `Ok(None)` if the flag is absent. Errs if the path is absolute and
+/// outside `project_root` (callers want `.as_deref()` for `Option<&str>` shape).
+fn get_path_flag(args: &[String], project_root: &Path, flag: &str) -> Result<Option<String>> {
+    match get_flag_value(args, flag) {
+        Some(v) => Ok(Some(normalize_user_path(project_root, v)?)),
+        None => Ok(None),
+    }
 }
 
 /// Parse a numeric flag value, printing a warning on invalid input and falling back to default.
@@ -760,7 +803,22 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
 /// `--last N` limits to the most recent N sessions. `--json` emits structured output.
 pub fn cmd_stats(project_root: &Path, args: &[String]) -> Result<()> {
     let json_mode = has_flag(args, "--json");
-    let last_n = get_flag_value(args, "--last").and_then(|s| s.parse::<usize>().ok());
+    // `--last abc` used to fall through `.ok()` silently and show all sessions —
+    // exactly opposite of the user's intent. Match other commands' parse_flag_or
+    // pattern (warn + ignore-the-bad-arg) so the contract is consistent.
+    let last_n = match get_flag_value(args, "--last") {
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                eprintln!(
+                    "[code-graph] Warning: invalid value '{}' for --last, showing all sessions",
+                    s
+                );
+                None
+            }
+        },
+        None => None,
+    };
 
     let usage_path = project_root.join(CODE_GRAPH_DIR).join("usage.jsonl");
     if !usage_path.exists() {
@@ -1408,6 +1466,12 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
         ))?;
 
     let direction = get_flag_value(args, "--direction").unwrap_or("both");
+    // Validate --direction at the CLI layer (matches cmd_deps). Without this,
+    // a typo only surfaces *after* ambiguity resolution — confusing UX where
+    // the user fixes ambiguity, retries, and is then told the direction is bad.
+    if !matches!(direction, "callers" | "callees" | "both") {
+        anyhow::bail!("--direction must be one of: callers, callees, both");
+    }
     // Lower-bound only: pass user's requested depth to the engine so
     // `requested_max_depth` in the JSON reflects the actual user input.
     // The engine caps to CALL_GRAPH_MAX_DEPTH internally and reports the
@@ -1417,7 +1481,8 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
     let include_tests = has_flag(args, "--include-tests");
-    let explicit_file = get_path_flag(args, "--file");
+    let explicit_file_owned = get_path_flag(args, project_root, "--file")?;
+    let explicit_file = explicit_file_owned.as_deref();
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -1645,7 +1710,8 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
 
     let depth: i32 = parse_flag_or(args, "--depth", 3_i32).clamp(1, 20);
     let json_mode = has_flag(args, "--json");
-    let explicit_file = get_path_flag(args, "--file");
+    let explicit_file_owned = get_path_flag(args, project_root, "--file")?;
+    let explicit_file = explicit_file_owned.as_deref();
     let change_type = get_flag_value(args, "--change-type").unwrap_or("behavior");
     if !matches!(change_type, "signature" | "behavior" | "remove") {
         anyhow::bail!("--change-type must be one of: signature, behavior, remove");
@@ -1934,11 +2000,13 @@ pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
     if raw_path.is_empty() {
         anyhow::bail!("path must not be empty — use '.' to scan the whole project root");
     }
-    // Normalize: strip leading "./" and treat bare "." as empty prefix (match all).
-    // Mirrors MCP `tool_module_overview` so `cd <proj>; code-graph-mcp overview .`
-    // returns the whole project the same way `module_overview path="."` does.
-    let path_prefix = raw_path.strip_prefix("./").unwrap_or(raw_path);
-    let path_prefix = if path_prefix == "." { "" } else { path_prefix };
+    // Normalize: strip leading "./", treat bare "." as empty prefix, and resolve
+    // absolute paths under the project root to their relative portion. Mirrors MCP
+    // `tool_module_overview` for "./"/"." and additionally supports paste-from-IDE
+    // absolute paths (the indexed `file_path` column is project-relative, so
+    // unnormalized absolute paths returned "No symbols found").
+    let path_prefix_owned = normalize_user_path(project_root, raw_path)?;
+    let path_prefix = path_prefix_owned.as_str();
 
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
@@ -2060,7 +2128,8 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
     let compact = has_flag(args, "--compact");
     let include_refs = has_flag(args, "--include-refs") || has_flag(args, "--include-references") || has_flag(args, "--refs");
     let include_impact = has_flag(args, "--include-impact") || has_flag(args, "--impact");
-    let file_filter = get_path_flag(args, "--file");
+    let file_filter_owned = get_path_flag(args, project_root, "--file")?;
+    let file_filter = file_filter_owned.as_deref();
     let context_lines_explicit: Option<usize> = if get_flag_value(args, "--context-lines").is_some() {
         Some(parse_flag_or(args, "--context-lines", 0_usize))
     } else {
@@ -2120,19 +2189,43 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
             ))?;
 
         let nodes = if let Some(fp) = file_filter {
-            queries::get_nodes_by_file_path(conn, fp)?
+            let mut found: Vec<_> = queries::get_nodes_by_file_path(conn, fp)?
                 .into_iter()
                 .filter(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
-                .collect::<Vec<_>>()
-        } else {
-            let mut found = queries::get_nodes_by_name(conn, symbol)?;
-            // Fallback: try as qualified name (e.g. "McpServer.handle_message")
+                .collect();
+            // Same `Class.method` fallback as the name path: if exact match fails
+            // but the symbol has a dot, fall back to the base name within the file.
+            // Why: parsers populate qualified_name inconsistently across languages
+            // (Rust `impl` blocks: yes; free functions: no), so the literal-match
+            // filter above used to silently miss legitimate symbols.
             if found.is_empty() && symbol.contains('.') {
                 if let Some(base_name) = symbol.rsplit('.').next() {
-                    found = queries::get_nodes_by_name(conn, base_name)?
+                    found = queries::get_nodes_by_file_path(conn, fp)?
                         .into_iter()
-                        .filter(|n| n.qualified_name.as_deref() == Some(symbol))
+                        .filter(|n| n.name == base_name)
                         .collect();
+                }
+            }
+            found
+        } else {
+            let mut found = queries::get_nodes_by_name(conn, symbol)?;
+            // `Class.method` fallback: when no node has the exact qualified name
+            // stored in DB, prefer nodes whose qualified_name matches; otherwise
+            // fall back to all nodes with the base name. Without this fallback,
+            // `show McpServer.lock_or_recover` was reporting "Symbol not found"
+            // even though `callgraph` resolves the same input via prefix-strip.
+            if found.is_empty() && symbol.contains('.') {
+                if let Some(base_name) = symbol.rsplit('.').next() {
+                    let by_name = queries::get_nodes_by_name(conn, base_name)?;
+                    let any_qualified = by_name.iter()
+                        .any(|n| n.qualified_name.as_deref() == Some(symbol));
+                    if any_qualified {
+                        found = by_name.into_iter()
+                            .filter(|n| n.qualified_name.as_deref() == Some(symbol))
+                            .collect();
+                    } else {
+                        found = by_name;
+                    }
                 }
             }
             found
@@ -2483,7 +2576,8 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!(
             "Usage: code-graph-mcp deps <file> [--direction outgoing|incoming|both] [--depth N] [--json]"
         ))?;
-    let file_path = raw_file_path.strip_prefix("./").unwrap_or(raw_file_path);
+    let file_path_owned = normalize_user_path(project_root, raw_file_path)?;
+    let file_path = file_path_owned.as_str();
 
     let direction = get_flag_value(args, "--direction").unwrap_or("both");
     if !matches!(direction, "outgoing" | "incoming" | "both") {
@@ -2772,7 +2866,8 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
 }
 
 pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
-    let explicit_file = get_path_flag(args, "--file");
+    let explicit_file_owned = get_path_flag(args, project_root, "--file")?;
+    let explicit_file = explicit_file_owned.as_deref();
     let relation = get_flag_value(args, "--relation");
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
@@ -2930,7 +3025,11 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
 /// Find dead code: orphans and exported-unused symbols.
 /// CLI equivalent of MCP `find_dead_code`.
 pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
-    let path_filter = get_positional(args, 0).map(|p| p.strip_prefix("./").unwrap_or(p));
+    let path_filter_owned: Option<String> = match get_positional(args, 0) {
+        Some(p) => Some(normalize_user_path(project_root, p)?),
+        None => None,
+    };
+    let path_filter = path_filter_owned.as_deref();
     // Accept both --node-type (preferred, matches `search` CLI + MCP param) and --type (legacy).
     let type_filter = get_flag_value(args, "--node-type")
         .or_else(|| get_flag_value(args, "--type"));
@@ -3516,5 +3615,68 @@ mod tests {
         assert_eq!(s.full_index_ms_sum, 2000);
         assert_eq!(s.incr_count, 8);
         assert_eq!(s.files_indexed, 60);
+    }
+
+    // --- normalize_user_path ---
+    // Indexed file_path columns are project-relative; users who paste absolute
+    // paths from an IDE used to get silent "no results" across overview/deps/dead-code.
+
+    #[test]
+    fn test_normalize_user_path_dot_means_whole_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(normalize_user_path(tmp.path(), ".").unwrap(), "");
+    }
+
+    #[test]
+    fn test_normalize_user_path_strips_dot_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(normalize_user_path(tmp.path(), "./src/parser").unwrap(), "src/parser");
+    }
+
+    #[test]
+    fn test_normalize_user_path_passes_relative_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(normalize_user_path(tmp.path(), "src/parser").unwrap(), "src/parser");
+        assert_eq!(normalize_user_path(tmp.path(), "src/parser/").unwrap(), "src/parser/");
+    }
+
+    #[test]
+    fn test_normalize_user_path_absolute_under_root_lexical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let abs = root.join("src/parser");
+        assert_eq!(normalize_user_path(root, abs.to_str().unwrap()).unwrap(), "src/parser");
+    }
+
+    #[test]
+    fn test_normalize_user_path_absolute_outside_root_errors() {
+        let tmp_root = tempfile::tempdir().unwrap();
+        let tmp_other = tempfile::tempdir().unwrap();
+        let abs_outside = tmp_other.path().join("foo.rs");
+        let err = normalize_user_path(tmp_root.path(), abs_outside.to_str().unwrap()).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("outside the project root"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_normalize_user_path_absolute_under_root_canonicalize_via_symlink() {
+        // Symlink case: lexical strip fails but canonicalize succeeds.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/parser")).unwrap();
+        let link_root = tmp.path().parent().unwrap().join(format!(
+            "cg-norm-link-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&link_root);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root, &link_root).unwrap();
+        #[cfg(unix)]
+        {
+            let abs_via_link = link_root.join("src/parser");
+            let res = normalize_user_path(root, abs_via_link.to_str().unwrap()).unwrap();
+            assert_eq!(res, "src/parser");
+            let _ = std::fs::remove_file(&link_root);
+        }
     }
 }

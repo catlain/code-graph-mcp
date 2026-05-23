@@ -1,5 +1,85 @@
 # Changelog
 
+## v0.32.3 — CLI path normalization + enum-arg early validation
+
+Three-fix patch bundling end-to-end dogfood findings. Two of the three
+were *silent wrong-answer* bugs (worst kind: no error, no exit code,
+just incorrect output). The third tightens MCP/CLI error attribution
+so a single typo doesn't surface as two cascading errors.
+
+### Fixed
+
+- **CLI commands accept absolute paths under the project root.** The
+  indexed `file_path` column is project-relative; users who pasted
+  absolute paths from an IDE used to get:
+  - `overview /abs/path` → "No symbols found" (silent wrong, exit 1)
+  - `dead-code /abs/path` → exit-0 "No dead code found" (most dangerous —
+    user trusts the wrong answer)
+  - `deps /abs/path` → bogus `barrel_scan` fallback with empty
+    `depended_by`/`depends_on` (user thinks file has no deps)
+  - `callgraph X --file /abs/path` (also `impact`/`show`/`refs`) → empty
+    filter, no edges, false "Symbol not found"
+  v0.32.3 introduces `normalize_user_path(project_root, raw)` and
+  routes all positional path args (`overview`, `deps`, `dead-code`)
+  plus all `--file` flags through it. Behavior:
+  - `.` → `""` (whole project, matches MCP `module_overview` semantics)
+  - `./foo` → `foo`
+  - absolute under root → relative portion (lexical strip; canonicalize
+    fallback covers symlinks)
+  - absolute outside root → explicit error, *not* silent wrong
+  - relative path → unchanged
+  Distinct from MCP-side `tool_module_overview` which *rejects* absolute
+  paths outright — CLI is more lenient because real humans paste from
+  IDE. Regression coverage in `tests/cli_e2e.rs::*absolute_path*`.
+
+- **`get_call_graph` / `dependency_graph` / `module_overview` validate
+  enum args at tool entry (MCP + CLI).** Previously a bogus
+  `direction` / `deps_direction` value first hit the ambiguity check
+  (which echoed the bogus value back in the JSON), and only after the
+  user disambiguated with `file_path` would the underlying graph layer
+  reject the enum — two errors for one mistake. Worse,
+  `module_overview deps_direction=bogus include_deps=true` swallowed
+  the downstream `tool_dependency_graph` error into a
+  `dependencies_unavailable` text field and returned
+  `isError=false`, so agents/scripts treated the call as successful.
+  v0.32.3 gates each enum-valued arg at the tool/cmd entry with
+  `matches!()`, matching the schema enum exactly and echoing the bad
+  value in the error message. Affected:
+  - MCP `get_call_graph` `direction`
+  - MCP `dependency_graph` `direction`
+  - MCP `module_overview` `deps_direction`
+  - CLI `callgraph --direction`
+  Regression coverage in
+  `tests/mcp_stdio_integration.rs::mcp_enum_args_validated_at_tool_entry`
+  and `tests/cli_e2e.rs::test_cli_callgraph_invalid_direction_errors_early`.
+
+- **`show <Class.method>` falls back to base-name match when the DB
+  doesn't store the qualified prefix.** Parsers populate
+  `qualified_name` inconsistently (Rust `impl` blocks: yes; free
+  functions: no). The old `show` fallback required an exact qualified
+  match and silently returned "Symbol not found" when the DB only had
+  the base name — even though `callgraph <Class.method>` resolved the
+  same input fine via prefix-strip. v0.32.3: prefer exact qualified
+  matches when any exist; otherwise fall back to all base-name nodes.
+  No regression for the qualified case (`show Database.open` still
+  uniquely matches the Rust `impl Database::open`). Regression
+  coverage in
+  `tests/cli_e2e.rs::test_cli_show_qualified_falls_back_to_base_name`.
+
+- **`stats --last <non-integer>` now warns instead of silently
+  showing all sessions.** Previously `--last abc` parsed through
+  `.ok()` and fell through to "no filter" — exactly opposite of the
+  user's stated intent. Aligned with `parse_flag_or`'s pattern
+  (warn-and-default) used by other numeric flags.
+
+### Tests
+
+11 new regression tests across `cli_e2e` (+8: abs-path on
+`overview`/`deps`/`dead-code`, callgraph invalid-direction,
+show qualified fallback, plus 5 `normalize_user_path` unit tests in
+`src/cli.rs`) and `mcp_stdio_integration` (+1 enum-arg validation).
+Full suite: 595 passing.
+
 ## v0.32.2 — tmp-dir containment + healthCheck repair verification
 
 Three-fix patch bundling reviewer follow-ups from v0.32.1 (M3/M4) and a

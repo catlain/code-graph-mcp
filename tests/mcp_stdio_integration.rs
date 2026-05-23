@@ -299,3 +299,43 @@ fn mcp_caller_count_prod_only_and_test_symbol_error_explains() {
         err_text
     );
 }
+
+/// Regression: enum-valued direction/deps_direction args must be validated at the
+/// tool entry. Previously, `get_call_graph` echoed a bogus direction back through
+/// the ambiguity-resolution path (two errors for one mistake), `dependency_graph`
+/// only rejected after index-freshness checks ran, and `module_overview` silently
+/// swallowed bogus `deps_direction` into a `dependencies_unavailable` field.
+#[test]
+fn mcp_enum_args_validated_at_tool_entry() {
+    let project = setup_fixture_project();
+    let mut client = McpClient::spawn(project.path());
+
+    let tool_err = |resp: &Value| -> String {
+        if resp["result"]["isError"].as_bool() == Some(true) {
+            resp["result"]["content"][0]["text"].as_str().unwrap_or("").to_string()
+        } else {
+            panic!("expected isError=true, got: {}", resp);
+        }
+    };
+
+    // get_call_graph direction enum
+    let r = client.call_tool("get_call_graph", json!({
+        "symbol_name": "target_fn", "direction": "sideways",
+    }));
+    assert!(tool_err(&r).contains("direction must be one of: callers, callees, both"),
+        "get_call_graph should reject bad direction at entry; got: {}", tool_err(&r));
+
+    // dependency_graph direction enum
+    let r = client.call_tool("dependency_graph", json!({
+        "file_path": "src/lib.rs", "direction": "upside_down",
+    }));
+    assert!(tool_err(&r).contains("direction must be one of: outgoing, incoming, both"),
+        "dependency_graph should reject bad direction at entry; got: {}", tool_err(&r));
+
+    // module_overview deps_direction enum (this was silently swallowed before)
+    let r = client.call_tool("module_overview", json!({
+        "path": "src/lib.rs", "include_deps": true, "deps_direction": "upside_down",
+    }));
+    assert!(tool_err(&r).contains("deps_direction must be one of"),
+        "module_overview should reject bad deps_direction at entry; got: {}", tool_err(&r));
+}

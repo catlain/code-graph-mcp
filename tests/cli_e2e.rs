@@ -249,6 +249,19 @@ fn test_cli_callgraph_nonexistent() {
     assert!(stderr.contains("No call graph results"), "should report not found");
 }
 
+// Regression: `--direction` must be validated at the CLI layer (like cmd_deps does).
+// Without early validation a typo only surfaced after ambiguity resolution: user
+// got "Ambiguous symbol" first, retried with --file, then was told "invalid direction" —
+// two error messages for one mistake.
+#[test]
+fn test_cli_callgraph_invalid_direction_errors_early() {
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "validateToken", "--direction", "bogus"]);
+    assert_eq!(code, 1, "bad --direction should error; stderr={stderr:?}");
+    assert!(stderr.contains("--direction must be one of"),
+        "stderr should explain the valid set; got: {stderr:?}");
+}
+
 #[test]
 fn test_cli_callgraph_json() {
     let project = setup_indexed_project();
@@ -325,6 +338,23 @@ fn test_cli_show_nonexistent() {
     let (_, stderr, code) = run_cli(&project, &["show", "nonexistent_fn"]);
     assert_ne!(code, 0, "nonexistent symbol should return non-zero exit code");
     assert!(stderr.contains("Symbol not found"));
+}
+
+// Regression: when DB doesn't store `Class.method` as qualified_name (free
+// functions, languages where parser omits class prefix), `show Foo.bar` used
+// to fail "Symbol not found" even though `callgraph Foo.bar` resolved fine.
+// New behavior: fall back to base-name match — consistent with callgraph/impact.
+#[test]
+fn test_cli_show_qualified_falls_back_to_base_name() {
+    let project = setup_indexed_project();
+    // `validateToken` is a free function — its qualified_name is just "validateToken",
+    // not "Auth.validateToken". Old fallback filter required exact qualified match
+    // and silently returned [] when DB had only the base name.
+    let (stdout, stderr, code) = run_cli(&project, &["show", "Imaginary.validateToken", "--json"]);
+    assert_eq!(code, 0, "qualified-name with no DB match should fall back to base name; stderr={stderr:?}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = v.as_array().unwrap();
+    assert!(!arr.is_empty(), "should find validateToken via base-name fallback; got {stdout:?}");
 }
 
 #[test]
@@ -409,6 +439,56 @@ fn test_cli_overview_dot_means_project_root() {
     assert_eq!(code, 0, "overview . should succeed; got stdout={stdout:?}");
     assert!(stdout.contains("validateToken"),
         "overview . should list symbols across the project; got: {stdout:?}");
+}
+
+// Regression: absolute paths under the project root must normalize to project-relative.
+// Indexed `file_path` columns are project-relative, so users pasting absolute paths
+// from an IDE previously got "No symbols found" (overview), silent exit-0 "No dead
+// code found" (dead-code), or bogus barrel_scan fallback (deps).
+#[test]
+fn test_cli_overview_absolute_path_under_root() {
+    let project = setup_indexed_project();
+    let abs = project.path().join("src");
+    let (stdout, stderr, code) = run_cli(&project, &["overview", abs.to_str().unwrap()]);
+    assert_eq!(code, 0, "absolute path under root should succeed; stderr={stderr:?}");
+    assert!(stdout.contains("validateToken"),
+        "should list symbols just like `overview src`; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_overview_absolute_path_outside_root_errors() {
+    let project = setup_indexed_project();
+    // Create a sibling dir outside the project for a deterministic "outside" path.
+    let outside = TempDir::new().unwrap();
+    let (_, stderr, code) = run_cli(&project, &["overview", outside.path().to_str().unwrap()]);
+    assert_eq!(code, 1, "absolute path outside root should error");
+    assert!(stderr.contains("outside the project root"),
+        "stderr should explain the path is outside the project root; got {stderr:?}");
+}
+
+#[test]
+fn test_cli_deps_absolute_path_under_root() {
+    let project = setup_indexed_project();
+    let abs = project.path().join("src/api.ts");
+    let (stdout, _, code) = run_cli(&project, &["deps", abs.to_str().unwrap(), "--json"]);
+    assert_eq!(code, 0);
+    // Must surface the relative path in JSON + real depends_on edges (not barrel_scan).
+    assert!(stdout.contains("\"file\":\"src/api.ts\""),
+        "deps JSON should normalize file to project-relative; got {stdout:?}");
+    assert!(!stdout.contains("barrel_scan"),
+        "deps must find tracked edges for abs path, not fall back to barrel_scan; got {stdout:?}");
+}
+
+#[test]
+fn test_cli_dead_code_absolute_path_under_root_matches_relative() {
+    let project = setup_indexed_project();
+    let (rel_stdout, _, rel_code) = run_cli(&project, &["dead-code", "src"]);
+    let abs = project.path().join("src");
+    let (abs_stdout, _, abs_code) = run_cli(&project, &["dead-code", abs.to_str().unwrap()]);
+    assert_eq!(rel_code, abs_code,
+        "abs path under root should match relative behavior exactly");
+    assert_eq!(rel_stdout, abs_stdout,
+        "abs/rel results must be identical (was: abs silently returned no results)");
 }
 
 // Regression: empty `--json` overview must keep stdout clean (`[]`) and avoid the

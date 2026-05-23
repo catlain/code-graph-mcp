@@ -275,6 +275,14 @@ impl McpServer {
         let direction = args.get("direction")
             .and_then(|v| v.as_str())
             .unwrap_or("both");
+        // Validate at tool entry so the error is clean — `get_import_tree` does
+        // reject bad direction too, but only AFTER index-freshness checks ran.
+        if !matches!(direction, "outgoing" | "incoming" | "both") {
+            return Err(anyhow!(
+                "direction must be one of: outgoing, incoming, both (got '{}')",
+                direction
+            ));
+        }
         let depth = args.get("depth")
             .and_then(|v| v.as_i64())
             .unwrap_or(2)

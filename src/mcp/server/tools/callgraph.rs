@@ -73,6 +73,16 @@ impl McpServer {
             .or_else(|| nonblank(args["function_name"].as_str()))
             .ok_or_else(|| anyhow!("symbol_name or route_path is required"))?;
         let direction = args["direction"].as_str().unwrap_or("both");
+        // Validate enum at tool entry. Without this, a bogus direction first hit
+        // the ambiguity check (which echoes the bad value back) — only after the
+        // user disambiguated with file_path would the underlying graph layer
+        // reject it. Two errors for one mistake.
+        if !matches!(direction, "callers" | "callees" | "both") {
+            return Err(anyhow!(
+                "direction must be one of: callers, callees, both (got '{}')",
+                direction
+            ));
+        }
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
         // Empty file_path is identical to absent — without this the
         // disambiguation/fuzzy path treats Some("") as "filter by this exact
