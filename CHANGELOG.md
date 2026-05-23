@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.32.1 — block-tier false-positive fixes + foreign-strip risk reduction
+
+Four-finding code-review patch on v0.32.0. All findings were `Important`
+(not Critical, not data-loss), but they hit exactly the spec the v0.32.0
+block tier was designed to satisfy ("narrowest case"), so they get fast
+follow-up rather than a v0.33 bundle.
+
+### Fixed
+
+- **Block tier no longer false-positives on identifier-shaped PATH ARGUMENTS** —
+  v0.32.0's `shouldBlock` ran `IDENTIFIER_LIKE.test(cmd)` against the full
+  command, so `grep -rn "abc" src/EmbeddingModel.rs` blocked because the
+  filename contains CamelCase. Same problem for snake_case directory names
+  (`src/some_module/...`). v0.32.1 adds `extractPatterns(cmd)` that pulls
+  quoted arguments out of the command and tests `IDENTIFIER_LIKE` against
+  the patterns only. Unquoted-pattern usage (`grep foo src/`) falls back to
+  hint behavior — conservative.
+- **`type` dropped from declaration-anchor keyword list; remaining anchors
+  pinned to pattern start** — `\btype\s+\w` matched "# type checking",
+  "some type X", and other comment-string scans. v0.32.1 drops `type`
+  (too common in English prose) and anchors `fn` / `def` / `class` /
+  `function` / `struct` / `impl` / `trait` to `^\s*` so they only fire
+  when the user is actually searching for a declaration.
+- **`isOurHookEntry` script-name fallback tightened** — v0.32.0 used
+  `cmd.includes('code-graph')` which would claim a user's own
+  `~/code-graph/foo.js`. v0.32.1 uses `MARKETPLACE_NAME` (`code-graph-mcp`)
+  instead. Foreign-entry strip risk eliminated.
+- **`doctor.js` report no longer prints two `'Hooks'` rows** — check 6
+  (healthCheck path validation) keeps `'Hooks'`; check 7 (settings.json
+  coverage) renamed to `'Hook coverage'`.
+
+### Internal
+
+- Dropped a `pluginRootDir()` function that duplicated the module-level
+  `PLUGIN_ROOT` constant.
+- Cleaned up `doctor.js` unused imports (`removeHooksFromSettings`,
+  `writeJsonAtomic`) that became dead when the v0.32.0 inversion replaced
+  the legacy strip path with `install()`-as-repair.
+
+### Testing
+
+- 437/437 plugin script tests pass (18 new). New coverage:
+  - `extractPatterns` matrix: single/multi quoted, env-prefixed verb,
+    `rg` / `ag` heads, no-quote conservative fallback, empty/null inputs
+  - I1 regressions: `"abc"` against CamelCase-named file, `"x"` against
+    snake_case directory, English-prose pattern with identifier-name
+    file path, unquoted-pattern hint fallback, inverse sanity (CamelCase
+    pattern + plain path still blocks)
+  - I4 regressions: `"# type checking"`, `"some type X"`, `"the def keyword"`
+    all hint (not block); real `"def calc_total"` and `"fn render"` still
+    block
+- E2E smoke (three inputs through the actual hook script, sandboxed
+  `.code-graph/index.db`): I1 case emits hint text, I4 case emits hint
+  text, real CamelCase symbol search emits JSON block envelope with
+  `permissionDecision: "deny"`. cargo check green.
+
+### Process
+
+Driven by `/superpowers:requesting-code-review` subagent on the
+`b5c907f..a25bee9` (v0.31.2..v0.32.0) range. Verdict was "With fixes
+— needs v0.32.1 patch"; this is that patch.
+
 ## v0.32.0 — re-route PreToolUse/PostToolUse/UserPromptSubmit via settings.json (root-cause fix for "hook never fired since v0.25.0")
 
 Architecture-level fix for a silent failure that turned every v0.25.0+ release
