@@ -172,17 +172,29 @@ function runDiagnostics() {
   }
 
   // 6. Hook paths validity
+  // healthCheck() auto-attempts install() when broken paths are detected and
+  // re-scans to verify; repaired:true is now contingent on the re-scan
+  // returning clean. If repaired:false despite install() running, the
+  // re-scan still found broken paths — surfacing 'remaining' makes that
+  // honest instead of telling the user we fixed nothing.
   const hookResult = healthCheck();
   if (hookResult.healthy) {
     results.push({ name: 'Hooks', status: 'ok', detail: 'all paths valid' });
-  } else {
+  } else if (hookResult.repaired) {
     results.push({
       name: 'Hooks',
-      status: hookResult.repaired ? 'ok' : 'warn',
-      detail: hookResult.repaired
-        ? `${hookResult.issues.length} issue(s) auto-repaired`
-        : `${hookResult.issues.length} invalid path(s)`,
-      fixId: hookResult.repaired ? undefined : 'hooks-invalid',
+      status: 'ok',
+      detail: `${hookResult.issues.length} issue(s) auto-repaired`,
+    });
+  } else {
+    const remainingCount = Array.isArray(hookResult.remaining)
+      ? hookResult.remaining.length
+      : hookResult.issues.length;
+    results.push({
+      name: 'Hooks',
+      status: 'warn',
+      detail: `${remainingCount} invalid path(s) — auto-repair did not resolve`,
+      fixId: 'hooks-invalid',
     });
   }
 
@@ -390,7 +402,7 @@ function runRepairs(results) {
         console.log('\n  Repairing hooks...');
         const { install } = require('./lifecycle');
         install();
-        console.log('  \u2705 Hooks repaired');
+        console.log('  \u2705 Hooks repaired \u2014 restart Claude Code to apply');
         fixed++;
         break;
       }

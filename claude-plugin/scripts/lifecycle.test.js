@@ -557,3 +557,107 @@ test('update() preserves foreign plugin hooks during upgrade', (t) => {
   assert.ok(ptu.some(e => e.description && e.description.includes('[code-graph-mcp v0.32+')),
     'update() must add our v0.32+ entries alongside the foreign one');
 });
+
+// ════════════════════════════════════════════════════════════════════
+// v0.32.2 — healthCheck post-repair re-verification
+// (Reviewer M3: repaired:true was set blindly after install() without
+//  re-scanning to confirm the issues actually resolved.)
+// ════════════════════════════════════════════════════════════════════
+
+function runHealthCheckInChild(homeDir) {
+  const code = `
+    const lc = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(lc.healthCheck()));
+  `;
+  const out = execFileSync(process.execPath, ['-e', code], {
+    env: { ...process.env, HOME: homeDir },
+    encoding: 'utf8',
+  });
+  return JSON.parse(out);
+}
+
+test('healthCheck on a clean state returns healthy:true and never sets remaining', (t) => {
+  const homeDir = mkHome(t);
+  // No settings.json, no registry — clean slate.
+  const r = runHealthCheckInChild(homeDir);
+  assert.equal(r.healthy, true, 'fresh empty state must be healthy');
+  assert.deepEqual(r.issues, [], 'no issues on empty state');
+  assert.equal(r.repaired, false, 'no repair runs when nothing was broken');
+  assert.equal(r.remaining, undefined, 'no remaining field when no repair attempted');
+});
+
+test('healthCheck repaired:true ONLY after post-repair re-scan returns clean', (t) => {
+  const homeDir = mkHome(t);
+  // Seed a hook entry whose path is broken AND carries our marker. install()
+  // will overwrite our entries with fresh absolute paths derived from
+  // __dirname (which is real in the test env), so the re-scan should be clean.
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  writeJson(settingsPath, {
+    hooks: {
+      PreToolUse: [{
+        matcher: 'Edit',
+        description: '[code-graph-mcp v0.32+] PreToolUse re-routed via settings.json (cache hooks.json silently ignored for this event by current CC)',
+        hooks: [{ type: 'command', command: 'node "/nonexistent/code-graph-mcp/pre-edit-guide.js"' }],
+      }],
+    },
+  });
+
+  const r = runHealthCheckInChild(homeDir);
+  assert.equal(r.healthy, false, 'pre-repair scan must have flagged the broken path');
+  assert.ok(r.issues.length >= 1, 'pre-repair issues must list the broken hook');
+  assert.equal(r.repaired, true, 'install() rewrote our entry → post-scan clean → repaired:true');
+  assert.deepEqual(r.remaining, [], 'remaining must be empty when repair succeeded');
+});
+
+test('healthCheck repaired:false when install() cannot resolve a flagged path', (t) => {
+  const homeDir = mkHome(t);
+  // Seed the registry with a non-`_previous` third-party provider whose path
+  // is broken. install() only manages the 'code-graph' registry entry, so
+  // the third-party entry survives untouched and the post-repair re-scan
+  // still flags it. This is the canonical "auto-repair could not fix it"
+  // path — previously the function lied and returned repaired:true anyway.
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+  writeJson(registryPath, [
+    { id: 'third-party-statusline', command: 'node "/nonexistent/foreign/sl.js"', needsStdin: false },
+  ]);
+
+  const r = runHealthCheckInChild(homeDir);
+  assert.equal(r.healthy, false, 'broken third-party path must be flagged on entry');
+  assert.ok(r.issues.some(i => i.type === 'registry' && i.id === 'third-party-statusline'),
+    'pre-repair issue list must contain the third-party entry');
+  assert.equal(r.repaired, false,
+    'install() does not touch third-party providers → re-scan still broken → repaired must be false');
+  assert.ok(Array.isArray(r.remaining), 'remaining must be present when install() was attempted');
+  assert.ok(r.remaining.some(i => i.id === 'third-party-statusline'),
+    'remaining must still contain the un-fixable third-party entry');
+});
+
+test('scanForBrokenPaths is exported and returns the issue structure', (t) => {
+  // Direct unit test of the extracted scanner — no install() side effects.
+  // Verifies the contract M3 relies on: a pure function whose return
+  // shape is what healthCheck composes its result from.
+  const homeDir = mkHome(t);
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  writeJson(settingsPath, {
+    hooks: {
+      PreToolUse: [{
+        matcher: 'Edit',
+        description: '[code-graph-mcp v0.32+] PreToolUse re-routed via settings.json (cache hooks.json silently ignored for this event by current CC)',
+        hooks: [{ type: 'command', command: 'node "/nonexistent/code-graph-mcp/pre-edit-guide.js"' }],
+      }],
+    },
+  });
+
+  const code = `
+    const lc = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(lc.scanForBrokenPaths()));
+  `;
+  const out = execFileSync(process.execPath, ['-e', code], {
+    env: { ...process.env, HOME: homeDir },
+    encoding: 'utf8',
+  });
+  const issues = JSON.parse(out);
+  assert.ok(Array.isArray(issues));
+  assert.ok(issues.some(i => i.type === 'hook' && i.event === 'PreToolUse' && i.path.includes('/nonexistent/')),
+    'scanForBrokenPaths must report the seeded broken hook entry');
+});

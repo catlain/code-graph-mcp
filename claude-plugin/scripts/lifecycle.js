@@ -595,9 +595,15 @@ function cleanupOldCacheVersions(keep = 3) {
 
 // --- Health Check ---
 // Validates all registered paths in settings.json point to existing scripts.
-// Returns { healthy, issues, repaired }.
+// Returns { healthy, issues, repaired, remaining }.
+//   issues:    pre-repair detection list (what was wrong on entry)
+//   repaired:  true only after a post-repair re-scan returned zero issues
+//              (was previously set blindly to true whenever install() ran,
+//              which would lie if install() couldn't actually fix something)
+//   remaining: post-repair detection list — present iff install() was invoked;
+//              empty array means repair succeeded
 
-function healthCheck() {
+function scanForBrokenPaths() {
   const settings = readJson(settingsPath()) || {};
   const issues = [];
 
@@ -635,18 +641,32 @@ function healthCheck() {
     }
   }
 
-  // Auto-repair if issues found
-  let repaired = false;
-  if (issues.length > 0) {
-    install();
-    repaired = true;
+  return issues;
+}
+
+function healthCheck() {
+  const issues = scanForBrokenPaths();
+
+  if (issues.length === 0) {
+    return { healthy: true, issues, repaired: false };
   }
 
-  return { healthy: issues.length === 0, issues, repaired };
+  // Attempt auto-repair, then re-scan to confirm the issues actually went
+  // away. install() may legitimately fail to resolve a problem (binary path
+  // permanently gone, registry corrupted, etc.) and the previous code lied
+  // by always returning repaired:true.
+  install();
+  const remaining = scanForBrokenPaths();
+  return {
+    healthy: false,
+    issues,
+    repaired: remaining.length === 0,
+    remaining,
+  };
 }
 
 module.exports = {
-  install, uninstall, update, healthCheck, checkScopeConflict,
+  install, uninstall, update, healthCheck, scanForBrokenPaths, checkScopeConflict,
   isPluginExplicitlyDisabled, isPluginInactive, cleanupDisabledStatusline,
   readManifest, readJson, writeJsonAtomic,
   readRegistry, writeRegistry,

@@ -112,9 +112,11 @@ themselves were never loaded by CC for non-SessionStart events.
 
 - **PreToolUse Bash block tier** in `pre-grep-guide.js`. Raw `grep -r{n}` /
   `rg` / `ag` against an indexed source tree with an identifier-shaped
-  pattern is now blocked via `{ hookSpecificOutput: { permissionDecision:
-  "deny", permissionDecisionReason: "<cg equivalent>" } }` (current Claude
-  Code schema). Bash is the comfort-zone leak — 15d audit measured 429 raw
+  pattern is now blocked via `{ hookSpecificOutput: { hookEventName:
+  "PreToolUse", permissionDecision: "deny", permissionDecisionReason:
+  "<cg equivalent>" } }` (current Claude Code schema — the
+  `hookEventName` discriminator is required for CC to recognize the
+  permission verdict). Bash is the comfort-zone leak — 15d audit measured 429 raw
   grep vs 191 functional CLI (~13× preference). Block tier targets the
   narrowest "I'm searching for a symbol" subset: bare flags (no `-l`,
   `--include`, `-A`/`-B`/`-C`), identifier-shaped pattern (CamelCase ≥4ch,
