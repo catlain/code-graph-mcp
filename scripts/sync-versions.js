@@ -7,6 +7,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 const version = process.argv[2];
 if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
@@ -91,3 +92,28 @@ for (const { file, json, transform } of updates) {
 }
 
 console.log(`\nVersion synced to ${version} (${changed} file${changed !== 1 ? 's' : ''} updated)`);
+
+// Keep the dev MCP binary (.mcp.json → ./target/release/code-graph-mcp) aligned
+// with the version we just wrote into Cargo.toml. Without this, every release
+// leaves target/release/code-graph-mcp one version behind, and the next dev
+// session's MCP `instructions` field reports the stale version.
+// Opt-out: SYNC_VERSIONS_SKIP_BUILD=1 (tests + CI scenarios where building
+// the actual crate is irrelevant or impossible).
+if (process.env.SYNC_VERSIONS_SKIP_BUILD === '1') {
+  console.log('\nSkipped cargo build (SYNC_VERSIONS_SKIP_BUILD=1).');
+} else {
+  console.log('\nRebuilding release binary so local MCP picks up new version...');
+  const t0 = Date.now();
+  const result = spawnSync('cargo', ['build', '--release'], {
+    cwd: root,
+    stdio: 'inherit',
+  });
+  const dt = ((Date.now() - t0) / 1000).toFixed(1);
+  if (result.status !== 0) {
+    console.error(`\nERROR: cargo build --release exited ${result.status} after ${dt}s.`);
+    console.error('Version files were updated but target/release/code-graph-mcp is stale.');
+    console.error('Fix the build, then run: cargo build --release');
+    process.exit(2);
+  }
+  console.log(`\nRelease binary rebuilt in ${dt}s — target/release/code-graph-mcp now ${version}`);
+}

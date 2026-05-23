@@ -86,12 +86,18 @@ function readJson(p) {
   return JSON.parse(fs.readFileSync(p, 'utf8'));
 }
 
+// Test env: skip the auto-rebuild step. The fixture is not a real Cargo crate,
+// so a real `cargo build --release` would fail or scan the host system. All
+// existing tests assert version-sync behavior, not build behavior — they set
+// SYNC_VERSIONS_SKIP_BUILD=1. Dedicated build/skip tests live further down.
+const SKIP_BUILD_ENV = { ...process.env, SYNC_VERSIONS_SKIP_BUILD: '1' };
+
 test('sync-versions bumps Cargo.toml + 8 JSON files atomically', (t) => {
   const root = setupFixture(t);
   const stdout = execFileSync(
     process.execPath,
     [path.join(root, 'scripts', 'sync-versions.js'), '1.2.3'],
-    { cwd: root, stdio: 'pipe', encoding: 'utf8' },
+    { cwd: root, stdio: 'pipe', encoding: 'utf8', env: SKIP_BUILD_ENV },
   );
   // Lock the success-path total. A regression that drops one of the 9 targets
   // without removing the per-target assertions below would otherwise pass
@@ -129,7 +135,7 @@ test('sync-versions rejects invalid semver and exits non-zero', (t) => {
   const result = require('child_process').spawnSync(
     process.execPath,
     [path.join(root, 'scripts', 'sync-versions.js'), 'not-a-version'],
-    { cwd: root, stdio: 'pipe', encoding: 'utf8' },
+    { cwd: root, stdio: 'pipe', encoding: 'utf8', env: SKIP_BUILD_ENV },
   );
   assert.equal(result.status, 1, 'invalid semver must exit 1');
   assert.match(result.stderr, /Usage:/, 'stderr should print usage hint');
@@ -149,7 +155,7 @@ test('sync-versions skips files that are missing without erroring', (t) => {
   const result = require('child_process').spawnSync(
     process.execPath,
     [path.join(root, 'scripts', 'sync-versions.js'), '1.2.3'],
-    { cwd: root, stdio: 'pipe', encoding: 'utf8' },
+    { cwd: root, stdio: 'pipe', encoding: 'utf8', env: SKIP_BUILD_ENV },
   );
   assert.equal(result.status, 0, 'exit 0 even when a target is missing');
   // skip messages go to stderr (console.warn); success summary lands on stdout.
@@ -167,8 +173,56 @@ test('sync-versions skips files that are missing without erroring', (t) => {
 test('sync-versions is idempotent — running with the same version reports unchanged', (t) => {
   const root = setupFixture(t, '1.2.3');
   const out = execFileSync(process.execPath, [path.join(root, 'scripts', 'sync-versions.js'), '1.2.3'], {
-    cwd: root, stdio: 'pipe', encoding: 'utf8',
+    cwd: root, stdio: 'pipe', encoding: 'utf8', env: SKIP_BUILD_ENV,
   });
   // All files are already at 1.2.3 — script should report 0 updated.
   assert.match(out, /\(0 files? updated\)/, 'idempotent run must report 0 changes');
+});
+
+test('SYNC_VERSIONS_SKIP_BUILD=1 skips cargo build and announces the skip', (t) => {
+  const root = setupFixture(t);
+  const stdout = execFileSync(
+    process.execPath,
+    [path.join(root, 'scripts', 'sync-versions.js'), '1.2.3'],
+    { cwd: root, stdio: 'pipe', encoding: 'utf8', env: SKIP_BUILD_ENV },
+  );
+  assert.match(stdout, /Skipped cargo build \(SYNC_VERSIONS_SKIP_BUILD=1\)/,
+    'must print the skip notice so the operator knows binary may be stale');
+  assert.doesNotMatch(stdout, /Rebuilding release binary/,
+    'must not run the build step when SKIP env is set');
+});
+
+test('default (no SKIP env) attempts cargo build — fixture is not a crate so build fails with exit 2', (t) => {
+  const root = setupFixture(t);
+  // Sanity: this fixture has Cargo.toml [package] but no src/, so a real
+  // `cargo build --release` will error. We exploit that to confirm the build
+  // step runs (and that we surface the right exit code + diagnostic) without
+  // needing to vendor a fake cargo or actually compile anything.
+  //
+  // The PATH passthrough is required so `cargo` resolves. If cargo is missing
+  // from the host PATH, status will be null (ENOENT) and the assertion below
+  // still catches non-zero-exit semantics.
+  const env = { ...process.env };
+  delete env.SYNC_VERSIONS_SKIP_BUILD;
+  const result = require('child_process').spawnSync(
+    process.execPath,
+    [path.join(root, 'scripts', 'sync-versions.js'), '1.2.3'],
+    { cwd: root, stdio: 'pipe', encoding: 'utf8', env },
+  );
+
+  // Version files still got written before build was attempted.
+  assert.equal(readJson(path.join(root, 'package.json')).version, '1.2.3',
+    'version sync must happen before build so partial-failure does not leave files unchanged');
+
+  // Build step ran (its banner is on stdout).
+  assert.match(result.stdout, /Rebuilding release binary/,
+    'default invocation must announce + attempt the build');
+
+  // Failed build surfaces exit 2 + remediation hint.
+  assert.equal(result.status, 2,
+    'cargo build failure must exit 2 (distinct from semver-parse exit 1)');
+  assert.match(result.stderr, /Version files were updated but target\/release\/code-graph-mcp is stale/,
+    'stderr must tell the operator what state the repo is in');
+  assert.match(result.stderr, /Fix the build, then run: cargo build --release/,
+    'stderr must give the recovery command');
 });
