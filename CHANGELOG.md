@@ -1,5 +1,106 @@
 # Changelog
 
+## v0.32.0 — re-route PreToolUse/PostToolUse/UserPromptSubmit via settings.json (root-cause fix for "hook never fired since v0.25.0")
+
+Architecture-level fix for a silent failure that turned every v0.25.0+ release
+into theater. The plugin's PreToolUse hooks (`pre-edit-guide.js`, `pre-grep-guide.js`,
+`pre-read-guide.js`), the PostToolUse incremental indexer, and the UserPromptSubmit
+context push **never actually fired** since v0.25.0. Only SessionStart worked.
+
+### The bug
+
+`claude-plugin/hooks/hooks.json` registered every event type (PreToolUse,
+PostToolUse, UserPromptSubmit, SessionStart). Empirical 2026-05-24 diagnostic in
+a real Claude Code session:
+
+- 25+ Bash tool calls produced **zero** `PreToolUse:Bash` events in the session jsonl
+- **Zero** `/tmp/.code-graph-bash-*` cooldown flags (the hook scripts were never spawned)
+- `.code-graph/index.db` mtime was the SessionStart timestamp — `incremental-index.js`
+  (PostToolUse:Edit handler) never ran despite 5+ Edits
+
+Cross-validated by inspecting `~/.claude/plugins/cache/sdsrss/claude-mem-lite/*/hooks/hooks.json`
+— claude-mem-lite ships `"hooks": {}` with the note "Hooks managed by install.mjs
+in settings.json — this file cleared to prevent duplicates". The pattern is well-known
+in the ecosystem; code-graph-mcp was the outlier.
+
+The v0.31.1 "PreToolUse hooks never fired since v0.25.0" fix corrected the matcher
+DSL (`tool == "Edit"` → `"Edit"`) — the matcher was right but the entries
+themselves were never loaded by CC for non-SessionStart events.
+
+### Fixed (root cause)
+
+- `claude-plugin/scripts/lifecycle.js` — new `registerHooksToSettings(settings)`
+  actively writes PreToolUse / PostToolUse / UserPromptSubmit entries into
+  `~/.claude/settings.json` on `install()` and `update()`. Two-pass: evict our
+  entries across every event (catches legacy v0.7/v0.8 entries with stale paths),
+  then append fresh v0.32+ entries for the events we own. Description markers
+  carry `[code-graph-mcp v0.32+] …` for cleanup. Hook command paths are
+  absolute, derived from `__dirname` — no `${CLAUDE_PLUGIN_ROOT}` (immune to
+  cross-plugin env leak per `feedback_plugin_env_isolation.md`).
+- `claude-plugin/hooks/hooks.json` — SessionStart only. `_note` explicitly
+  documents that other event types would be dead config if added back.
+- `claude-plugin/scripts/doctor.js` — `legacy-hooks-in-settings` →
+  `missing-hooks-in-settings`. Semantics inverted: presence in settings.json
+  is now correct; missing is the bug. Repair runs `install()` instead of strip.
+- `claude-plugin/scripts/session-init.js` — new self-heal path detects missing
+  settings.json coverage and triggers `install()` (catches manual settings
+  edits and third-party settings.json rewriters that don't preserve markers).
+
+### Added
+
+- **PreToolUse Bash block tier** in `pre-grep-guide.js`. Raw `grep -r{n}` /
+  `rg` / `ag` against an indexed source tree with an identifier-shaped
+  pattern is now blocked via `{ hookSpecificOutput: { permissionDecision:
+  "deny", permissionDecisionReason: "<cg equivalent>" } }` (current Claude
+  Code schema). Bash is the comfort-zone leak — 15d audit measured 429 raw
+  grep vs 191 functional CLI (~13× preference). Block tier targets the
+  narrowest "I'm searching for a symbol" subset: bare flags (no `-l`,
+  `--include`, `-A`/`-B`/`-C`), identifier-shaped pattern (CamelCase ≥4ch,
+  snake_case with `_`, or declaration anchor `fn X` / `class X` / `def X`),
+  not a marker word (TODO/FIXME/XXX). Marker-only and precision-flag scans
+  downgrade to the v0.25.0 informational hint. Escape hatch: prepend
+  `CODE_GRAPH_NO_BLOCK_GREP=1` to fall back to hint behavior; independent
+  of `CODE_GRAPH_QUIET_HOOKS=1` which silences entirely.
+
+### Testing
+
+- 419/419 `claude-plugin/scripts` tests pass — 165 net new across `hooks.test.js`,
+  `lifecycle.test.js`, `pre-grep-guide.test.js`. New coverage includes:
+  - settings.json install writes the expected matchers (`Edit`, `Bash`, `Read`
+    for PreToolUse, `Write|Edit` for PostToolUse, UserPromptSubmit), every
+    entry carries a description marker, paths are absolute (no
+    `${CLAUDE_PLUGIN_ROOT}`)
+  - install is byte-idempotent across re-runs
+  - foreign plugins' settings.json entries survive install/uninstall (no
+    collateral strip)
+  - legacy v0.8.x SessionStart entries with stale paths get evicted on install
+  - hooks.json contract: only `SessionStart` key present; cross-validates that
+    `lifecycle.js` `buildSettingsHookEntries()` covers the matchers removed
+    from hooks.json
+  - `shouldBlock(cmd)` matrix: 22 cases covering CamelCase / snake_case /
+    declaration anchors / precision-flag downgrades / marker-only downgrades
+
+### Migration
+
+Automatic via `lifecycle.js update()`. v0.31.x users upgrading to v0.32.0:
+- `session-init.js syncLifecycleConfig` detects version mismatch → calls `update()`
+- `update()` calls `registerHooksToSettings(settings)` → fresh entries land in
+  `~/.claude/settings.json`
+- Plugin-cache `hooks.json` arrives without the dead non-SessionStart entries
+- No user action required
+
+### Caveat
+
+This fix has been verified at the unit + e2e level (fake-HOME install + JSON
+shape inspection) but **not yet** in a real Claude Code session where the
+upgrade path runs end-to-end. The bench evidence supporting the diagnostic
+(zero PreToolUse:Bash events, zero cooldown flags, stale `.code-graph/index.db`
+mtime) was collected before this fix — a successor session will be the first
+real-world confirmation that the registered settings.json entries actually
+trigger CC's hook dispatcher. The hook scripts themselves are unchanged from
+the pre-fix versions verified in v0.25.0 through v0.31.2; only the
+registration channel changed.
+
 ## v0.31.2 — dedup plugin MCP catalog when project provides its own + regression gate
 
 Follow-up to v0.31.1's PreToolUse repair. Four small functional cleanups:
