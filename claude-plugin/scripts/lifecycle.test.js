@@ -443,3 +443,117 @@ test('hook commands use absolute paths (no ${CLAUDE_PLUGIN_ROOT} in settings.jso
   assert.ok(!serialized.includes('${CLAUDE_PLUGIN_ROOT}'),
     'settings.json hook commands must not reference ${CLAUDE_PLUGIN_ROOT}: ' + serialized);
 });
+
+// ════════════════════════════════════════════════════════════════════
+// v0.32.2 — update() upgrade-path integration tests (reviewer Rec #2)
+// ════════════════════════════════════════════════════════════════════
+// Covers the actual v0.31.x → v0.32.x migration path that runs in
+// production via session-init.js syncLifecycleConfig detecting a manifest
+// version mismatch and calling update(). Previously only install() was
+// tested end-to-end; the upgrade path shared the registerHooksToSettings
+// code internally but had no integration test exercising the wiring.
+
+test('update() from v0.31.x manifest registers fresh hooks in empty settings.json', (t) => {
+  const homeDir = mkHome(t);
+  const manifestPath = path.join(homeDir, '.cache', 'code-graph', 'install-manifest.json');
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+
+  // Seed v0.31.2 manifest state. updatedAt is the v0.31.2 release date.
+  writeJson(manifestPath, {
+    version: '0.31.2',
+    installedAt: '2026-03-16T18:56:17.656Z',
+    updatedAt: '2026-05-23T16:46:39.353Z',
+    config: { statusLine: false },
+  });
+  // settings.json empty (mirrors real v0.31.x state — pre-v0.32.0 strategy
+  // was "strip from settings.json, rely on plugin-cache hooks.json").
+  writeJson(settingsPath, {});
+
+  const out = execFileSync(process.execPath, [lifecyclePath, 'update'], {
+    env: { ...process.env, HOME: homeDir },
+  }).toString();
+  assert.match(out, /Updated 0\.31\.2 → /, 'CLI output must show version transition');
+
+  // Manifest version was bumped to current
+  const manifestAfter = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  assert.notEqual(manifestAfter.version, '0.31.2', 'manifest version must advance');
+  assert.ok(/^\d+\.\d+\.\d+$/.test(manifestAfter.version),
+    `manifest version must be semver, got ${manifestAfter.version}`);
+
+  // settings.json got the v0.32+ hook entries
+  const settingsAfter = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  assert.ok(settingsAfter.hooks, 'update() must populate hooks block');
+  assert.ok(settingsAfter.hooks.PreToolUse, 'PreToolUse must be registered');
+  assert.ok(settingsAfter.hooks.PostToolUse, 'PostToolUse must be registered');
+  assert.ok(settingsAfter.hooks.UserPromptSubmit, 'UserPromptSubmit must be registered');
+
+  // Every entry must carry the v0.32+ marker
+  for (const entries of Object.values(settingsAfter.hooks)) {
+    for (const e of entries) {
+      assert.ok(e.description && e.description.includes('[code-graph-mcp v0.32+'),
+        `update() entry without v0.32+ marker: ${JSON.stringify(e.description)}`);
+    }
+  }
+});
+
+test('update() from v0.31.x evicts legacy v0.7/v0.8 entries with stale paths', (t) => {
+  const homeDir = mkHome(t);
+  const manifestPath = path.join(homeDir, '.cache', 'code-graph', 'install-manifest.json');
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+
+  writeJson(manifestPath, {
+    version: '0.31.2',
+    installedAt: '2026-03-16T18:56:17.656Z',
+    config: { statusLine: false },
+  });
+  // Seed with legacy v0.8.2-era entries that should be evicted on update.
+  writeJson(settingsPath, {
+    hooks: legacyHooksFromPlugin(),
+  });
+
+  execFileSync(process.execPath, [lifecyclePath, 'update'], {
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  const settingsAfter = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  const serialized = JSON.stringify(settingsAfter.hooks || {});
+  // Stale paths must be gone
+  assert.ok(!serialized.includes('/stale/cache/'),
+    'legacy stale paths must be evicted by update(): ' + serialized);
+  // Fresh v0.32+ entries must be present
+  assert.ok(serialized.includes('[code-graph-mcp v0.32+'),
+    'fresh v0.32+ entries must be installed by update()');
+});
+
+test('update() preserves foreign plugin hooks during upgrade', (t) => {
+  const homeDir = mkHome(t);
+  const manifestPath = path.join(homeDir, '.cache', 'code-graph', 'install-manifest.json');
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+
+  writeJson(manifestPath, {
+    version: '0.31.2',
+    config: { statusLine: false },
+  });
+  // Seed with an unrelated plugin's hooks — must survive our update().
+  writeJson(settingsPath, {
+    hooks: {
+      PreToolUse: [{
+        matcher: 'Bash',
+        description: 'foreign-plugin Bash watcher',
+        hooks: [{ type: 'command', command: 'node /opt/foreign/bash.js', timeout: 3 }],
+      }],
+    },
+  });
+
+  execFileSync(process.execPath, [lifecyclePath, 'update'], {
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  const settingsAfter = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  const ptu = settingsAfter.hooks.PreToolUse;
+  assert.ok(ptu.some(e => e.description === 'foreign-plugin Bash watcher'),
+    'foreign Bash hook must survive update() — never strip non-code-graph entries');
+  // And our own entries must coexist
+  assert.ok(ptu.some(e => e.description && e.description.includes('[code-graph-mcp v0.32+')),
+    'update() must add our v0.32+ entries alongside the foreign one');
+});
