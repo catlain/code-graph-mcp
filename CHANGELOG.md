@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.31.1 — fix: PreToolUse hooks never fired
+
+Two compounding bugs caused `PreToolUse:Edit`/`Bash`/`Read` hooks and the
+`PostToolUse:Write|Edit` incremental-index hook to be **registered but
+silently inert** since v0.25.0. Replaying 147 historical `.rs` Edits across
+5 sessions confirms the regression — none of them produced hook output,
+even on functions with 30+ direct callers (`conn`, `lock_or_recover`).
+
+### Fixed
+- `claude-plugin/hooks/hooks.json` — matchers used the expression-style
+  syntax `"tool == \"Edit\""`, but Claude Code's `matcher` field is a literal
+  string / pipe-list / regex matched against the tool name. Switched to
+  `"Edit"`, `"Bash"`, `"Read"`, and `"Write|Edit"`.
+- `claude-plugin/scripts/pre-edit-guide.js` — `code-graph-mcp impact` was
+  called without `--file`, so common short symbol names (`open`, `new`,
+  `from`, `parse`, `init`) hit the ambiguous-symbol code path and returned
+  `{"error": "..."}` instead of caller data. The hook then read
+  `direct_callers || 0` from the error object and silently exited at the
+  `< 1` gate. Now passes `--file <relative-path>` (the indexer stores
+  repo-relative paths; absolute paths return 0 matches) and explicitly
+  handles `error`-keyed responses.
+
+Measured before/after on the same 147 historical Edits, impact-injection
+fires went from **0 / 147 (0%)** to **37 / 147 (25%)**. Test-only sessions
+(routing_bench.rs heavy) stay low by design — bench helpers have no
+production callers, so silent-skip is correct there.
+
 ## v0.31.0 — Multi-account isolation: honor `CLAUDE_CONFIG_DIR`
 
 Closes [#20](https://github.com/sdsrss/code-graph-mcp/issues/20). Users with

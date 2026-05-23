@@ -16,7 +16,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "tool == \"Edit\"",
+        "matcher": "Edit",
         "hooks": [
           {
             "type": "command",
@@ -26,7 +26,7 @@
         ]
       },
       {
-        "matcher": "tool == \"Bash\"",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
@@ -36,7 +36,7 @@
         ]
       },
       {
-        "matcher": "tool == \"Read\"",
+        "matcher": "Read",
         "hooks": [
           {
             "type": "command",
@@ -48,7 +48,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "tool == \"Write\" || tool == \"Edit\"",
+        "matcher": "Write|Edit",
         "hooks": [
           {
             "type": "command",

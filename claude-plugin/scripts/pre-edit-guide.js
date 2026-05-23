@@ -104,9 +104,18 @@ try {
 } catch { /* first time for this symbol */ }
 
 // --- Run impact analysis (JSON mode for programmatic parsing) ---
+// Disambiguate via --file: file_path from tool_input is absolute, but the
+// indexer stores files as repo-relative paths — converting here is what makes
+// short generic symbol names (open, new, create, parse, from, init) resolve
+// to a unique node instead of triggering the CLI's "Ambiguous symbol" error
+// path, which previously caused silent exits for the most common edit cases.
+const editedFile = (input.tool_input && input.tool_input.file_path) || '';
+const relFile = editedFile ? path.relative(cwd, editedFile) : '';
 let jsonResult;
 try {
-  const raw = execFileSync('code-graph-mcp', ['impact', symbol, '--json'], {
+  const args = ['impact', symbol, '--json'];
+  if (relFile && !relFile.startsWith('..')) args.push('--file', relFile);
+  const raw = execFileSync('code-graph-mcp', args, {
     cwd,
     timeout: 2500,
     encoding: 'utf8',
@@ -117,6 +126,10 @@ try {
   // Symbol not found, timeout, or parse error — exit silently
   process.exit(0);
 }
+
+// CLI returns {"error": "..."} on ambiguous / not-found instead of throwing.
+// Treat as silent skip — direct_callers will be undefined.
+if (jsonResult && jsonResult.error) process.exit(0);
 
 // --- Inject when the symbol has any caller (1+) ---
 // Earlier gate was 2+ direct callers; reality is that editing a function with
