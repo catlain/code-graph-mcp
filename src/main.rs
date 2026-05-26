@@ -15,6 +15,26 @@ impl Write for SharedStdout {
     }
 }
 
+/// Resolve project root from CLI --project-root flag, falling back to
+/// the default resolution (CWD + .git walk).
+fn resolve_root_from_args(args: &[String]) -> Result<std::path::PathBuf> {
+    match args.iter().position(|a| a == "--project-root") {
+        Some(idx) => {
+            let path = args
+                .get(idx + 1)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("--project-root requires a path argument")
+                })?;
+            let root = std::path::PathBuf::from(path);
+            if !root.is_dir() {
+                anyhow::bail!("--project-root directory not found: {}", root.display());
+            }
+            Ok(root)
+        }
+        None => Ok(code_graph_mcp::cli::resolve_project_root()?),
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(|s| s.as_str());
@@ -31,31 +51,33 @@ fn main() -> Result<()> {
         }
         Some("incremental-index") => {
             let quiet = args.iter().any(|a| a == "--quiet");
-            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            let has_explicit_root = args.iter().any(|a| a == "--project-root");
+            let project_root = resolve_root_from_args(&args)?;
             // Silent bail when the resolved root has neither a .git anchor nor an
             // existing index. Without this guard the PostToolUse hook would create
             // .code-graph/ in multi-repo workspace parents (issue #8).
-            // Interactive runs get a helpful message so users know *why* nothing
-            // happened — silent exit-0 was indistinguishable from a real index.
-            let has_git = project_root.join(".git").exists();
-            let has_index = project_root
-                .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
-                .join("index.db")
-                .exists();
-            if !has_git && !has_index {
-                if !quiet {
-                    eprintln!(
-                        "[code-graph] Skipping index: no .git anchor or existing .code-graph/ at {}.\n  \
-                         Run `git init` first, or cd into a git repository.",
-                        project_root.display()
-                    );
+            // Skip this check when --project-root is explicitly provided.
+            if !has_explicit_root {
+                let has_git = project_root.join(".git").exists();
+                let has_index = project_root
+                    .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+                    .join("index.db")
+                    .exists();
+                if !has_git && !has_index {
+                    if !quiet {
+                        eprintln!(
+                            "[code-graph] Skipping index: no .git anchor or existing .code-graph/ at {}.\n  \
+                             Run `git init` first, or cd into a git repository.",
+                            project_root.display()
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
             }
             code_graph_mcp::cli::cmd_incremental_index(&project_root, quiet)
         }
         Some("rebuild-index") => {
-            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            let project_root = resolve_root_from_args(&args)?;
             code_graph_mcp::cli::cmd_rebuild_index(&project_root, &args)
         }
         Some("reindex") => {
