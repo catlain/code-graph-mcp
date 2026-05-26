@@ -56,6 +56,7 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
         .git_ignore(true)   // respect .gitignore
         .git_global(true)
         .git_exclude(true)
+        .follow_links(true) // follow symlinks for multi-project indexing
         .build();
 
     let mut file_paths: Vec<(String, std::path::PathBuf)> = Vec::new();
@@ -142,6 +143,7 @@ pub fn scan_directory_cached(
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
+        .follow_links(true) // follow symlinks for multi-project indexing
         .build()
         .filter_map(|e| match e {
             Ok(entry) => Some(entry),
