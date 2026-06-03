@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use crate::storage::db::Database;
 use crate::storage::queries::{
     delete_pending_unresolved_call, insert_edge_cached, list_pending_unresolved_calls,
+    helpers::MAX_IN_PARAMS,
 };
 use crate::domain::REL_CALLS;
 
@@ -177,14 +178,14 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
     // proximity hint it needs.
     let source_ids: Vec<i64> = pending.iter().map(|p| p.source_id).collect();
     let mut source_id_to_path: HashMap<i64, String> = HashMap::new();
-    if !source_ids.is_empty() {
-        let placeholders = std::iter::repeat_n("?", source_ids.len()).collect::<Vec<_>>().join(",");
+    for chunk in source_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.id IN ({})",
             placeholders
         );
         let mut stmt = db.conn().prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = source_ids.iter()
+        let params: Vec<&dyn rusqlite::ToSql> = chunk.iter()
             .map(|id| id as &dyn rusqlite::ToSql)
             .collect();
         let rows = stmt.query_map(params.as_slice(), |row| {
@@ -260,22 +261,24 @@ pub(super) fn path_filter_candidates(
     let path_chain = segments.join("/");
     let qn_chain = segments.join(".");
 
-    let placeholders: String = std::iter::repeat_n("?", candidates.len()).collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT id, COALESCE(qualified_name, '') FROM nodes WHERE id IN ({})",
-        placeholders
-    );
-    let mut stmt = db.conn().prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = candidates.iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect();
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
     let mut id_to_qn: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
-    for r in rows {
-        let (id, qn) = r?;
-        id_to_qn.insert(id, qn);
+    for chunk in candidates.chunks(MAX_IN_PARAMS) {
+        let placeholders: String = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, COALESCE(qualified_name, '') FROM nodes WHERE id IN ({})",
+            placeholders
+        );
+        let mut stmt = db.conn().prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = chunk.iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (id, qn) = r?;
+            id_to_qn.insert(id, qn);
+        }
     }
 
     // For the LAST segment, also accept the path ending in `<seg>.rs` —
@@ -323,24 +326,25 @@ pub(super) fn self_filter_candidates(
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders: String = std::iter::repeat_n("?", candidates.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT id FROM nodes
-         WHERE id IN ({})
-           AND qualified_name LIKE ? || '.%'",
-        placeholders
-    );
-    let mut stmt = db.conn().prepare(&sql)?;
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = candidates
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
-        .collect();
-    params.push(Box::new(impl_type.to_string()));
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-    let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
-    let kept: Vec<i64> = rows.filter_map(|r| r.ok()).collect();
+    let mut kept: Vec<i64> = Vec::new();
+    for chunk in candidates.chunks(MAX_IN_PARAMS) {
+        let placeholders: String = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id FROM nodes\n             WHERE id IN ({})\n               AND qualified_name LIKE ? || '.%'",
+            placeholders
+        );
+        let mut stmt = db.conn().prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = chunk
+            .iter()
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        params.push(Box::new(impl_type.to_string()));
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
+        kept.extend(rows.filter_map(|r| r.ok()));
+    }
     Ok(kept)
 }
 

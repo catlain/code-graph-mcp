@@ -5,7 +5,7 @@
 //! Cross-submodule helpers live in `helpers` (placeholders, MAX_IN_PARAMS,
 //! generic `first_row`, test_db harness) and `nodes` (NODE_SELECT*, map_node_row).
 
-mod helpers;
+pub mod helpers;
 
 mod dead_code;
 mod edges;

@@ -1,5 +1,5 @@
 /// Maximum number of parameters in a single IN clause to stay within SQLite limits.
-pub(super) const MAX_IN_PARAMS: usize = 500;
+pub const MAX_IN_PARAMS: usize = 500;
 
 pub(super) fn first_row<T>(
     mut rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
