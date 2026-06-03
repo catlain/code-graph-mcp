@@ -49,6 +49,37 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Walk `_codegraph_links/` with gitignore disabled so that the directory is
+/// indexed even when `.gitignore` excludes it (which is common — users don't
+/// want git to track the symlinks, but code-graph should still follow them).
+fn walk_codegraph_links(root: &Path) -> Vec<(String, std::path::PathBuf)> {
+    let links_dir = root.join("_codegraph_links");
+    if !links_dir.is_dir() {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    let walker = WalkBuilder::new(&links_dir)
+        .hidden(true)
+        .git_ignore(false)  // intentionally ignore .gitignore for this directory
+        .git_global(false)
+        .git_exclude(false)
+        .follow_links(true)
+        .build();
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(rel) = path.strip_prefix(root) {
+            let rel_str = normalize_rel_path(rel);
+            if detect_language(&rel_str).is_some() {
+                paths.push((rel_str, path.to_path_buf()));
+            }
+        }
+    }
+    paths
+}
+
 pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
     // Collect eligible file paths first, then hash in parallel
     let walker = WalkBuilder::new(root)
@@ -89,6 +120,10 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
             file_paths.push((rel_str, path.to_path_buf()));
         }
     }
+
+    // Merge in _codegraph_links/ files (bypasses gitignore so they are always indexed)
+    let mut codegraph_link_paths = walk_codegraph_links(root);
+    file_paths.append(&mut codegraph_link_paths);
 
     Ok(hash_files_parallel(&file_paths))
 }
@@ -182,6 +217,9 @@ pub fn scan_directory_cached(
         changed_dirs.insert(String::new());
     }
 
+    // Merge _codegraph_links/ files (bypasses gitignore)
+    let codegraph_link_files = walk_codegraph_links(root);
+
     // Pass 2: collect files that need hashing, then hash in parallel.
     // Directory mtime only changes on file add/remove (not content edits on ext4/btrfs),
     // so we also check individual file mtimes to catch content modifications.
@@ -228,6 +266,15 @@ pub fn scan_directory_cached(
             files_to_hash.push((rel_str, path.to_path_buf()));
         }
     }
+
+    // Merge _codegraph_links/ files into hashing (bypasses gitignore)
+    let existing_keys: std::collections::HashSet<_> =
+        files_to_hash.iter().map(|(r, _)| r.clone()).collect();
+    files_to_hash.extend(
+        codegraph_link_files
+            .into_iter()
+            .filter(|(rel_str, _)| !existing_keys.contains(rel_str)),
+    );
 
     // Hash files in parallel
     hashes.extend(hash_files_parallel(&files_to_hash));
